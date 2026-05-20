@@ -154,12 +154,11 @@ OtaUpdater::OtaUpdaterError OtaUpdater::installUpdate() {
   esp_http_client_config_t client_config = {
       .url = otaUrl.c_str(),
       .timeout_ms = 15000,
-      /* Default HTTP client buffer size 512 byte only
-       * not sufficient to handle URL redirection cases or
-       * parsing of large HTTP headers.
-       */
-      .buffer_size = 8192,
-      .buffer_size_tx = 8192,
+      // 4096 holds the github->CDN redirect headers (the 512 default truncates
+      // them); TX only carries our GET. Both are contiguous blocks contending
+      // with the TLS handshake on a tight internal arena, so keep them minimal.
+      .buffer_size = 4096,
+      .buffer_size_tx = 1024,
       .skip_cert_common_name_check = true,
       .crt_bundle_attach = esp_crt_bundle_attach,
       .keep_alive_enable = true,
@@ -179,11 +178,21 @@ OtaUpdater::OtaUpdaterError OtaUpdater::installUpdate() {
     return INTERNAL_UPDATE_ERROR;
   }
 
+  int lastReportedPct = -1;
   do {
     esp_err = esp_https_ota_perform(ota_handle);
     processedSize = esp_https_ota_get_image_len_read(ota_handle);
-    /* Sent signal to  OtaUpdateActivity */
-    render = true;
+    // OtaUpdateActivity への render 要求を 1% 変化時のみに throttle する。
+    // 従来は毎 ~100ms perform iteration 毎に render を立てていて、render task の
+    // framebuffer 描画が TLS session と同じ内部 arena を奪い合い OOM を助長していた。
+    // E-ink は 1% tick より速く再描画できないのでこれで十分。
+    if (totalSize > 0) {
+      const int pct = static_cast<int>(static_cast<uint64_t>(processedSize) * 100 / totalSize);
+      if (pct != lastReportedPct) {
+        lastReportedPct = pct;
+        render = true;
+      }
+    }
     delay(100);  // TODO: should we replace this with something better?
   } while (esp_err == ESP_ERR_HTTPS_OTA_IN_PROGRESS);
 
