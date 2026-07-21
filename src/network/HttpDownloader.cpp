@@ -12,11 +12,57 @@
 #include <utility>
 
 #include "CrossPointSettings.h"
+#include "SecureNetworkClient.h"
 #include "util/UrlUtils.h"
 
 int HttpDownloader::lastHttpCode = 0;
 
 namespace {
+
+// Builds the NetworkClient appropriate for the URL/verifyTls combination.
+// - https + verifyTls: SecureNetworkClient with the default CA bundle attached (chain + hostname
+//   verification). *outSecureForError is set so the caller can pull a diagnostic message on failure.
+// - https + !verifyTls: NetworkClientSecure with setInsecure() (unchanged legacy behavior).
+// - http (plain): NetworkClient, unless verifyTls was requested -- html2xtc is https-only, so
+//   verifyTls=true against a plain http:// URL is a caller error and yields nullptr.
+std::unique_ptr<NetworkClient> makeHttpClient(const std::string& url, bool verifyTls,
+                                              SecureNetworkClient** outSecureForError) {
+  if (outSecureForError) *outSecureForError = nullptr;
+
+  if (UrlUtils::isHttpsUrl(url)) {
+    if (verifyTls) {
+      auto* secureClient = new SecureNetworkClient();
+      secureClient->useDefaultCertBundle();
+      secureClient->setHandshakeTimeout(20);
+      if (outSecureForError) *outSecureForError = secureClient;
+      return std::unique_ptr<NetworkClient>(secureClient);
+    }
+    auto* secureClient = new NetworkClientSecure();
+    secureClient->setInsecure();
+    secureClient->setHandshakeTimeout(20);
+    return std::unique_ptr<NetworkClient>(secureClient);
+  }
+
+  if (verifyTls) {
+    LOG_ERR("HTTP", "verifyTls requested for a non-HTTPS URL: %s", url.c_str());
+    return nullptr;
+  }
+  return std::unique_ptr<NetworkClient>(new NetworkClient());
+}
+
+// Logs the mbedtls-level diagnostic for a TLS/connection failure. Only meaningful when
+// secureForError is non-null (i.e. verifyTls was in effect) and the HTTP layer reported a
+// transport-level failure (httpCode <= 0) rather than a genuine HTTP status code (>= 100).
+bool logTlsFailureIfAny(SecureNetworkClient* secureForError, int httpCode) {
+  if (!secureForError || httpCode > 0) {
+    return false;
+  }
+  char errBuf[128];
+  secureForError->lastError(errBuf, sizeof(errBuf));
+  LOG_ERR("HTTP", "TLS/connection error: %s (code=%d)", errBuf, httpCode);
+  return true;
+}
+
 class FileWriteStream final : public Stream {
  public:
   FileWriteStream(FsFile& file, size_t total, HttpDownloader::ProgressCallback progress)
@@ -55,16 +101,12 @@ class FileWriteStream final : public Stream {
 }  // namespace
 
 bool HttpDownloader::fetchUrl(const std::string& url, Stream& outContent, const std::string& username,
-                              const std::string& password) {
-  // Use NetworkClientSecure for HTTPS, regular NetworkClient for HTTP
-  std::unique_ptr<NetworkClient> client;
-  if (UrlUtils::isHttpsUrl(url)) {
-    auto* secureClient = new NetworkClientSecure();
-    secureClient->setInsecure();
-    secureClient->setHandshakeTimeout(20);
-    client.reset(secureClient);
-  } else {
-    client.reset(new NetworkClient());
+                              const std::string& password, bool verifyTls) {
+  SecureNetworkClient* secureForError = nullptr;
+  std::unique_ptr<NetworkClient> client = makeHttpClient(url, verifyTls, &secureForError);
+  if (!client) {
+    lastHttpCode = TLS_ERROR_CODE;
+    return false;
   }
   HTTPClient http;
 
@@ -84,6 +126,9 @@ bool HttpDownloader::fetchUrl(const std::string& url, Stream& outContent, const 
   const int httpCode = http.GET();
   lastHttpCode = httpCode;
   LOG_DBG("HTTP", "GET result: %d, free heap: %d", httpCode, ESP.getFreeHeap());
+  if (logTlsFailureIfAny(secureForError, httpCode)) {
+    lastHttpCode = TLS_ERROR_CODE;
+  }
   if (httpCode != HTTP_CODE_OK) {
     LOG_ERR("HTTP", "Fetch failed: %d", httpCode);
     http.end();
@@ -104,16 +149,13 @@ bool HttpDownloader::fetchUrl(const std::string& url, Stream& outContent, const 
 }
 
 bool HttpDownloader::fetchUrl(const std::string& url, std::string& outContent, const std::string& username,
-                              const std::string& password) {
+                              const std::string& password, bool verifyTls) {
   // Direct string fetch: avoids StreamString and writeToStream issues.
-  std::unique_ptr<NetworkClient> client;
-  if (UrlUtils::isHttpsUrl(url)) {
-    auto* secureClient = new NetworkClientSecure();
-    secureClient->setInsecure();
-    secureClient->setHandshakeTimeout(20);
-    client.reset(secureClient);
-  } else {
-    client.reset(new NetworkClient());
+  SecureNetworkClient* secureForError = nullptr;
+  std::unique_ptr<NetworkClient> client = makeHttpClient(url, verifyTls, &secureForError);
+  if (!client) {
+    lastHttpCode = TLS_ERROR_CODE;
+    return false;
   }
   HTTPClient http;
 
@@ -131,6 +173,9 @@ bool HttpDownloader::fetchUrl(const std::string& url, std::string& outContent, c
   const int httpCode = http.GET();
   lastHttpCode = httpCode;
 
+  if (logTlsFailureIfAny(secureForError, httpCode)) {
+    lastHttpCode = TLS_ERROR_CODE;
+  }
   if (httpCode != HTTP_CODE_OK) {
     LOG_ERR("HTTP", "FetchStr failed: %d", httpCode);
     http.end();
@@ -176,16 +221,12 @@ bool HttpDownloader::fetchUrl(const std::string& url, std::string& outContent, c
 HttpDownloader::DownloadError HttpDownloader::downloadToFile(const std::string& url, const std::string& destPath,
                                                              ProgressCallback progress, int timeoutMs,
                                                              const std::string& username, const std::string& password,
-                                                             HttpResponseMetadata* outMetadata) {
-  // Use NetworkClientSecure for HTTPS, regular NetworkClient for HTTP
-  std::unique_ptr<NetworkClient> client;
-  if (UrlUtils::isHttpsUrl(url)) {
-    auto* secureClient = new NetworkClientSecure();
-    secureClient->setInsecure();
-    secureClient->setHandshakeTimeout(20);
-    client.reset(secureClient);
-  } else {
-    client.reset(new NetworkClient());
+                                                             HttpResponseMetadata* outMetadata, bool verifyTls) {
+  SecureNetworkClient* secureForError = nullptr;
+  std::unique_ptr<NetworkClient> client = makeHttpClient(url, verifyTls, &secureForError);
+  if (!client) {
+    lastHttpCode = TLS_ERROR_CODE;
+    return TLS_ERROR;
   }
   HTTPClient http;
 
@@ -213,6 +254,10 @@ HttpDownloader::DownloadError HttpDownloader::downloadToFile(const std::string& 
 
   const int httpCode = http.GET();
   lastHttpCode = httpCode;
+  const bool tlsFailure = logTlsFailureIfAny(secureForError, httpCode);
+  if (tlsFailure) {
+    lastHttpCode = TLS_ERROR_CODE;
+  }
   if (outMetadata) {
     outMetadata->statusCode = httpCode;
     outMetadata->contentType = http.header("Content-Type").c_str();
@@ -221,7 +266,7 @@ HttpDownloader::DownloadError HttpDownloader::downloadToFile(const std::string& 
   if (httpCode != HTTP_CODE_OK) {
     LOG_ERR("HTTP", "Download failed: %d", httpCode);
     http.end();
-    return HTTP_ERROR;
+    return tlsFailure ? TLS_ERROR : HTTP_ERROR;
   }
 
   const int64_t reportedLength = http.getSize();

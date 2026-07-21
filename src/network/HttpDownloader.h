@@ -17,7 +17,12 @@ class HttpDownloader {
     HTTP_ERROR,
     FILE_ERROR,
     ABORTED,
+    TLS_ERROR,
   };
+
+  /// lastHttpCode value used to signal a TLS chain/hostname verification (or transport-level
+  /// connection) failure when verifyTls=true. Distinguishes this from a genuine HTTP status code.
+  static constexpr int TLS_ERROR_CODE = -950;
 
   /**
    * Subset of HTTP response headers, populated by downloadToFile() when an output pointer is provided.
@@ -39,21 +44,27 @@ class HttpDownloader {
    * @param outContent The fetched content (output)
    * @param username Optional username for Basic auth
    * @param password Optional password for Basic auth
+   * @param verifyTls When true (https only), verify the server's certificate chain and hostname
+   *                  against the embedded default CA bundle instead of accepting any certificate.
+   *                  Requesting verifyTls=true for a plain http:// URL is treated as an error.
    * @return true if fetch succeeded, false on error
    */
   static bool fetchUrl(const std::string& url, std::string& outContent, const std::string& username = "",
-                       const std::string& password = "");
+                       const std::string& password = "", bool verifyTls = false);
 
   static bool fetchUrl(const std::string& url, Stream& stream, const std::string& username = "",
-                       const std::string& password = "");
+                       const std::string& password = "", bool verifyTls = false);
 
   /**
    * Download a file to the SD card with optional Basic auth credentials.
    * @param outMetadata Optional output pointer; when non-null, Content-Type/Content-Disposition headers are
    *                    collected and the response metadata is populated regardless of success/failure.
+   * @param verifyTls When true (https only), verify the server's certificate chain and hostname
+   *                  against the embedded default CA bundle instead of accepting any certificate.
+   *                  Requesting verifyTls=true for a plain http:// URL returns TLS_ERROR.
    */
   static DownloadError downloadToFile(const std::string& url, const std::string& destPath,
                                       ProgressCallback progress = nullptr, int timeoutMs = 0,
                                       const std::string& username = "", const std::string& password = "",
-                                      HttpResponseMetadata* outMetadata = nullptr);
+                                      HttpResponseMetadata* outMetadata = nullptr, bool verifyTls = false);
 };
