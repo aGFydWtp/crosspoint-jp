@@ -63,6 +63,84 @@ bool logTlsFailureIfAny(SecureNetworkClient* secureForError, int httpCode) {
   return true;
 }
 
+// Shared implementation for postJson()/getJson(): issues an HTTP request with a JSON
+// Content-Type, an optional raw Authorization header, and reads the response body into a
+// std::string regardless of status code (error bodies can carry useful diagnostics too).
+int sendJsonRequest(const char* method, const std::string& url, const std::string& body, std::string& outResponse,
+                    const std::string& authorization, bool verifyTls, int* outRetryAfterSeconds) {
+  if (outRetryAfterSeconds) *outRetryAfterSeconds = 0;
+  outResponse.clear();
+
+  SecureNetworkClient* secureForError = nullptr;
+  std::unique_ptr<NetworkClient> client = makeHttpClient(url, verifyTls, &secureForError);
+  if (!client) {
+    HttpDownloader::lastHttpCode = HttpDownloader::TLS_ERROR_CODE;
+    return HttpDownloader::TLS_ERROR_CODE;
+  }
+  HTTPClient http;
+
+  http.begin(*client, url.c_str());
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  http.addHeader("User-Agent", "CrossPoint-ESP32-" CROSSPOINT_VERSION);
+  http.addHeader("Content-Type", "application/json");
+  if (!authorization.empty()) {
+    http.addHeader("Authorization", authorization.c_str());
+  }
+
+  // Headers must be registered before the request executes, or header() always returns empty.
+  if (outRetryAfterSeconds) {
+    static const char* kCollectedHeaders[] = {"Retry-After"};
+    http.collectHeaders(kCollectedHeaders, 1);
+  }
+
+  LOG_DBG("HTTP", "%s: %s (heap=%d)", method, url.c_str(), ESP.getFreeHeap());
+  const int httpCode = http.sendRequest(method, String(body.c_str()));
+  HttpDownloader::lastHttpCode = httpCode;
+
+  int resultCode = httpCode;
+  if (logTlsFailureIfAny(secureForError, httpCode)) {
+    resultCode = HttpDownloader::TLS_ERROR_CODE;
+    HttpDownloader::lastHttpCode = HttpDownloader::TLS_ERROR_CODE;
+  }
+
+  if (outRetryAfterSeconds && httpCode > 0) {
+    String retryAfter = http.header("Retry-After");
+    if (!retryAfter.isEmpty()) {
+      *outRetryAfterSeconds = retryAfter.toInt();
+    }
+  }
+
+  // Only a genuine HTTP response (httpCode > 0) has a readable body stream; a transport-level
+  // failure (negative code) leaves nothing to drain.
+  if (httpCode > 0) {
+    NetworkClient* stream = http.getStreamPtr();
+    const int contentLen = http.getSize();
+    if (contentLen > 0) {
+      outResponse.reserve(contentLen);
+    }
+
+    char buf[512];
+    while (stream->available() || stream->connected()) {
+      int avail = stream->available();
+      if (avail <= 0) {
+        delay(1);
+        continue;
+      }
+      int toRead = (avail < static_cast<int>(sizeof(buf))) ? avail : static_cast<int>(sizeof(buf));
+      int bytesRead = stream->readBytes(buf, toRead);
+      if (bytesRead > 0) {
+        outResponse.append(buf, bytesRead);
+      } else {
+        break;
+      }
+    }
+  }
+  http.end();
+
+  LOG_DBG("HTTP", "%s result: %d, %zu bytes", method, httpCode, outResponse.size());
+  return resultCode;
+}
+
 class FileWriteStream final : public Stream {
  public:
   FileWriteStream(FsFile& file, size_t total, HttpDownloader::ProgressCallback progress)
@@ -333,4 +411,14 @@ HttpDownloader::DownloadError HttpDownloader::downloadToFile(const std::string& 
   }
 
   return OK;
+}
+
+int HttpDownloader::postJson(const std::string& url, const std::string& jsonBody, std::string& outResponse,
+                             const std::string& authorization, bool verifyTls, int* outRetryAfterSeconds) {
+  return sendJsonRequest("POST", url, jsonBody, outResponse, authorization, verifyTls, outRetryAfterSeconds);
+}
+
+int HttpDownloader::getJson(const std::string& url, std::string& outResponse, const std::string& authorization,
+                            bool verifyTls, int* outRetryAfterSeconds) {
+  return sendJsonRequest("GET", url, "", outResponse, authorization, verifyTls, outRetryAfterSeconds);
 }

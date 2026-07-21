@@ -67,4 +67,31 @@ class HttpDownloader {
                                       ProgressCallback progress = nullptr, int timeoutMs = 0,
                                       const std::string& username = "", const std::string& password = "",
                                       HttpResponseMetadata* outMetadata = nullptr, bool verifyTls = false);
+
+  /**
+   * Send a JSON request body via HTTP POST and capture the response body.
+   * Used by REST-style JSON APIs (e.g. html2xtc device pairing) that need an arbitrary
+   * Authorization header value rather than the Basic-auth username/password pair above.
+   * @param jsonBody Raw JSON request body (Content-Type: application/json is set automatically).
+   * @param outResponse Response body (output), populated whenever a response was received
+   *                    regardless of status code, so callers can inspect error bodies too.
+   * @param authorization When non-empty, sent verbatim as the Authorization header value
+   *                      (e.g. "Pairing abc123", "Bearer xyz") -- no scheme is added/assumed.
+   * @param verifyTls Same semantics as fetchUrl()/downloadToFile().
+   * @param outRetryAfterSeconds Optional output pointer; when non-null, the Retry-After response
+   *                            header is parsed as an integer number of seconds (0 if absent).
+   * @return HTTP status code, or a negative error code (see TLS_ERROR_CODE) on transport failure.
+   */
+  static int postJson(const std::string& url, const std::string& jsonBody, std::string& outResponse,
+                      const std::string& authorization = "", bool verifyTls = false,
+                      int* outRetryAfterSeconds = nullptr);
+
+  /**
+   * Issue an authenticated HTTP GET expecting a JSON response body (e.g. polling a status
+   * endpoint). Companion to postJson() -- see its doc comment for shared parameter semantics.
+   * Needed because fetchUrl() only supports HTTP Basic auth, not an arbitrary Authorization
+   * header value.
+   */
+  static int getJson(const std::string& url, std::string& outResponse, const std::string& authorization = "",
+                     bool verifyTls = false, int* outRetryAfterSeconds = nullptr);
 };

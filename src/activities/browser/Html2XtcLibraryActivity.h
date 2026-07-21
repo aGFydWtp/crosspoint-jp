@@ -1,5 +1,6 @@
 #pragma once
 #include "../Activity.h"
+#include "../ActivityResult.h"
 
 /**
  * Wrapper activity for the "My XTC" home-menu entry.
@@ -10,11 +11,14 @@
  * replacing the activity stack (Home or Reader), which also destroys this
  * wrapper; it never returns here in normal operation.
  *
- * If not paired, it shows a "not connected" instruction screen with a Back
- * button. The QR pairing flow will be added in a later phase.
+ * If not paired, it shows a "not connected" instruction screen; pressing
+ * Confirm launches Html2XtcPairingActivity (QR pairing flow). On success it
+ * proceeds straight to the OPDS browser; on cancel it returns to this
+ * instruction screen.
  */
 class Html2XtcLibraryActivity final : public Activity {
   bool browserLaunched = false;
+  bool pairingLaunched = false;
 
  public:
   explicit Html2XtcLibraryActivity(GfxRenderer& renderer, MappedInputManager& mappedInput)
@@ -23,4 +27,8 @@ class Html2XtcLibraryActivity final : public Activity {
   void onEnter() override;
   void loop() override;
   void render(RenderLock&&) override;
+
+ private:
+  void launchBrowser();
+  void onPairingComplete(const ActivityResult& result);
 };
