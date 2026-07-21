@@ -51,8 +51,8 @@ class OpdsBookBrowserActivity final : public Activity {
 
   // Downloaded-file index for the html2xtc "already downloaded" marker (server.verifyTls only).
   // Key: 6-hex-digit id-hash suffix (see appendIdHashSuffix in the .cpp), value: full SD path.
-  // Rebuilt from a single /Html2Xtc directory listing in fetchFeed(); never touched by render()
-  // so render() stays free of SD I/O. EPUB downloads (saved to the SD root, not /Html2Xtc) are
+  // Rebuilt from a single /XTCFiles directory listing in fetchFeed(); never touched by render()
+  // so render() stays free of SD I/O. EPUB downloads (saved to the SD root, not /XTCFiles) are
   // out of scope for this marker -- html2xtc only ever serves XTC.
   std::unordered_map<std::string, std::string> downloadedByHash;
 
@@ -72,7 +72,7 @@ class OpdsBookBrowserActivity final : public Activity {
   void downloadBook(const OpdsEntry& book);
   void launchSearch();
   void performSearch(const std::string& query);
-  // Populates downloadedByHash from a single listing of /Html2Xtc. Only called when
+  // Populates downloadedByHash from a single listing of /XTCFiles. Only called when
   // server.verifyTls (html2xtc); a no-op directory listing for generic OPDS servers would be
   // wasted SD I/O with no matching entries anyway.
   void scanDownloadedFiles();

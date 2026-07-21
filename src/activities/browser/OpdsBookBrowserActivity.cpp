@@ -27,7 +27,7 @@ constexpr int PAGE_ITEMS = 23;
 // Single reusable temp-download path: only one OPDS download runs at a time (the activity blocks
 // input while state == DOWNLOADING), so this doesn't need to be unique per-download.
 constexpr const char* kTempDownloadPath = "/opds_download.tmp";
-constexpr const char* kHtml2XtcDir = "/Html2Xtc";
+constexpr const char* kXtcFilesDir = "/XTCFiles";
 
 std::string fallbackBaseName(const OpdsEntry& book) {
   return (book.author.empty() ? "" : book.author + " - ") + book.title;
@@ -468,9 +468,9 @@ void OpdsBookBrowserActivity::downloadBook(const OpdsEntry& book) {
       Storage.remove(destPath.c_str());
     }
   } else {
-    const std::string destDir = std::string(kHtml2XtcDir) + "/";
-    if (!Storage.exists(kHtml2XtcDir) && !Storage.mkdir(kHtml2XtcDir)) {
-      LOG_ERR("OPDS", "Failed to create %s", kHtml2XtcDir);
+    const std::string destDir = std::string(kXtcFilesDir) + "/";
+    if (!Storage.exists(kXtcFilesDir) && !Storage.mkdir(kXtcFilesDir)) {
+      LOG_ERR("OPDS", "Failed to create %s", kXtcFilesDir);
       Storage.remove(kTempDownloadPath);
       state = BrowserState::ERROR;
       errorMessage = tr(STR_DOWNLOAD_FAILED);
@@ -513,7 +513,7 @@ void OpdsBookBrowserActivity::downloadBook(const OpdsEntry& book) {
     Epub(destPath, "/.crosspoint").clearCache();
   } else if (!book.id.empty()) {
     // Reflect the new download immediately without waiting for the next fetchFeed() rescan.
-    // EPUBs are saved to the SD root (not /Html2Xtc) and are out of scope for this marker.
+    // EPUBs are saved to the SD root (not /XTCFiles) and are out of scope for this marker.
     downloadedByHash[idHashHex(book.id)] = destPath;
   }
 
@@ -524,9 +524,9 @@ void OpdsBookBrowserActivity::downloadBook(const OpdsEntry& book) {
 void OpdsBookBrowserActivity::scanDownloadedFiles() {
   downloadedByHash.clear();
 
-  auto dir = Storage.open(kHtml2XtcDir);
+  auto dir = Storage.open(kXtcFilesDir);
   if (!dir || !dir.isDirectory()) {
-    // No /Html2Xtc directory yet (e.g. nothing downloaded from this server so far) -- leave the
+    // No /XTCFiles directory yet (e.g. nothing downloaded from this server so far) -- leave the
     // map empty rather than treating it as an error.
     return;
   }
@@ -548,7 +548,7 @@ void OpdsBookBrowserActivity::scanDownloadedFiles() {
         std::all_of(hash.begin(), hash.end(), [](char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'); });
     if (!isHex) continue;
 
-    downloadedByHash[hash] = std::string(kHtml2XtcDir) + "/" + filename;
+    downloadedByHash[hash] = std::string(kXtcFilesDir) + "/" + filename;
   }
 }
 
