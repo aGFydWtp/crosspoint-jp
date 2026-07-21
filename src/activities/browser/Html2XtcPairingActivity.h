@@ -18,6 +18,7 @@ class Html2XtcPairingActivity final : public Activity {
       : Activity("Html2XtcPairing", renderer, mappedInput) {}
 
   void onEnter() override;
+  void onExit() override;
   void loop() override;
   void render(RenderLock&&) override;
   bool preventAutoSleep() override { return state == CREATING || state == WAITING_APPROVAL || state == SAVING; }

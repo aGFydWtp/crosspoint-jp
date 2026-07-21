@@ -39,6 +39,17 @@ void Html2XtcPairingActivity::onEnter() {
   checkAndConnectWifi();
 }
 
+void Html2XtcPairingActivity::onExit() {
+  Activity::onExit();
+  // Like every other network activity (OpdsBookBrowserActivity, FontDownloadActivity, ...),
+  // unconditionally turn WiFi off on exit. Activities that need WiFi afterwards
+  // (OpdsBookBrowserActivity) reconnect autonomously in their own onEnter().
+  WiFi.disconnect(false);
+  delay(100);
+  WiFi.mode(WIFI_OFF);
+  delay(100);
+}
+
 void Html2XtcPairingActivity::checkAndConnectWifi() {
   if (WiFi.status() == WL_CONNECTED && WiFi.localIP() != IPAddress(0, 0, 0, 0)) {
     beginCreating();

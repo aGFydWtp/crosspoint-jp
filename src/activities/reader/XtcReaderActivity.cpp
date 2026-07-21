@@ -46,12 +46,30 @@ void XtcReaderActivity::onEnter() {
   APP_STATE.saveToFile();
   RECENT_BOOKS.addBook(xtc->getPath(), xtc->getTitle(), xtc->getAuthor(), xtc->getThumbBmpPath());
 
+  // Allocate the row-streaming buffer for 1-bit (XTG) pages once up front. If this fails,
+  // renderPage() falls back to the previous single-shot full-page malloc path.
+  if (xtc->getBitDepth() == 1) {
+    const size_t rowBytes = (static_cast<size_t>(xtc->getPageWidth()) + 7) / 8;
+    xtgStreamBufferSize_ = rowBytes * kXtgStreamRows;
+    xtgStreamBuffer_ = static_cast<uint8_t*>(malloc(xtgStreamBufferSize_));
+    if (!xtgStreamBuffer_) {
+      LOG_ERR("XTR", "Failed to allocate XTG stream buffer (%lu bytes)", xtgStreamBufferSize_);
+      xtgStreamBufferSize_ = 0;
+    }
+  }
+
   // Trigger first update
   requestUpdate();
 }
 
 void XtcReaderActivity::onExit() {
   Activity::onExit();
+
+  if (xtgStreamBuffer_) {
+    free(xtgStreamBuffer_);
+    xtgStreamBuffer_ = nullptr;
+  }
+  xtgStreamBufferSize_ = 0;
 
   APP_STATE.readerActivityLoadCount = 0;
   APP_STATE.saveToFile();
@@ -210,6 +228,67 @@ void XtcReaderActivity::renderPage() {
   const uint16_t pageHeight = xtc->getPageHeight();
   const uint8_t bitDepth = xtc->getBitDepth();
 
+  // Streaming path for 1-bit (XTG) pages: renders row-by-row from the small fixed-size buffer
+  // allocated once in onEnter(), instead of a single ~48KB contiguous page malloc per page turn.
+  // Falls through to the legacy single-shot path below if that buffer failed to allocate.
+  if (bitDepth == 1 && xtgStreamBuffer_) {
+    renderer.clearScreen();
+
+    const xtc::XtcError err = xtc->loadPageStreaming(
+        currentPage, xtgStreamBuffer_, xtgStreamBufferSize_,
+        [](void* rawCtx, const uint8_t* data, size_t size, size_t offset) {
+          auto* self = static_cast<XtcReaderActivity*>(rawCtx);
+          const uint16_t width = self->xtc->getPageWidth();
+          const size_t srcRowBytes = (static_cast<size_t>(width) + 7) / 8;  // 1-bit mode: 8 pixels per byte, MSB first
+          // xtgStreamBufferSize_ is a whole multiple of srcRowBytes, so XtcParser::loadPageStreaming's
+          // min(chunkSize, remaining) reads always deliver an integer number of full rows here.
+          const size_t rowCount = size / srcRowBytes;
+          const uint16_t startRow = static_cast<uint16_t>(offset / srcRowBytes);
+          for (size_t r = 0; r < rowCount; r++) {
+            const uint16_t srcY = startRow + static_cast<uint16_t>(r);
+            const uint8_t* rowData = data + r * srcRowBytes;
+            for (uint16_t srcX = 0; srcX < width; srcX++) {
+              // Read source pixel (MSB first, bit 7 = leftmost pixel)
+              const size_t srcByte = srcX / 8;
+              const size_t srcBit = 7 - (srcX % 8);
+              const bool isBlack = !((rowData[srcByte] >> srcBit) & 1);  // XTC: 0 = black, 1 = white
+              if (isBlack) {
+                self->renderer.drawPixel(srcX, srcY, true);
+              }
+            }
+          }
+        },
+        this);
+
+    if (err != xtc::XtcError::OK) {
+      LOG_ERR("XTR", "Failed to stream page %lu: %s", currentPage, xtc::errorToString(err));
+      renderer.clearScreen();
+      renderer.drawCenteredText(UI_12_FONT_ID, 300, tr(STR_PAGE_LOAD_ERROR), true, EpdFontFamily::BOLD);
+      renderer.displayBuffer();
+      return;
+    }
+
+    // XTC pages already have status bar pre-rendered, no need to add our own
+
+    // Display with appropriate refresh
+    if (pagesUntilFullRefresh <= 1) {
+      renderer.displayBuffer(HalDisplay::HALF_REFRESH);
+      pagesUntilFullRefresh = SETTINGS.getRefreshFrequency();
+    } else {
+      renderer.displayBuffer();
+      pagesUntilFullRefresh--;
+    }
+
+    LOG_DBG("XTR", "Rendered page %lu/%lu (%u-bit, streamed)", currentPage + 1, xtc->getPageCount(), bitDepth);
+    renderer.setDarkMode(wasDarkMode);
+
+    if (pendingScreenshot) {
+      pendingScreenshot = false;
+      ScreenshotUtil::takeScreenshot(renderer);
+    }
+    return;
+  }
+
   // Calculate buffer size for one page
   // XTG (1-bit): Row-major, ((width+7)/8) * height bytes
   // XTH (2-bit): Two bit planes, column-major, ((width * height + 7) / 8) * 2 bytes
@@ -224,6 +303,12 @@ void XtcReaderActivity::renderPage() {
   uint8_t* pageBuffer = static_cast<uint8_t*>(malloc(pageBufferSize));
   if (!pageBuffer) {
     LOG_ERR("XTR", "Failed to allocate page buffer (%lu bytes)", pageBufferSize);
+    if (bitDepth == 2) {
+      // 96KB two-plane allocation failed: degrade to a black/white-only render instead of
+      // failing the page outright. See renderXthPageOomFallback() for details.
+      renderXthPageOomFallback(wasDarkMode);
+      return;
+    }
     renderer.clearScreen();
     renderer.drawCenteredText(UI_12_FONT_ID, 300, tr(STR_MEMORY_ERROR), true, EpdFontFamily::BOLD);
     renderer.displayBuffer();
@@ -389,6 +474,107 @@ void XtcReaderActivity::renderPage() {
   }
 
   LOG_DBG("XTR", "Rendered page %lu/%lu (%u-bit)", currentPage + 1, xtc->getPageCount(), bitDepth);
+  renderer.setDarkMode(wasDarkMode);
+
+  if (pendingScreenshot) {
+    pendingScreenshot = false;
+    ScreenshotUtil::takeScreenshot(renderer);
+  }
+}
+
+void XtcReaderActivity::renderXthPageOomFallback(bool wasDarkMode) {
+  // The normal 2-bit (XTH) path needs a single ~96KB two-plane malloc, which can fail under
+  // memory pressure. Rather than showing a hard error, degrade to a black/white-only render:
+  // stream just plane1 (bit1) and treat bit1==1 as black. This loses the light-grey distinction
+  // (XTH pixel value 1, where bit1=0/bit2=1, is drawn white here instead of black) but keeps the
+  // page readable.
+  const uint16_t pageHeight = xtc->getPageHeight();
+  const size_t colBytes = (static_cast<size_t>(pageHeight) + 7) / 8;
+
+  // xtgStreamBuffer_ is only allocated for 1-bit books, so it's normally null here (this fallback
+  // is only reached for 2-bit books). Reuse it opportunistically if it happens to be available;
+  // otherwise fall back to a small dedicated scratch allocation.
+  uint8_t* scratch = xtgStreamBuffer_;
+  size_t scratchSize = xtgStreamBufferSize_;
+  bool ownsScratch = false;
+  if (!scratch) {
+    scratchSize = colBytes * 4;
+    scratch = static_cast<uint8_t*>(malloc(scratchSize));
+    ownsScratch = true;
+  }
+
+  if (!scratch) {
+    LOG_ERR("XTR", "OOM fallback: failed to allocate scratch buffer (%lu bytes)", scratchSize);
+    renderer.clearScreen();
+    renderer.drawCenteredText(UI_12_FONT_ID, 300, tr(STR_MEMORY_ERROR), true, EpdFontFamily::BOLD);
+    renderer.displayBuffer();
+    return;
+  }
+
+  renderer.clearScreen();
+
+  const xtc::XtcError err = xtc->loadPageStreaming(
+      currentPage, scratch, scratchSize,
+      [](void* rawCtx, const uint8_t* data, size_t size, size_t offset) {
+        auto* self = static_cast<XtcReaderActivity*>(rawCtx);
+        const uint16_t width = self->xtc->getPageWidth();
+        const uint16_t height = self->xtc->getPageHeight();
+        const size_t colBytesLocal = (static_cast<size_t>(height) + 7) / 8;
+        const size_t planeSizeLocal = static_cast<size_t>(width) * colBytesLocal;
+
+        // Only plane1 (bit1) matters for this degraded render; ignore plane2 chunks entirely.
+        if (offset >= planeSizeLocal) {
+          return;
+        }
+        size_t usableSize = size;
+        if (offset + usableSize > planeSizeLocal) {
+          usableSize = planeSizeLocal - offset;
+        }
+
+        // Same column-major layout/coordinate transform as the normal XTH getPixelValue() path:
+        // colIndex = pageWidth-1-x, byteInCol = y/8, bit shift = 7-(y%8).
+        for (size_t i = 0; i < usableSize; i++) {
+          const size_t byteOffset = offset + i;
+          const size_t colIndex = byteOffset / colBytesLocal;
+          const size_t byteInCol = byteOffset % colBytesLocal;
+          const uint16_t x = width - 1 - static_cast<uint16_t>(colIndex);
+          const uint8_t byteVal = data[i];
+          for (int shift = 0; shift < 8; shift++) {
+            const size_t y = byteInCol * 8 + (7 - static_cast<size_t>(shift));
+            if (y >= height) {
+              continue;  // Last byte in a column may be partially padded past pageHeight.
+            }
+            const uint8_t bit1 = (byteVal >> shift) & 1;
+            if (bit1 == 1) {
+              self->renderer.drawPixel(x, static_cast<uint16_t>(y), true);
+            }
+          }
+        }
+      },
+      this);
+
+  if (ownsScratch) {
+    free(scratch);
+  }
+
+  if (err != xtc::XtcError::OK) {
+    LOG_ERR("XTR", "OOM fallback: failed to stream page %lu: %s", currentPage, xtc::errorToString(err));
+    renderer.clearScreen();
+    renderer.drawCenteredText(UI_12_FONT_ID, 300, tr(STR_PAGE_LOAD_ERROR), true, EpdFontFamily::BOLD);
+    renderer.displayBuffer();
+    return;
+  }
+
+  // Display with appropriate refresh, same as the normal render paths
+  if (pagesUntilFullRefresh <= 1) {
+    renderer.displayBuffer(HalDisplay::HALF_REFRESH);
+    pagesUntilFullRefresh = SETTINGS.getRefreshFrequency();
+  } else {
+    renderer.displayBuffer();
+    pagesUntilFullRefresh--;
+  }
+
+  LOG_DBG("XTR", "Rendered page %lu/%lu (2-bit, OOM fallback)", currentPage + 1, xtc->getPageCount());
   renderer.setDarkMode(wasDarkMode);
 
   if (pendingScreenshot) {
