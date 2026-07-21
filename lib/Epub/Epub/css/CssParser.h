@@ -103,9 +103,19 @@ class CssParser {
    */
   bool loadFromCache();
 
+  /**
+   * True when the last loadFromCache() call bailed out because free heap was
+   * too low to hold the rule map. Distinguishes "transient memory pressure"
+   * (keep the cache file, retry next open) from "corrupt/stale cache"
+   * (delete and rebuild).
+   */
+  [[nodiscard]] bool lastLoadAbortedLowHeap() const { return lastLoadAbortedLowHeap_; }
+
  private:
   // Storage: maps normalized selector -> style properties
   std::unordered_map<std::string, CssStyle> rulesBySelector_;
+
+  bool lastLoadAbortedLowHeap_ = false;
 
   std::string cachePath;
 
