@@ -191,7 +191,10 @@ void OpdsBookBrowserActivity::render(RenderLock&&) {
   GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
 
   if (entries.empty()) {
-    renderer.drawCenteredText(UI_10_FONT_ID, pageHeight / 2, tr(STR_NO_ENTRIES));
+    // html2xtc (verifyTls) gets a friendlier message: an empty library right after pairing is
+    // the expected first-run state, not a lookup failure.
+    renderer.drawCenteredText(UI_10_FONT_ID, pageHeight / 2,
+                              server.verifyTls ? tr(STR_XTC_LIBRARY_EMPTY) : tr(STR_NO_ENTRIES));
   } else {
     const auto pageStartIndex = selectorIndex / PAGE_ITEMS * PAGE_ITEMS;
     renderer.fillRect(0, 60 + (selectorIndex % PAGE_ITEMS) * 30 - 2, pageWidth - 1, 30);
@@ -260,8 +263,9 @@ void OpdsBookBrowserActivity::fetchFeed(const std::string& path) {
   }
 
   selectorIndex = 0;
-  state = entries.empty() ? BrowserState::ERROR : BrowserState::BROWSING;
-  if (entries.empty()) errorMessage = tr(STR_NO_ENTRIES);
+  // An empty feed is a valid response (e.g. a freshly paired html2xtc device with no books
+  // assigned yet), not an error -- the BROWSING render path shows its own empty-state message.
+  state = BrowserState::BROWSING;
   requestUpdate();
 }
 
