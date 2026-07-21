@@ -183,13 +183,43 @@ void OpdsBookBrowserActivity::render(RenderLock&&) {
   }
 
   if (state == BrowserState::DOWNLOADING) {
+    // Throttle redraws to once per percentage point (mirrors SdFirmwareUpdateActivity::render()).
+    // When downloadTotal is unknown (0), draw the unknown-length placeholder only once per
+    // download instead of on every progress callback.
+    if (downloadTotal > 0) {
+      const int pct = static_cast<int>((static_cast<uint64_t>(downloadProgress) * 100) / downloadTotal);
+      if (pct == lastRenderedPercent) {
+        return;
+      }
+      lastRenderedPercent = pct;
+    } else {
+      if (lastRenderedPercent != -1) {
+        return;
+      }
+      lastRenderedPercent = -2;
+    }
+
+    const auto& metrics = UITheme::getInstance().getMetrics();
+
     renderer.drawCenteredText(UI_10_FONT_ID, pageHeight / 2 - 40, tr(STR_DOWNLOADING));
     auto title = renderer.truncatedText(UI_10_FONT_ID, statusMessage.c_str(), pageWidth - 40);
     renderer.drawCenteredText(UI_10_FONT_ID, pageHeight / 2 - 10, title.c_str());
     if (downloadTotal > 0) {
-      GUI.drawProgressBar(renderer, Rect{50, pageHeight / 2 + 20, pageWidth - 100, 20}, downloadProgress,
-                          downloadTotal);
+      const int barY = pageHeight / 2 + 20;
+      constexpr int barHeight = 20;
+      GUI.drawProgressBar(renderer, Rect{50, barY, pageWidth - 100, barHeight}, downloadProgress, downloadTotal);
+
+      // GUI.drawProgressBar() already draws a "NN%" line at barY + barHeight + 15; place the MB
+      // readout further below so the two don't overlap.
+      const std::string sizeText =
+          StringUtils::formatSize(downloadProgress) + " / " + StringUtils::formatSize(downloadTotal);
+      renderer.drawCenteredText(UI_10_FONT_ID, barY + barHeight + 15 + 40, sizeText.c_str());
     }
+
+    GUI.drawHelpText(renderer,
+                     Rect{0, pageHeight - metrics.buttonHintsHeight - metrics.contentSidePadding - 15, pageWidth, 20},
+                     tr(STR_DOWNLOAD_CANCEL_HINT));
+
     renderer.displayBuffer();
     return;
   }
@@ -335,6 +365,7 @@ void OpdsBookBrowserActivity::downloadBook(const OpdsEntry& book) {
   state = BrowserState::DOWNLOADING;
   statusMessage = book.title;
   downloadProgress = downloadTotal = 0;
+  lastRenderedPercent = -1;
   requestUpdate(true);
 
   // Build full download URL relative to the current feed, not the root server URL
@@ -348,12 +379,33 @@ void OpdsBookBrowserActivity::downloadBook(const OpdsEntry& book) {
   HttpDownloader::HttpResponseMetadata metadata;
   const auto result = HttpDownloader::downloadToFile(
       downloadUrl, kTempDownloadPath,
-      [this](const size_t downloaded, const size_t total) {
+      [this](const size_t downloaded, const size_t total) -> bool {
         downloadProgress = downloaded;
         downloadTotal = total;
         requestUpdate(true);
+
+        // Poll for a long-press Back to cancel. Safe to call at high frequency from inside this
+        // blocking download call: InputManager::update() is millis()-based and idempotent (the
+        // same pattern is used by HalGPIO::verifyPowerButtonWakeup in a synchronous loop), and
+        // GPIO/ADC reads here don't contend with the SD/display SPI bus.
+        mappedInput.update();
+        if (mappedInput.isPressed(MappedInputManager::Button::Back) &&
+            mappedInput.getHeldTime() >= kDownloadCancelHoldMs) {
+          return false;
+        }
+        return true;
       },
       0, server.username, server.password, &metadata, server.verifyTls);
+
+  if (result == HttpDownloader::ABORTED) {
+    LOG_INF("OPDS", "Download cancelled by user (held Back)");
+    // downloadToFile() already removed the partial temp file on the short-write path.
+    consumeBack = true;  // Swallow the wasReleased(Back) once the user lets go of the button, so
+                         // it doesn't also fire navigateBack() on the same release.
+    state = BrowserState::BROWSING;
+    requestUpdate();
+    return;
+  }
 
   if (result != HttpDownloader::OK) {
     LOG_ERR("OPDS", "Download failed: err=%d http=%d", static_cast<int>(result), HttpDownloader::lastHttpCode);

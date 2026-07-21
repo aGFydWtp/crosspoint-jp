@@ -41,6 +41,13 @@ class OpdsBookBrowserActivity final : public Activity {
   std::string statusMessage;
   size_t downloadProgress = 0;
   size_t downloadTotal = 0;
+  // Throttles DOWNLOADING re-renders to once per percentage point (see render()). Reset to -1 at
+  // the start of each downloadBook() call. When downloadTotal is unknown (0), -2 marks "the
+  // unknown-length placeholder has already been drawn once" so it isn't redrawn on every chunk.
+  int lastRenderedPercent = -1;
+  // Hold duration (ms) for Back to cancel an in-progress download; matches the GO_HOME_MS
+  // long-press convention used elsewhere in the codebase.
+  static constexpr unsigned long kDownloadCancelHoldMs = 1000;
 
   // Downloaded-file index for the html2xtc "already downloaded" marker (server.verifyTls only).
   // Key: 6-hex-digit id-hash suffix (see appendIdHashSuffix in the .cpp), value: full SD path.

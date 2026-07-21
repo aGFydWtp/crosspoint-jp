@@ -10,7 +10,11 @@
  */
 class HttpDownloader {
  public:
-  using ProgressCallback = std::function<void(size_t downloaded, size_t total)>;
+  /// Progress callback invoked after each successful chunk write during downloadToFile().
+  /// Return true to continue the download, or false to request cancellation -- the in-flight
+  /// write is reported as a short write to HTTPClient, which closes the connection and causes
+  /// downloadToFile() to return ABORTED (the partial temp file is removed automatically).
+  using ProgressCallback = std::function<bool(size_t downloaded, size_t total)>;
 
   enum DownloadError {
     OK = 0,
