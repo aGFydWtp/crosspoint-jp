@@ -2,6 +2,7 @@
 #include <OpdsParser.h>
 
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -41,6 +42,13 @@ class OpdsBookBrowserActivity final : public Activity {
   size_t downloadProgress = 0;
   size_t downloadTotal = 0;
 
+  // Downloaded-file index for the html2xtc "already downloaded" marker (server.verifyTls only).
+  // Key: 6-hex-digit id-hash suffix (see appendIdHashSuffix in the .cpp), value: full SD path.
+  // Rebuilt from a single /Html2Xtc directory listing in fetchFeed(); never touched by render()
+  // so render() stays free of SD I/O. EPUB downloads (saved to the SD root, not /Html2Xtc) are
+  // out of scope for this marker -- html2xtc only ever serves XTC.
+  std::unordered_map<std::string, std::string> downloadedByHash;
+
   OpdsServer server;  // Copied at construction — safe even if the store changes during browsing
 
   void checkAndConnectWifi();
@@ -57,5 +65,12 @@ class OpdsBookBrowserActivity final : public Activity {
   void downloadBook(const OpdsEntry& book);
   void launchSearch();
   void performSearch(const std::string& query);
+  // Populates downloadedByHash from a single listing of /Html2Xtc. Only called when
+  // server.verifyTls (html2xtc); a no-op directory listing for generic OPDS servers would be
+  // wasted SD I/O with no matching entries anyway.
+  void scanDownloadedFiles();
+  // Returns the full SD path of a previously downloaded file matching this book's id hash, or
+  // "" if book.id is empty or no match was found. Pure map lookup -- safe to call from render().
+  std::string downloadedPathFor(const OpdsEntry& book) const;
   bool preventAutoSleep() override { return true; }
 };

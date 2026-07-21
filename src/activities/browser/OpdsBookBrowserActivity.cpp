@@ -7,6 +7,7 @@
 #include <OpdsStream.h>
 #include <WiFi.h>
 
+#include <algorithm>
 #include <functional>
 
 #include "MappedInputManager.h"
@@ -32,13 +33,17 @@ std::string fallbackBaseName(const OpdsEntry& book) {
   return (book.author.empty() ? "" : book.author + " - ") + book.title;
 }
 
+// Deterministic 6-hex-digit id hash, shared by appendIdHashSuffix() (filename generation) and
+// downloadedPathFor() (matching a downloaded file back to its OPDS entry) so both always agree.
+std::string idHashHex(const std::string& id) {
+  char hex[7];
+  snprintf(hex, sizeof(hex), "%06zx", std::hash<std::string>{}(id) & 0xFFFFFFu);
+  return hex;
+}
+
 // Deterministic short suffix derived from the OPDS entry id, used to disambiguate filename
 // collisions while keeping repeat downloads of the same item idempotent.
-std::string appendIdHashSuffix(const std::string& base, const std::string& id) {
-  char suffix[10];
-  snprintf(suffix, sizeof(suffix), "_%06zx", std::hash<std::string>{}(id) & 0xFFFFFFu);
-  return base + suffix;
-}
+std::string appendIdHashSuffix(const std::string& base, const std::string& id) { return base + "_" + idHashHex(id); }
 }  // namespace
 
 void OpdsBookBrowserActivity::onEnter() {
@@ -114,7 +119,12 @@ void OpdsBookBrowserActivity::loop() {
     if (mappedInput.wasReleased(MappedInputManager::Button::Confirm)) {
       if (!entries.empty()) {
         const auto& entry = entries[selectorIndex];
-        entry.type == OpdsEntryType::BOOK ? downloadBook(entry) : navigateToEntry(entry);
+        if (entry.type != OpdsEntryType::BOOK) {
+          navigateToEntry(entry);
+        } else {
+          const std::string downloadedPath = downloadedPathFor(entry);
+          downloadedPath.empty() ? downloadBook(entry) : onSelectBook(downloadedPath);
+        }
       }
     } else if (mappedInput.wasReleased(MappedInputManager::Button::Back)) {
       navigateBack();
@@ -184,8 +194,11 @@ void OpdsBookBrowserActivity::render(RenderLock&&) {
     return;
   }
 
-  const char* confirmLabel =
-      (!entries.empty() && entries[selectorIndex].type == OpdsEntryType::BOOK) ? tr(STR_DOWNLOAD) : tr(STR_OPEN);
+  const bool selectedIsDownloadedBook = !entries.empty() && entries[selectorIndex].type == OpdsEntryType::BOOK &&
+                                        !downloadedPathFor(entries[selectorIndex]).empty();
+  const char* confirmLabel = (!entries.empty() && entries[selectorIndex].type == OpdsEntryType::BOOK)
+                                 ? (selectedIsDownloadedBook ? tr(STR_OPEN) : tr(STR_DOWNLOAD))
+                                 : tr(STR_OPEN);
   const char* searchLabel = (!searchTemplate.empty() && selectorIndex == 0) ? tr(STR_SEARCH) : tr(STR_DIR_UP);
   const auto labels = mappedInput.mapLabels(tr(STR_BACK), confirmLabel, searchLabel, tr(STR_DIR_DOWN));
   GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
@@ -202,6 +215,8 @@ void OpdsBookBrowserActivity::render(RenderLock&&) {
     for (size_t i = pageStartIndex; i < entries.size() && i < static_cast<size_t>(pageStartIndex + PAGE_ITEMS); i++) {
       const auto& entry = entries[i];
       std::string displayText = (entry.type == OpdsEntryType::NAVIGATION) ? "> " + entry.title : entry.title;
+      const bool isDownloaded = entry.type == OpdsEntryType::BOOK && !downloadedPathFor(entry).empty();
+      if (isDownloaded) displayText = std::string(tr(STR_XTC_DOWNLOADED_MARK)) + displayText;
       if (entry.type == OpdsEntryType::BOOK && !entry.author.empty()) displayText += " - " + entry.author;
       auto item = renderer.truncatedText(UI_10_FONT_ID, displayText.c_str(), pageWidth - 40);
       renderer.drawText(UI_10_FONT_ID, 20, 60 + (i % PAGE_ITEMS) * 30, item.c_str(),
@@ -234,6 +249,17 @@ void OpdsBookBrowserActivity::fetchFeed(const std::string& path) {
       if (HttpDownloader::lastHttpCode == HttpDownloader::TLS_ERROR_CODE) {
         errorMessage = tr(STR_ERROR_TLS_VERIFICATION_FAILED);
         errorHint = tr(STR_ERROR_TLS_CHECK_HINT);
+      } else if (server.verifyTls && HttpDownloader::lastHttpCode == 401) {
+        // html2xtc returns 401 for every auth failure (unknown device, bad token, revoked
+        // device) -- it never returns 403. Guarded by verifyTls so generic OPDS servers keep
+        // their existing generic error.
+        errorMessage = tr(STR_XTC_AUTH_FAILED);
+        errorHint = tr(STR_XTC_REPAIR_HINT);
+      } else if (server.verifyTls && HttpDownloader::lastHttpCode == 403) {
+        // Defensive only: the real html2xtc server never sends 403 (see 401 comment above), but
+        // handle it the same way in case that ever changes.
+        errorMessage = tr(STR_XTC_DEVICE_REVOKED);
+        errorHint = tr(STR_XTC_REPAIR_HINT);
       } else {
         errorMessage = tr(STR_FETCH_FEED_FAILED);
         errorHint.clear();
@@ -263,6 +289,13 @@ void OpdsBookBrowserActivity::fetchFeed(const std::string& path) {
   }
 
   selectorIndex = 0;
+
+  // Refresh the "already downloaded" index for html2xtc feeds. Generic OPDS servers never
+  // populate downloadedByHash, so their entries just never match in downloadedPathFor().
+  if (server.verifyTls) {
+    scanDownloadedFiles();
+  }
+
   // An empty feed is a valid response (e.g. a freshly paired html2xtc device with no books
   // assigned yet), not an error -- the BROWSING render path shows its own empty-state message.
   state = BrowserState::BROWSING;
@@ -329,6 +362,14 @@ void OpdsBookBrowserActivity::downloadBook(const OpdsEntry& book) {
     if (result == HttpDownloader::TLS_ERROR) {
       errorMessage = tr(STR_ERROR_TLS_VERIFICATION_FAILED);
       errorHint = tr(STR_ERROR_TLS_CHECK_HINT);
+    } else if (server.verifyTls && HttpDownloader::lastHttpCode == 401) {
+      // See the matching comment in fetchFeed(): html2xtc always returns 401 for auth failures.
+      errorMessage = tr(STR_XTC_AUTH_FAILED);
+      errorHint = tr(STR_XTC_REPAIR_HINT);
+    } else if (server.verifyTls && HttpDownloader::lastHttpCode == 403) {
+      // Defensive only; see the matching comment in fetchFeed().
+      errorMessage = tr(STR_XTC_DEVICE_REVOKED);
+      errorHint = tr(STR_XTC_REPAIR_HINT);
     } else {
       errorMessage = tr(STR_DOWNLOAD_FAILED);
       errorHint.clear();
@@ -414,10 +455,51 @@ void OpdsBookBrowserActivity::downloadBook(const OpdsEntry& book) {
 
   if (format == DownloadFormat::EPUB) {
     Epub(destPath, "/.crosspoint").clearCache();
+  } else if (!book.id.empty()) {
+    // Reflect the new download immediately without waiting for the next fetchFeed() rescan.
+    // EPUBs are saved to the SD root (not /Html2Xtc) and are out of scope for this marker.
+    downloadedByHash[idHashHex(book.id)] = destPath;
   }
 
   state = BrowserState::BROWSING;
   requestUpdate();
+}
+
+void OpdsBookBrowserActivity::scanDownloadedFiles() {
+  downloadedByHash.clear();
+
+  auto dir = Storage.open(kHtml2XtcDir);
+  if (!dir || !dir.isDirectory()) {
+    // No /Html2Xtc directory yet (e.g. nothing downloaded from this server so far) -- leave the
+    // map empty rather than treating it as an error.
+    return;
+  }
+  dir.rewindDirectory();
+
+  char name[500];
+  for (auto file = dir.openNextFile(); file; file = dir.openNextFile()) {
+    if (file.isDirectory()) continue;
+    file.getName(name, sizeof(name));
+
+    const std::string filename(name);
+    const std::string base = DownloadFormatUtils::stripExtension(filename);
+    // Match the "_%06zx" suffix appendIdHashSuffix() writes: 6 lowercase hex digits after a
+    // trailing underscore. Files without that suffix (no book.id at download time) are skipped.
+    if (base.size() < 7 || base[base.size() - 7] != '_') continue;
+
+    const std::string hash = base.substr(base.size() - 6);
+    const bool isHex =
+        std::all_of(hash.begin(), hash.end(), [](char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'); });
+    if (!isHex) continue;
+
+    downloadedByHash[hash] = std::string(kHtml2XtcDir) + "/" + filename;
+  }
+}
+
+std::string OpdsBookBrowserActivity::downloadedPathFor(const OpdsEntry& book) const {
+  if (book.id.empty()) return "";
+  const auto it = downloadedByHash.find(idHashHex(book.id));
+  return it != downloadedByHash.end() ? it->second : "";
 }
 
 void OpdsBookBrowserActivity::launchSearch() {
