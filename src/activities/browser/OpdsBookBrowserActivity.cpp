@@ -216,9 +216,13 @@ void OpdsBookBrowserActivity::render(RenderLock&&) {
       renderer.drawCenteredText(UI_10_FONT_ID, barY + barHeight + 15 + 40, sizeText.c_str());
     }
 
-    GUI.drawHelpText(renderer,
-                     Rect{0, pageHeight - metrics.buttonHintsHeight - metrics.contentSidePadding - 15, pageWidth, 20},
-                     tr(STR_DOWNLOAD_CANCEL_HINT));
+    // Cancellation is detected inside the progress callback, which only fires when the response
+    // has a Content-Length (FileWriteStream gates on total > 0) -- don't advertise it otherwise.
+    if (downloadTotal > 0) {
+      GUI.drawHelpText(renderer,
+                       Rect{0, pageHeight - metrics.buttonHintsHeight - metrics.contentSidePadding - 15, pageWidth, 20},
+                       tr(STR_DOWNLOAD_CANCEL_HINT));
+    }
 
     renderer.displayBuffer();
     return;

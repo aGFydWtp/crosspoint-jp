@@ -391,6 +391,15 @@ HttpDownloader::DownloadError HttpDownloader::downloadToFile(const std::string& 
     return HTTP_ERROR;
   }
 
+  // Defensive: if the framework ever tolerates the abort's short write and reports success,
+  // the file is still truncated -- never let an aborted download pass as OK.
+  if (fileStream.aborted()) {
+    LOG_INF("HTTP", "Download cancelled by progress callback (len=%zu, downloaded=%zu)", contentLength,
+            fileStream.downloaded());
+    Storage.remove(destPath.c_str());
+    return ABORTED;
+  }
+
   const size_t downloaded = fileStream.downloaded();
   LOG_DBG("HTTP", "Downloaded %zu bytes", downloaded);
 
