@@ -19,6 +19,7 @@
 #include "components/UITheme.h"
 #include "fontIds.h"
 #include "images/Logo120.h"
+#include "network/TimeSync.h"
 
 void SleepActivity::onEnter() {
   Activity::onEnter();
@@ -351,9 +352,9 @@ void SleepActivity::drawCalendarIfPending() const {
 }
 
 bool SleepActivity::isTimeValid() {
-  // 2024-01-01 00:00:00 UTC = 1704067200
-  // NTP未同期の場合、time()はエポック付近（1970年）を返す
-  return time(nullptr) >= 1704067200;
+  // Logic lives in TimeSync (src/network/TimeSync.cpp) so TLS certificate-validity checks
+  // (Phase 1) share the same "has NTP synced yet" threshold instead of duplicating it.
+  return TimeSync::isTimeValid();
 }
 
 void SleepActivity::renderCalendarOverlay() const {

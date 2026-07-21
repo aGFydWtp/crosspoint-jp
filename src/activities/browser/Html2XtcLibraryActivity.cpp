@@ -26,6 +26,9 @@ void Html2XtcLibraryActivity::onEnter() {
     server.url = std::move(url);
     server.username = HTML2XTC_STORE.getDeviceId();
     server.password = HTML2XTC_STORE.getDeviceToken();
+    // html2xtc is a first-party HTTPS endpoint (unlike ad-hoc/self-signed generic OPDS servers),
+    // so verify its certificate chain and hostname against the embedded default CA bundle.
+    server.verifyTls = true;
 
     // Launching from onEnter() is safe: pushActivity() only records a pending
     // action, which ActivityManager::loop() processes right after onEnter()

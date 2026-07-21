@@ -36,6 +36,7 @@ class OpdsBookBrowserActivity final : public Activity {
   bool consumeBack = false;  // Added missing member
   int selectorIndex = 0;
   std::string errorMessage;
+  std::string errorHint;  // Optional second line shown below errorMessage on the ERROR screen
   std::string statusMessage;
   size_t downloadProgress = 0;
   size_t downloadTotal = 0;
@@ -45,6 +46,11 @@ class OpdsBookBrowserActivity final : public Activity {
   void checkAndConnectWifi();
   void launchWifiSelection();
   void onWifiSelectionComplete(bool connected);
+  // When server.verifyTls, makes sure the clock is synced (NTP) before any TLS-verified request
+  // is made -- a not-yet-synced clock makes every certificate look not-yet-valid. On failure,
+  // sets state=ERROR with a time-sync-specific message and returns false; TLS verification is
+  // never silently disabled as a fallback. No-op (returns true) when !server.verifyTls.
+  bool ensureTimeSyncedIfNeeded();
   void fetchFeed(const std::string& path);
   void navigateToEntry(const OpdsEntry& entry);
   void navigateBack();

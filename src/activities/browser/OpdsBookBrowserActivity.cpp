@@ -15,6 +15,7 @@
 #include "components/UITheme.h"
 #include "fontIds.h"
 #include "network/HttpDownloader.h"
+#include "network/TimeSync.h"
 #include "util/DownloadFormat.h"
 #include "util/StringUtils.h"
 #include "util/UrlUtils.h"
@@ -52,6 +53,7 @@ void OpdsBookBrowserActivity::onEnter() {
   consumeConfirm = false;
   consumeBack = false;
   errorMessage.clear();
+  errorHint.clear();
   statusMessage = tr(STR_CHECKING_WIFI);
   requestUpdate();
 
@@ -160,6 +162,9 @@ void OpdsBookBrowserActivity::render(RenderLock&&) {
   if (state == BrowserState::ERROR) {
     renderer.drawCenteredText(UI_10_FONT_ID, pageHeight / 2 - 20, tr(STR_ERROR_MSG));
     renderer.drawCenteredText(UI_10_FONT_ID, pageHeight / 2 + 10, errorMessage.c_str());
+    if (!errorHint.empty()) {
+      renderer.drawCenteredText(UI_10_FONT_ID, pageHeight / 2 + 40, errorHint.c_str());
+    }
     const auto labels = mappedInput.mapLabels(tr(STR_BACK), tr(STR_RETRY), "", "");
     GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
     renderer.displayBuffer();
@@ -206,6 +211,7 @@ void OpdsBookBrowserActivity::fetchFeed(const std::string& path) {
   if (server.url.empty()) {
     state = BrowserState::ERROR;
     errorMessage = tr(STR_NO_SERVER_URL);
+    errorHint.clear();
     requestUpdate();
     return;
   }
@@ -215,9 +221,15 @@ void OpdsBookBrowserActivity::fetchFeed(const std::string& path) {
   OpdsParser parser;
   {
     OpdsParserStream stream{parser};
-    if (!HttpDownloader::fetchUrl(url, stream, server.username, server.password)) {
+    if (!HttpDownloader::fetchUrl(url, stream, server.username, server.password, server.verifyTls)) {
       state = BrowserState::ERROR;
-      errorMessage = tr(STR_FETCH_FEED_FAILED);
+      if (HttpDownloader::lastHttpCode == HttpDownloader::TLS_ERROR_CODE) {
+        errorMessage = tr(STR_ERROR_TLS_VERIFICATION_FAILED);
+        errorHint = tr(STR_ERROR_TLS_CHECK_HINT);
+      } else {
+        errorMessage = tr(STR_FETCH_FEED_FAILED);
+        errorHint.clear();
+      }
       requestUpdate();
       return;
     }
@@ -299,13 +311,19 @@ void OpdsBookBrowserActivity::downloadBook(const OpdsEntry& book) {
         downloadTotal = total;
         requestUpdate(true);
       },
-      0, server.username, server.password, &metadata);
+      0, server.username, server.password, &metadata, server.verifyTls);
 
   if (result != HttpDownloader::OK) {
     LOG_ERR("OPDS", "Download failed: err=%d http=%d", static_cast<int>(result), HttpDownloader::lastHttpCode);
     Storage.remove(kTempDownloadPath);
     state = BrowserState::ERROR;
-    errorMessage = tr(STR_DOWNLOAD_FAILED);
+    if (result == HttpDownloader::TLS_ERROR) {
+      errorMessage = tr(STR_ERROR_TLS_VERIFICATION_FAILED);
+      errorHint = tr(STR_ERROR_TLS_CHECK_HINT);
+    } else {
+      errorMessage = tr(STR_DOWNLOAD_FAILED);
+      errorHint.clear();
+    }
     requestUpdate();
     return;
   }
@@ -326,6 +344,7 @@ void OpdsBookBrowserActivity::downloadBook(const OpdsEntry& book) {
     Storage.remove(kTempDownloadPath);
     state = BrowserState::ERROR;
     errorMessage = tr(STR_UNSUPPORTED_DOWNLOAD_FORMAT);
+    errorHint.clear();
     requestUpdate();
     return;
   }
@@ -349,6 +368,7 @@ void OpdsBookBrowserActivity::downloadBook(const OpdsEntry& book) {
       Storage.remove(kTempDownloadPath);
       state = BrowserState::ERROR;
       errorMessage = tr(STR_DOWNLOAD_FAILED);
+      errorHint.clear();
       requestUpdate();
       return;
     }
@@ -376,6 +396,7 @@ void OpdsBookBrowserActivity::downloadBook(const OpdsEntry& book) {
     Storage.remove(kTempDownloadPath);
     state = BrowserState::ERROR;
     errorMessage = tr(STR_DOWNLOAD_FAILED);
+    errorHint.clear();
     requestUpdate();
     return;
   }
@@ -444,6 +465,7 @@ void OpdsBookBrowserActivity::performSearch(const std::string& query) {
 
 void OpdsBookBrowserActivity::checkAndConnectWifi() {
   if (WiFi.status() == WL_CONNECTED && WiFi.localIP() != IPAddress(0, 0, 0, 0)) {
+    if (!ensureTimeSyncedIfNeeded()) return;
     state = BrowserState::LOADING;
     statusMessage = tr(STR_LOADING);
     requestUpdate();
@@ -451,6 +473,28 @@ void OpdsBookBrowserActivity::checkAndConnectWifi() {
     return;
   }
   launchWifiSelection();
+}
+
+bool OpdsBookBrowserActivity::ensureTimeSyncedIfNeeded() {
+  if (!server.verifyTls || TimeSync::isTimeValid()) {
+    return true;
+  }
+
+  // NTP sync happens before the first TLS-verified request: a not-yet-synced clock (post-boot,
+  // no RTC battery) makes every certificate's notBefore check fail. Blocking here is consistent
+  // with fetchFeed()/downloadBook() already blocking the activity loop for network I/O.
+  statusMessage = tr(STR_LOADING);
+  requestUpdate(true);
+  if (TimeSync::ensureSynced(10000)) {
+    return true;
+  }
+
+  LOG_ERR("OPDS", "NTP sync failed; refusing to proceed with TLS-verified server");
+  state = BrowserState::ERROR;
+  errorMessage = tr(STR_ERROR_TIME_SYNC_FAILED);
+  errorHint.clear();
+  requestUpdate();
+  return false;
 }
 
 void OpdsBookBrowserActivity::launchWifiSelection() {
@@ -463,6 +507,7 @@ void OpdsBookBrowserActivity::launchWifiSelection() {
 
 void OpdsBookBrowserActivity::onWifiSelectionComplete(const bool connected) {
   if (connected) {
+    if (!ensureTimeSyncedIfNeeded()) return;
     state = BrowserState::LOADING;
     statusMessage = tr(STR_LOADING);
     requestUpdate(true);
@@ -472,6 +517,7 @@ void OpdsBookBrowserActivity::onWifiSelectionComplete(const bool connected) {
     WiFi.mode(WIFI_OFF);
     state = BrowserState::ERROR;
     errorMessage = tr(STR_WIFI_CONN_FAILED);
+    errorHint.clear();
     requestUpdate();
   }
 }
