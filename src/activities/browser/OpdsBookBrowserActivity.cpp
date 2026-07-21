@@ -357,15 +357,17 @@ void OpdsBookBrowserActivity::downloadBook(const OpdsEntry& book) {
         dispositionFilename.empty()
             ? StringUtils::sanitizeFilename(fallbackBaseName(book))
             : StringUtils::sanitizeFilename(DownloadFormatUtils::stripExtension(dispositionFilename));
-    destPath = destDir + baseName + extension;
+    // Always append the id-hash suffix (when we have an id) instead of only doing so on collision:
+    // an exists-then-decide branch means the same item's first download lands on the bare path and
+    // every subsequent re-download of that same item collides with it and gets pushed onto the
+    // suffixed path, leaving the original as an orphan and creating a new file per re-download.
+    // Making the suffix unconditional keeps a given item's path deterministic across downloads
+    // (idempotent overwrite below) while still avoiding collisions between different items that
+    // happen to share a title (they hash to different suffixes).
+    const std::string finalBaseName = book.id.empty() ? baseName : appendIdHashSuffix(baseName, book.id);
+    destPath = destDir + finalBaseName + extension;
     if (Storage.exists(destPath.c_str())) {
-      // Name collision: fall back to a deterministic per-entry suffix so re-downloading the same
-      // OPDS item is idempotent (overwrites its own prior download) instead of accumulating
-      // duplicates, while still not clobbering an unrelated item that happens to share a title.
-      destPath = destDir + appendIdHashSuffix(baseName, book.id) + extension;
-      if (Storage.exists(destPath.c_str())) {
-        Storage.remove(destPath.c_str());
-      }
+      Storage.remove(destPath.c_str());
     }
   }
 
