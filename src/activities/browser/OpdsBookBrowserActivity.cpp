@@ -7,18 +7,38 @@
 #include <OpdsStream.h>
 #include <WiFi.h>
 
+#include <functional>
+
 #include "MappedInputManager.h"
 #include "activities/network/WifiSelectionActivity.h"
 #include "activities/util/KeyboardEntryActivity.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
 #include "network/HttpDownloader.h"
+#include "util/DownloadFormat.h"
 #include "util/StringUtils.h"
 #include "util/UrlUtils.h"
 
 namespace {
 constexpr int PAGE_ITEMS = 23;
+
+// Single reusable temp-download path: only one OPDS download runs at a time (the activity blocks
+// input while state == DOWNLOADING), so this doesn't need to be unique per-download.
+constexpr const char* kTempDownloadPath = "/opds_download.tmp";
+constexpr const char* kHtml2XtcDir = "/Html2Xtc";
+
+std::string fallbackBaseName(const OpdsEntry& book) {
+  return (book.author.empty() ? "" : book.author + " - ") + book.title;
 }
+
+// Deterministic short suffix derived from the OPDS entry id, used to disambiguate filename
+// collisions while keeping repeat downloads of the same item idempotent.
+std::string appendIdHashSuffix(const std::string& base, const std::string& id) {
+  char suffix[10];
+  snprintf(suffix, sizeof(suffix), "_%06zx", std::hash<std::string>{}(id) & 0xFFFFFFu);
+  return base + suffix;
+}
+}  // namespace
 
 void OpdsBookBrowserActivity::onEnter() {
   Activity::onEnter();
@@ -34,6 +54,9 @@ void OpdsBookBrowserActivity::onEnter() {
   errorMessage.clear();
   statusMessage = tr(STR_CHECKING_WIFI);
   requestUpdate();
+
+  // Clean up a temp file left behind by a download that never completed (e.g. crash, power loss).
+  Storage.remove(kTempDownloadPath);
 
   checkAndConnectWifi();
 }
@@ -213,10 +236,10 @@ void OpdsBookBrowserActivity::fetchFeed(const std::string& path) {
   entries = std::move(parser).getEntries();
 
   if (!prevUrl.empty()) {
-    entries.insert(entries.begin(), OpdsEntry{OpdsEntryType::NAVIGATION, tr(STR_PREV_PAGE), "", prevUrl, ""});
+    entries.insert(entries.begin(), OpdsEntry{OpdsEntryType::NAVIGATION, tr(STR_PREV_PAGE), "", prevUrl, "", ""});
   }
   if (!nextUrl.empty()) {
-    entries.push_back(OpdsEntry{OpdsEntryType::NAVIGATION, tr(STR_NEXT_PAGE), "", nextUrl, ""});
+    entries.push_back(OpdsEntry{OpdsEntryType::NAVIGATION, tr(STR_NEXT_PAGE), "", nextUrl, "", ""});
   }
 
   selectorIndex = 0;
@@ -263,26 +286,105 @@ void OpdsBookBrowserActivity::downloadBook(const OpdsEntry& book) {
   // Build full download URL relative to the current feed, not the root server URL
   const std::string feedUrl = UrlUtils::buildUrl(server.url, currentPath);
   std::string downloadUrl = UrlUtils::buildUrl(feedUrl, book.href);
-  std::string filename =
-      "/" + StringUtils::sanitizeFilename((book.author.empty() ? "" : book.author + " - ") + book.title) + ".epub";
-  LOG_DBG("OPDS", "Downloading: %s -> %s", downloadUrl.c_str(), filename.c_str());
+  LOG_DBG("OPDS", "Downloading: %s -> %s", downloadUrl.c_str(), kTempDownloadPath);
 
+  // Clean up a stale temp file left behind by a previous interrupted download.
+  Storage.remove(kTempDownloadPath);
+
+  HttpDownloader::HttpResponseMetadata metadata;
   const auto result = HttpDownloader::downloadToFile(
-      downloadUrl, filename,
+      downloadUrl, kTempDownloadPath,
       [this](const size_t downloaded, const size_t total) {
         downloadProgress = downloaded;
         downloadTotal = total;
         requestUpdate(true);
       },
-      0, server.username, server.password);
+      0, server.username, server.password, &metadata);
 
-  if (result == HttpDownloader::OK) {
-    Epub(filename, "/.crosspoint").clearCache();
-    state = BrowserState::BROWSING;
-  } else {
+  if (result != HttpDownloader::OK) {
+    LOG_ERR("OPDS", "Download failed: err=%d http=%d", static_cast<int>(result), HttpDownloader::lastHttpCode);
+    Storage.remove(kTempDownloadPath);
     state = BrowserState::ERROR;
     errorMessage = tr(STR_DOWNLOAD_FAILED);
+    requestUpdate();
+    return;
   }
+
+  // Format is decided only after the download completes: Content-Disposition filename extension
+  // (preferred), then the response Content-Type, then (if that's inconclusive, e.g. a generic
+  // application/octet-stream) the OPDS entry's own media type, then the href extension.
+  const std::string dispositionFilename =
+      DownloadFormatUtils::parseContentDispositionFilename(metadata.contentDisposition);
+  DownloadFormat format = DownloadFormatUtils::detectFormat(dispositionFilename, metadata.contentType, book.href);
+  if (format == DownloadFormat::UNKNOWN) {
+    format = DownloadFormatUtils::detectFormat(dispositionFilename, book.mediaType, book.href);
+  }
+
+  if (format == DownloadFormat::UNKNOWN) {
+    LOG_ERR("OPDS", "Unrecognized download format (contentType=%s, entryMediaType=%s, href=%s)",
+            metadata.contentType.c_str(), book.mediaType.c_str(), book.href.c_str());
+    Storage.remove(kTempDownloadPath);
+    state = BrowserState::ERROR;
+    errorMessage = tr(STR_UNSUPPORTED_DOWNLOAD_FORMAT);
+    requestUpdate();
+    return;
+  }
+
+  const char* extension = DownloadFormatUtils::extensionForFormat(format);
+  std::string destPath;
+
+  if (format == DownloadFormat::EPUB) {
+    // Unchanged from pre-Phase2 behavior: fixed root-directory "<author> - <title>.epub" path,
+    // never the Content-Disposition filename, so existing OPDS users re-downloading a book keep the
+    // same filename (and thus reading progress) instead of silently landing on a different file.
+    const std::string baseName = StringUtils::sanitizeFilename(fallbackBaseName(book));
+    destPath = "/" + baseName + extension;
+    if (Storage.exists(destPath.c_str())) {
+      Storage.remove(destPath.c_str());
+    }
+  } else {
+    const std::string destDir = std::string(kHtml2XtcDir) + "/";
+    if (!Storage.exists(kHtml2XtcDir) && !Storage.mkdir(kHtml2XtcDir)) {
+      LOG_ERR("OPDS", "Failed to create %s", kHtml2XtcDir);
+      Storage.remove(kTempDownloadPath);
+      state = BrowserState::ERROR;
+      errorMessage = tr(STR_DOWNLOAD_FAILED);
+      requestUpdate();
+      return;
+    }
+
+    const std::string baseName =
+        dispositionFilename.empty()
+            ? StringUtils::sanitizeFilename(fallbackBaseName(book))
+            : StringUtils::sanitizeFilename(DownloadFormatUtils::stripExtension(dispositionFilename));
+    destPath = destDir + baseName + extension;
+    if (Storage.exists(destPath.c_str())) {
+      // Name collision: fall back to a deterministic per-entry suffix so re-downloading the same
+      // OPDS item is idempotent (overwrites its own prior download) instead of accumulating
+      // duplicates, while still not clobbering an unrelated item that happens to share a title.
+      destPath = destDir + appendIdHashSuffix(baseName, book.id) + extension;
+      if (Storage.exists(destPath.c_str())) {
+        Storage.remove(destPath.c_str());
+      }
+    }
+  }
+
+  if (!Storage.rename(kTempDownloadPath, destPath.c_str())) {
+    LOG_ERR("OPDS", "Rename failed: %s -> %s", kTempDownloadPath, destPath.c_str());
+    Storage.remove(kTempDownloadPath);
+    state = BrowserState::ERROR;
+    errorMessage = tr(STR_DOWNLOAD_FAILED);
+    requestUpdate();
+    return;
+  }
+
+  LOG_DBG("OPDS", "Downloaded: %s", destPath.c_str());
+
+  if (format == DownloadFormat::EPUB) {
+    Epub(destPath, "/.crosspoint").clearCache();
+  }
+
+  state = BrowserState::BROWSING;
   requestUpdate();
 }
 

@@ -175,7 +175,8 @@ bool HttpDownloader::fetchUrl(const std::string& url, std::string& outContent, c
 
 HttpDownloader::DownloadError HttpDownloader::downloadToFile(const std::string& url, const std::string& destPath,
                                                              ProgressCallback progress, int timeoutMs,
-                                                             const std::string& username, const std::string& password) {
+                                                             const std::string& username, const std::string& password,
+                                                             HttpResponseMetadata* outMetadata) {
   // Use NetworkClientSecure for HTTPS, regular NetworkClient for HTTP
   std::unique_ptr<NetworkClient> client;
   if (UrlUtils::isHttpsUrl(url)) {
@@ -204,8 +205,19 @@ HttpDownloader::DownloadError HttpDownloader::downloadToFile(const std::string& 
     http.addHeader("Authorization", "Basic " + encoded);
   }
 
+  // Headers must be registered before GET() or header() will always return empty afterwards.
+  if (outMetadata) {
+    static const char* kCollectedHeaders[] = {"Content-Type", "Content-Disposition"};
+    http.collectHeaders(kCollectedHeaders, 2);
+  }
+
   const int httpCode = http.GET();
   lastHttpCode = httpCode;
+  if (outMetadata) {
+    outMetadata->statusCode = httpCode;
+    outMetadata->contentType = http.header("Content-Type").c_str();
+    outMetadata->contentDisposition = http.header("Content-Disposition").c_str();
+  }
   if (httpCode != HTTP_CODE_OK) {
     LOG_ERR("HTTP", "Download failed: %d", httpCode);
     http.end();
@@ -218,6 +230,9 @@ HttpDownloader::DownloadError HttpDownloader::downloadToFile(const std::string& 
     LOG_DBG("HTTP", "Content-Length: %zu", contentLength);
   } else {
     LOG_DBG("HTTP", "Content-Length: unknown");
+  }
+  if (outMetadata) {
+    outMetadata->contentLength = contentLength;
   }
 
   // Remove existing file if present
