@@ -87,6 +87,7 @@ void OpdsBookBrowserActivity::loop() {
   if (state == BrowserState::ERROR) {
     if (mappedInput.wasReleased(MappedInputManager::Button::Confirm)) {
       if (WiFi.status() == WL_CONNECTED && WiFi.localIP() != IPAddress(0, 0, 0, 0)) {
+        if (!ensureTimeSyncedIfNeeded()) return;
         state = BrowserState::LOADING;
         statusMessage = tr(STR_LOADING);
         requestUpdate();
@@ -208,6 +209,10 @@ void OpdsBookBrowserActivity::render(RenderLock&&) {
 }
 
 void OpdsBookBrowserActivity::fetchFeed(const std::string& path) {
+  // Clear any hint left over from a previous error (e.g. a TLS failure) up front, so a later
+  // failure in this call that doesn't set its own hint can't show a stale, unrelated one.
+  errorHint.clear();
+
   if (server.url.empty()) {
     state = BrowserState::ERROR;
     errorMessage = tr(STR_NO_SERVER_URL);
