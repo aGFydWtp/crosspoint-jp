@@ -55,6 +55,9 @@ void OpdsBookBrowserActivity::onEnter() {
   statusMessage = tr(STR_CHECKING_WIFI);
   requestUpdate();
 
+  // Clean up a temp file left behind by a download that never completed (e.g. crash, power loss).
+  Storage.remove(kTempDownloadPath);
+
   checkAndConnectWifi();
 }
 
@@ -307,15 +310,19 @@ void OpdsBookBrowserActivity::downloadBook(const OpdsEntry& book) {
     return;
   }
 
-  // Format is decided only after the download completes: Content-Disposition (preferred), then the
-  // OPDS entry's media type, then the href extension.
+  // Format is decided only after the download completes: Content-Disposition filename extension
+  // (preferred), then the response Content-Type, then (if that's inconclusive, e.g. a generic
+  // application/octet-stream) the OPDS entry's own media type, then the href extension.
   const std::string dispositionFilename =
       DownloadFormatUtils::parseContentDispositionFilename(metadata.contentDisposition);
-  const std::string mediaType = !metadata.contentType.empty() ? metadata.contentType : book.mediaType;
-  const DownloadFormat format = DownloadFormatUtils::detectFormat(dispositionFilename, mediaType, book.href);
+  DownloadFormat format = DownloadFormatUtils::detectFormat(dispositionFilename, metadata.contentType, book.href);
+  if (format == DownloadFormat::UNKNOWN) {
+    format = DownloadFormatUtils::detectFormat(dispositionFilename, book.mediaType, book.href);
+  }
 
   if (format == DownloadFormat::UNKNOWN) {
-    LOG_ERR("OPDS", "Unrecognized download format (mediaType=%s, href=%s)", mediaType.c_str(), book.href.c_str());
+    LOG_ERR("OPDS", "Unrecognized download format (contentType=%s, entryMediaType=%s, href=%s)",
+            metadata.contentType.c_str(), book.mediaType.c_str(), book.href.c_str());
     Storage.remove(kTempDownloadPath);
     state = BrowserState::ERROR;
     errorMessage = tr(STR_UNSUPPORTED_DOWNLOAD_FORMAT);
@@ -324,14 +331,19 @@ void OpdsBookBrowserActivity::downloadBook(const OpdsEntry& book) {
   }
 
   const char* extension = DownloadFormatUtils::extensionForFormat(format);
-  const std::string baseName =
-      dispositionFilename.empty()
-          ? StringUtils::sanitizeFilename(fallbackBaseName(book))
-          : StringUtils::sanitizeFilename(DownloadFormatUtils::stripExtension(dispositionFilename));
+  std::string destPath;
 
-  std::string destDir = "/";
-  if (format != DownloadFormat::EPUB) {
-    destDir = std::string(kHtml2XtcDir) + "/";
+  if (format == DownloadFormat::EPUB) {
+    // Unchanged from pre-Phase2 behavior: fixed root-directory "<author> - <title>.epub" path,
+    // never the Content-Disposition filename, so existing OPDS users re-downloading a book keep the
+    // same filename (and thus reading progress) instead of silently landing on a different file.
+    const std::string baseName = StringUtils::sanitizeFilename(fallbackBaseName(book));
+    destPath = "/" + baseName + extension;
+    if (Storage.exists(destPath.c_str())) {
+      Storage.remove(destPath.c_str());
+    }
+  } else {
+    const std::string destDir = std::string(kHtml2XtcDir) + "/";
     if (!Storage.exists(kHtml2XtcDir) && !Storage.mkdir(kHtml2XtcDir)) {
       LOG_ERR("OPDS", "Failed to create %s", kHtml2XtcDir);
       Storage.remove(kTempDownloadPath);
@@ -340,15 +352,20 @@ void OpdsBookBrowserActivity::downloadBook(const OpdsEntry& book) {
       requestUpdate();
       return;
     }
-  }
 
-  std::string destPath = destDir + baseName + extension;
-  if (Storage.exists(destPath.c_str())) {
-    // Name collision: fall back to a deterministic per-entry suffix so re-downloading the same OPDS
-    // item is idempotent (overwrites its own prior download) instead of accumulating duplicates.
-    destPath = destDir + appendIdHashSuffix(baseName, book.id) + extension;
+    const std::string baseName =
+        dispositionFilename.empty()
+            ? StringUtils::sanitizeFilename(fallbackBaseName(book))
+            : StringUtils::sanitizeFilename(DownloadFormatUtils::stripExtension(dispositionFilename));
+    destPath = destDir + baseName + extension;
     if (Storage.exists(destPath.c_str())) {
-      Storage.remove(destPath.c_str());
+      // Name collision: fall back to a deterministic per-entry suffix so re-downloading the same
+      // OPDS item is idempotent (overwrites its own prior download) instead of accumulating
+      // duplicates, while still not clobbering an unrelated item that happens to share a title.
+      destPath = destDir + appendIdHashSuffix(baseName, book.id) + extension;
+      if (Storage.exists(destPath.c_str())) {
+        Storage.remove(destPath.c_str());
+      }
     }
   }
 

@@ -63,12 +63,34 @@ std::string trimAndUnquote(std::string value) {
   return value;
 }
 
-// Extracts the value of a `key=` parameter from a Content-Disposition header value, up to the next
-// ';' or the end of the string. `key` must include the trailing '='.
+// Case-insensitive ASCII equality (used for the RFC 5987 charset token, e.g. "UTF-8").
+bool ciEquals(const std::string& a, const char* b) {
+  size_t i = 0;
+  for (; i < a.size() && b[i] != '\0'; i++) {
+    if (tolower(static_cast<unsigned char>(a[i])) != tolower(static_cast<unsigned char>(b[i]))) return false;
+  }
+  return i == a.size() && b[i] == '\0';
+}
+
+// Extracts the value of a `key=` parameter from a Content-Disposition header value. `key` must
+// include the trailing '='. If the value is a quoted-string, reads through to the matching closing
+// quote so an embedded ';' (e.g. filename="foo;bar.epub") doesn't truncate it; otherwise reads up to
+// the next ';' or the end of the string.
 std::string extractParameterValue(const std::string& contentDisposition, const char* key) {
   const size_t pos = findCaseInsensitive(contentDisposition, key);
   if (pos == std::string::npos) return "";
-  const size_t valueStart = pos + strlen(key);
+  size_t valueStart = pos + strlen(key);
+  while (valueStart < contentDisposition.size() &&
+         (contentDisposition[valueStart] == ' ' || contentDisposition[valueStart] == '\t')) {
+    valueStart++;
+  }
+  if (valueStart < contentDisposition.size() && contentDisposition[valueStart] == '"') {
+    const size_t closeQuote = contentDisposition.find('"', valueStart + 1);
+    if (closeQuote != std::string::npos) {
+      return contentDisposition.substr(valueStart, closeQuote - valueStart + 1);
+    }
+    // No closing quote found; fall through and treat it as an unquoted value.
+  }
   const size_t end = contentDisposition.find(';', valueStart);
   return (end == std::string::npos) ? contentDisposition.substr(valueStart)
                                     : contentDisposition.substr(valueStart, end - valueStart);
@@ -102,18 +124,19 @@ const char* extensionForFormat(DownloadFormat format) {
 std::string parseContentDispositionFilename(const std::string& contentDisposition) {
   if (contentDisposition.empty()) return "";
 
-  // Prefer the RFC 5987 filename* parameter: charset'lang'percent-encoded-value
-  std::string starValue = extractParameterValue(contentDisposition, "filename*=");
+  // Prefer the RFC 5987 filename* parameter: charset'lang'percent-encoded-value. Only trust it when
+  // the charset is UTF-8 (the only encoding percentDecode()'s byte-for-byte decoding is valid for) --
+  // otherwise fall through to the plain filename parameter below.
+  const std::string starValue = extractParameterValue(contentDisposition, "filename*=");
   if (!starValue.empty()) {
     const size_t firstQuote = starValue.find('\'');
-    if (firstQuote != std::string::npos) {
-      const size_t secondQuote = starValue.find('\'', firstQuote + 1);
-      if (secondQuote != std::string::npos) {
-        starValue = starValue.substr(secondQuote + 1);
-      }
+    const size_t secondQuote =
+        firstQuote == std::string::npos ? std::string::npos : starValue.find('\'', firstQuote + 1);
+    if (secondQuote != std::string::npos && ciEquals(starValue.substr(0, firstQuote), "UTF-8")) {
+      const std::string encodedValue = starValue.substr(secondQuote + 1);
+      const std::string decoded = sanitizeDispositionValue(percentDecode(trimAndUnquote(encodedValue)));
+      if (!decoded.empty()) return decoded;
     }
-    const std::string decoded = sanitizeDispositionValue(percentDecode(trimAndUnquote(starValue)));
-    if (!decoded.empty()) return decoded;
   }
 
   // Fall back to the plain filename parameter.
@@ -131,13 +154,22 @@ DownloadFormat detectFormat(const std::string& dispositionFilename, const std::s
   DownloadFormat format = formatFromExtension(dispositionFilename);
   if (format != DownloadFormat::UNKNOWN) return format;
 
-  if (mediaType == "application/epub+zip") return DownloadFormat::EPUB;
-  if (mediaType == "application/vnd.xteink.xtc") return DownloadFormat::XTC;
+  // Compare only the media type itself, ignoring any trailing parameters (e.g.
+  // "application/epub+zip; charset=binary").
+  std::string mediaTypeMain = mediaType;
+  const size_t paramPos = mediaTypeMain.find(';');
+  if (paramPos != std::string::npos) mediaTypeMain.resize(paramPos);
+  while (!mediaTypeMain.empty() && (mediaTypeMain.back() == ' ' || mediaTypeMain.back() == '\t')) {
+    mediaTypeMain.pop_back();
+  }
+
+  if (mediaTypeMain == "application/epub+zip") return DownloadFormat::EPUB;
+  if (mediaTypeMain == "application/vnd.xteink.xtc") return DownloadFormat::XTC;
   // application/octet-stream is intentionally not used as a signal here.
 
   std::string path = href;
-  const size_t queryPos = path.find('?');
-  if (queryPos != std::string::npos) path.resize(queryPos);
+  const size_t cutPos = path.find_first_of("?#");
+  if (cutPos != std::string::npos) path.resize(cutPos);
 
   return formatFromExtension(path);
 }
