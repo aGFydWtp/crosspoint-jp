@@ -358,14 +358,19 @@ HttpDownloader::DownloadError HttpDownloader::downloadToFile(const std::string& 
     outMetadata->contentLength = contentLength;
   }
 
-  // Remove existing file if present
-  if (Storage.exists(destPath.c_str())) {
-    Storage.remove(destPath.c_str());
+  // Download into a temporary ".part" file and rename it to destPath only after
+  // all verification passes. This keeps destPath atomic: it either holds the old
+  // complete file or the new complete file, never a truncated download.
+  const std::string partPath = destPath + ".part";
+
+  // Clean up any stale .part file left over from a previous interrupted download.
+  if (Storage.exists(partPath.c_str())) {
+    Storage.remove(partPath.c_str());
   }
 
   // Open file for writing
   FsFile file;
-  if (!Storage.openFileForWrite("HTTP", destPath.c_str(), file)) {
+  if (!Storage.openFileForWrite("HTTP", partPath.c_str(), file)) {
     LOG_ERR("HTTP", "Failed to open file for writing");
     http.end();
     return FILE_ERROR;
@@ -382,12 +387,12 @@ HttpDownloader::DownloadError HttpDownloader::downloadToFile(const std::string& 
     if (fileStream.aborted()) {
       LOG_INF("HTTP", "Download cancelled by progress callback (len=%zu, downloaded=%zu)", contentLength,
               fileStream.downloaded());
-      Storage.remove(destPath.c_str());
+      Storage.remove(partPath.c_str());
       return ABORTED;
     }
     LOG_ERR("HTTP", "writeToStream error: %d (len=%zu)", writeResult, contentLength);
     lastHttpCode = writeResult;  // Store writeToStream error code for diagnostics
-    Storage.remove(destPath.c_str());
+    Storage.remove(partPath.c_str());
     return HTTP_ERROR;
   }
 
@@ -396,7 +401,7 @@ HttpDownloader::DownloadError HttpDownloader::downloadToFile(const std::string& 
   if (fileStream.aborted()) {
     LOG_INF("HTTP", "Download cancelled by progress callback (len=%zu, downloaded=%zu)", contentLength,
             fileStream.downloaded());
-    Storage.remove(destPath.c_str());
+    Storage.remove(partPath.c_str());
     return ABORTED;
   }
 
@@ -407,22 +412,36 @@ HttpDownloader::DownloadError HttpDownloader::downloadToFile(const std::string& 
   if (!fileStream.ok()) {
     LOG_ERR("HTTP", "Write failed during download");
     lastHttpCode = -900;  // Custom code: SD write failure
-    Storage.remove(destPath.c_str());
+    Storage.remove(partPath.c_str());
     return FILE_ERROR;
   }
 
   if (contentLength == 0 && downloaded == 0) {
     LOG_ERR("HTTP", "Download failed: no data received");
     lastHttpCode = -901;  // Custom code: no data
-    Storage.remove(destPath.c_str());
+    Storage.remove(partPath.c_str());
     return HTTP_ERROR;
   }
 
   // Verify download size if known
   if (contentLength > 0 && downloaded != contentLength) {
     LOG_ERR("HTTP", "Size mismatch: got %zu, expected %zu", downloaded, contentLength);
-    Storage.remove(destPath.c_str());
+    Storage.remove(partPath.c_str());
     return HTTP_ERROR;
+  }
+
+  // All checks passed: move the .part file into place. SdFat's rename() opens the
+  // target with O_EXCL semantics and fails if it already exists, so remove the old
+  // destination first.
+  if (Storage.exists(destPath.c_str())) {
+    Storage.remove(destPath.c_str());
+  }
+  if (!Storage.rename(partPath.c_str(), destPath.c_str())) {
+    // Keep the verified .part file: deleting it here would lose both the old file
+    // (removed above) and the fully downloaded data. The stale-.part cleanup at the
+    // top of this function reclaims it on the next download attempt.
+    LOG_ERR("HTTP", "Rename failed: %s -> %s", partPath.c_str(), destPath.c_str());
+    return FILE_ERROR;
   }
 
   return OK;

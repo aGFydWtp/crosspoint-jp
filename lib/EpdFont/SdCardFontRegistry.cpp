@@ -42,11 +42,16 @@ std::vector<uint8_t> SdCardFontFamilyInfo::availableSizes() const {
 
 bool SdCardFontRegistry::parseFilename(const char* filename, uint8_t& size, uint8_t& style) {
   // V4 naming: <name>_<size>.cpfont (e.g. Bookerly-SD_14.cpfont)
-  const char* ext = strstr(filename, ".cpfont");
-  if (!ext) return false;
+  // ".cpfont" must be the end of the filename so leftover temporary files
+  // (e.g. "Foo_14.cpfont.part" from an interrupted download) are not registered.
+  static constexpr char kExt[] = ".cpfont";
+  constexpr size_t kExtLen = sizeof(kExt) - 1;
+  const size_t nameLen = strlen(filename);
+  if (nameLen <= kExtLen) return false;
+  if (strcmp(filename + (nameLen - kExtLen), kExt) != 0) return false;
 
-  size_t baseLen = ext - filename;
-  if (baseLen == 0 || baseLen > 127) return false;
+  size_t baseLen = nameLen - kExtLen;
+  if (baseLen > 127) return false;
 
   char base[128];
   memcpy(base, filename, baseLen);
