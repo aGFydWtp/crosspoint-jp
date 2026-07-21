@@ -33,7 +33,9 @@ void Html2XtcLibraryActivity::onEnter() {
     browserLaunched = true;
     startActivityForResult(std::make_unique<OpdsBookBrowserActivity>(renderer, mappedInput, std::move(server)),
                            [this](const ActivityResult&) {
-                             // Back from the browser should return Home, not to this empty wrapper
+                             // OpdsBookBrowserActivity normally exits via replaceActivity (Home or
+                             // Reader), which destroys the whole stack including this wrapper, so
+                             // this callback is defensive: it only runs if the browser ever pops.
                              finish();
                            });
     return;
@@ -64,6 +66,7 @@ void Html2XtcLibraryActivity::render(RenderLock&&) {
   renderer.drawCenteredText(UI_12_FONT_ID, 15, tr(STR_MY_XTC), true, EpdFontFamily::BOLD);
   renderer.drawCenteredText(UI_10_FONT_ID, pageHeight / 2 - 20, tr(STR_XTC_NOT_PAIRED));
   renderer.drawCenteredText(UI_10_FONT_ID, pageHeight / 2 + 10, tr(STR_XTC_PAIRING_HINT));
+  renderer.drawCenteredText(UI_10_FONT_ID, pageHeight / 2 + 40, tr(STR_XTC_PAIRING_PATH));
 
   const auto labels = mappedInput.mapLabels(tr(STR_BACK), "", "", "");
   GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);

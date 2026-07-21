@@ -1,9 +1,8 @@
 #include "Html2XtcCredentialStore.h"
 
 #include <HalStorage.h>
+#include <JsonSettingsIO.h>
 #include <Logging.h>
-
-#include "JsonSettingsIO.h"
 
 // Initialize the static instance
 Html2XtcCredentialStore Html2XtcCredentialStore::instance;
