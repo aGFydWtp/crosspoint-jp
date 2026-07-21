@@ -134,13 +134,27 @@ class FileWriteStream final : public Stream {
 
   size_t write(const uint8_t* buffer, size_t size) override {
     // Write-through stream for HTTPClient::writeToStream with progress tracking.
+    if (aborted_) {
+      // A previous call already requested cancellation via a short-write return. HTTPClient's
+      // writeToStreamDataBlock() retries the remainder of the same chunk once after a short
+      // write before giving up, so this can be invoked again after aborted_ is set. Reporting a
+      // short write again is harmless: downloadToFile() discards the entire temp file on error.
+      return 0;
+    }
+
     const size_t written = file_.write(buffer, size);
     if (written != size) {
       writeOk_ = false;
     }
     downloaded_ += written;
     if (progress_ && total_ > 0) {
-      progress_(downloaded_, total_);
+      if (!progress_(downloaded_, total_)) {
+        // Cancellation requested: report a short write so HTTPClient::writeToStreamDataBlock
+        // treats this as a stream error, stops the connection (via returnError()), and unwinds
+        // back to downloadToFile() with a negative writeResult.
+        aborted_ = true;
+        return 0;
+      }
     }
     return written;
   }
@@ -152,12 +166,14 @@ class FileWriteStream final : public Stream {
 
   size_t downloaded() const { return downloaded_; }
   bool ok() const { return writeOk_; }
+  bool aborted() const { return aborted_; }
 
  private:
   FsFile& file_;
   size_t total_;
   size_t downloaded_ = 0;
   bool writeOk_ = true;
+  bool aborted_ = false;
   HttpDownloader::ProgressCallback progress_;
 };
 }  // namespace
@@ -363,10 +379,25 @@ HttpDownloader::DownloadError HttpDownloader::downloadToFile(const std::string& 
   http.end();
 
   if (writeResult < 0) {
+    if (fileStream.aborted()) {
+      LOG_INF("HTTP", "Download cancelled by progress callback (len=%zu, downloaded=%zu)", contentLength,
+              fileStream.downloaded());
+      Storage.remove(destPath.c_str());
+      return ABORTED;
+    }
     LOG_ERR("HTTP", "writeToStream error: %d (len=%zu)", writeResult, contentLength);
     lastHttpCode = writeResult;  // Store writeToStream error code for diagnostics
     Storage.remove(destPath.c_str());
     return HTTP_ERROR;
+  }
+
+  // Defensive: if the framework ever tolerates the abort's short write and reports success,
+  // the file is still truncated -- never let an aborted download pass as OK.
+  if (fileStream.aborted()) {
+    LOG_INF("HTTP", "Download cancelled by progress callback (len=%zu, downloaded=%zu)", contentLength,
+            fileStream.downloaded());
+    Storage.remove(destPath.c_str());
+    return ABORTED;
   }
 
   const size_t downloaded = fileStream.downloaded();

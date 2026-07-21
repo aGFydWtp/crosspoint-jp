@@ -73,5 +73,4 @@ class FontDownloadActivity : public Activity {
   int familyIndexFromList(int listIndex) const { return listIndex - 1; }
   int listItemCount() const { return families_.empty() ? 0 : static_cast<int>(families_.size()) + 1; }
   size_t totalUninstalledSize() const;
-  static std::string formatSize(size_t bytes);
 };

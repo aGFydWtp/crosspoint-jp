@@ -14,6 +14,7 @@
 #include "components/UITheme.h"
 #include "fontIds.h"
 #include "network/HttpDownloader.h"
+#include "util/StringUtils.h"
 
 FontDownloadActivity::FontDownloadActivity(GfxRenderer& renderer, MappedInputManager& mappedInput)
     : Activity("FontDownload", renderer, mappedInput), fontInstaller_(sdFontSystem.registry()) {}
@@ -231,6 +232,7 @@ void FontDownloadActivity::downloadFamily(ManifestFamily& family) {
       fileProgress_ = downloaded;
       fileTotal_ = total;
       requestUpdate(true);
+      return true;
     });
 
     if (result != HttpDownloader::OK) {
@@ -321,18 +323,6 @@ void FontDownloadActivity::loop() {
 
 // --- Rendering ---
 
-std::string FontDownloadActivity::formatSize(size_t bytes) {
-  char buf[32];
-  if (bytes >= 1024 * 1024) {
-    snprintf(buf, sizeof(buf), "%.1f MB", static_cast<double>(bytes) / (1024.0 * 1024.0));
-  } else if (bytes >= 1024) {
-    snprintf(buf, sizeof(buf), "%.0f KB", static_cast<double>(bytes) / 1024.0);
-  } else {
-    snprintf(buf, sizeof(buf), "%zu B", bytes);
-  }
-  return buf;
-}
-
 void FontDownloadActivity::render(RenderLock&&) {
   const auto& metrics = UITheme::getInstance().getMetrics();
   const auto pageWidth = renderer.getScreenWidth();
@@ -360,7 +350,7 @@ void FontDownloadActivity::render(RenderLock&&) {
           listItemCount(), selectedIndex_,
           [this](int index) -> std::string {
             if (index == 0) {
-              return std::string(tr(STR_DOWNLOAD_ALL)) + " (" + formatSize(totalUninstalledSize()) + ")";
+              return std::string(tr(STR_DOWNLOAD_ALL)) + " (" + StringUtils::formatSize(totalUninstalledSize()) + ")";
             }
             return families_[familyIndexFromList(index)].name;
           },
@@ -399,7 +389,7 @@ void FontDownloadActivity::render(RenderLock&&) {
                         (std::string(tr(STR_FILES_LABEL)) + std::to_string(totalFiles)).c_str());
       y += lineHeight + metrics.verticalSpacing;
       renderer.drawText(UI_10_FONT_ID, metrics.contentSidePadding, y,
-                        (std::string(tr(STR_SIZE_LABEL)) + formatSize(totalUninstalledSize())).c_str());
+                        (std::string(tr(STR_SIZE_LABEL)) + StringUtils::formatSize(totalUninstalledSize())).c_str());
     } else {
       const auto& family = families_[familyIndexFromList(selectedIndex_)];
       std::string confirmText = (family.installed ? std::string(tr(STR_REDOWNLOAD)) : std::string(tr(STR_DOWNLOAD))) +
@@ -410,7 +400,7 @@ void FontDownloadActivity::render(RenderLock&&) {
                         (std::string(tr(STR_FILES_LABEL)) + std::to_string(family.files.size())).c_str());
       y += lineHeight + metrics.verticalSpacing;
       renderer.drawText(UI_10_FONT_ID, metrics.contentSidePadding, y,
-                        (std::string(tr(STR_SIZE_LABEL)) + formatSize(family.totalSize)).c_str());
+                        (std::string(tr(STR_SIZE_LABEL)) + StringUtils::formatSize(family.totalSize)).c_str());
     }
 
     const auto labels = mappedInput.mapLabels(tr(STR_CANCEL), tr(STR_CONFIRM), "", "");

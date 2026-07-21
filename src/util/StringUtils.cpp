@@ -2,6 +2,8 @@
 
 #include <Utf8.h>
 
+#include <cstdio>
+
 namespace StringUtils {
 
 std::string sanitizeFilename(const std::string& name, size_t maxBytes) {
@@ -41,6 +43,18 @@ std::string sanitizeFilename(const std::string& name, size_t maxBytes) {
   }
 
   return result.empty() ? "book" : result;
+}
+
+std::string formatSize(size_t bytes) {
+  char buf[32];
+  if (bytes >= 1024 * 1024) {
+    snprintf(buf, sizeof(buf), "%.1f MB", static_cast<double>(bytes) / (1024.0 * 1024.0));
+  } else if (bytes >= 1024) {
+    snprintf(buf, sizeof(buf), "%.0f KB", static_cast<double>(bytes) / 1024.0);
+  } else {
+    snprintf(buf, sizeof(buf), "%zu B", bytes);
+  }
+  return buf;
 }
 
 }  // namespace StringUtils
