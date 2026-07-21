@@ -9,7 +9,6 @@
 
 #include <HalStorage.h>
 
-#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -17,6 +16,11 @@
 #include "XtcTypes.h"
 
 namespace xtc {
+
+// Callback invoked with each chunk of streamed page data. `ctx` is the opaque pointer passed
+// to loadPageStreaming(); a plain function pointer is used instead of std::function to avoid
+// per-instantiation heap allocation and binary bloat on this RAM-constrained target.
+using PageStreamCallback = void (*)(void* ctx, const uint8_t* data, size_t size, size_t offset);
 
 /**
  * XTC File Parser
@@ -59,16 +63,18 @@ class XtcParser {
 
   /**
    * Streaming page load
-   * Memory-efficient method that reads page data in chunks.
+   * Memory-efficient method that reads page data in chunks, using a caller-provided scratch
+   * buffer as the read work area instead of allocating internally.
    *
    * @param pageIndex Page index
+   * @param scratchBuffer Caller-allocated work buffer used as the read chunk
+   * @param scratchBufferSize Size of scratchBuffer; also the effective chunk size
    * @param callback Callback function to receive data chunks
-   * @param chunkSize Chunk size (default: 1024 bytes)
+   * @param ctx Opaque context pointer passed through to callback
    * @return Error code
    */
-  XtcError loadPageStreaming(uint32_t pageIndex,
-                             std::function<void(const uint8_t* data, size_t size, size_t offset)> callback,
-                             size_t chunkSize = 1024);
+  XtcError loadPageStreaming(uint32_t pageIndex, uint8_t* scratchBuffer, size_t scratchBufferSize,
+                             PageStreamCallback callback, void* ctx);
 
   // Get title/author from metadata
   std::string getTitle() const { return m_title; }

@@ -86,13 +86,14 @@ class Xtc {
   /**
    * Load page with streaming callback
    * @param pageIndex Page index
+   * @param scratchBuffer Caller-allocated work buffer used as the read chunk
+   * @param scratchBufferSize Size of scratchBuffer; also the effective chunk size
    * @param callback Callback for each chunk
-   * @param chunkSize Chunk size
+   * @param ctx Opaque context pointer passed through to callback
    * @return Error code
    */
-  xtc::XtcError loadPageStreaming(uint32_t pageIndex,
-                                  std::function<void(const uint8_t* data, size_t size, size_t offset)> callback,
-                                  size_t chunkSize = 1024) const;
+  xtc::XtcError loadPageStreaming(uint32_t pageIndex, uint8_t* scratchBuffer, size_t scratchBufferSize,
+                                  xtc::PageStreamCallback callback, void* ctx) const;
 
   // Progress calculation
   uint8_t calculateProgress(uint32_t currentPage) const;
