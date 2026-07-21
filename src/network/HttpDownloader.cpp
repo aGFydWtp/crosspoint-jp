@@ -110,30 +110,14 @@ int sendJsonRequest(const char* method, const std::string& url, const std::strin
     }
   }
 
-  // Only a genuine HTTP response (httpCode > 0) has a readable body stream; a transport-level
-  // failure (negative code) leaves nothing to drain.
+  // Only a genuine HTTP response (httpCode > 0) has a readable body; a transport-level failure
+  // (negative code) leaves nothing to drain. Responses here are small JSON payloads (~400B), so
+  // http.getString() is used instead of a raw stream read: it already handles chunked transfer
+  // decoding internally, which a manual available()/readBytes() loop over the raw socket does not
+  // (chunk-size lines would otherwise leak into the body) and bounds the read to Content-Length /
+  // the chunked terminator instead of spinning on connected() for a keep-alive connection.
   if (httpCode > 0) {
-    NetworkClient* stream = http.getStreamPtr();
-    const int contentLen = http.getSize();
-    if (contentLen > 0) {
-      outResponse.reserve(contentLen);
-    }
-
-    char buf[512];
-    while (stream->available() || stream->connected()) {
-      int avail = stream->available();
-      if (avail <= 0) {
-        delay(1);
-        continue;
-      }
-      int toRead = (avail < static_cast<int>(sizeof(buf))) ? avail : static_cast<int>(sizeof(buf));
-      int bytesRead = stream->readBytes(buf, toRead);
-      if (bytesRead > 0) {
-        outResponse.append(buf, bytesRead);
-      } else {
-        break;
-      }
-    }
+    outResponse = http.getString().c_str();
   }
   http.end();
 

@@ -33,7 +33,9 @@ class Html2XtcPairingActivity final : public Activity {
   std::string pairingSecret;
   std::string userCode;
   std::string verificationUri;
-  int pollIntervalSeconds = 5;
+  int basePollIntervalSeconds = 5;  // Server-provided cadence from the 201 create response.
+  int pollIntervalSeconds = 5;      // Effective interval for the next poll; temporarily overridden
+                                    // by a 429's Retry-After, then restored on the next 200.
 
   // Credentials obtained once the pairing is approved (see pollStatus()).
   std::string pairedDeviceId;

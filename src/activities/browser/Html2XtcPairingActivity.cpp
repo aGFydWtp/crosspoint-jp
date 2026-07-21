@@ -57,11 +57,12 @@ void Html2XtcPairingActivity::launchWifiSelection() {
 
 void Html2XtcPairingActivity::onWifiSelectionComplete(bool connected) {
   if (!connected) {
+    // WifiSelectionActivity already shows its own failure/cancel UI (CONNECTION_FAILED state,
+    // etc.) before returning here with isCancelled -- don't make the user dismiss a second
+    // "connection failed" screen on this side, just propagate the cancellation.
     WiFi.disconnect();
     WiFi.mode(WIFI_OFF);
-    state = ERROR;
-    errorMessage = tr(STR_WIFI_CONN_FAILED);
-    requestUpdate();
+    finishWithResult(true);
     return;
   }
   beginCreating();
@@ -115,6 +116,7 @@ void Html2XtcPairingActivity::createPairing() {
     if (pollIntervalSeconds <= 0) {
       pollIntervalSeconds = 5;
     }
+    basePollIntervalSeconds = pollIntervalSeconds;
 
     if (pairingId.empty() || pairingSecret.empty() || verificationUri.empty()) {
       LOG_ERR("XTC", "Pairing create: response missing required fields");
@@ -156,10 +158,13 @@ void Html2XtcPairingActivity::pollStatus() {
   const int code = HttpDownloader::getJson(url, response, authorizationHeader(pairingSecret), true, &retryAfterSeconds);
 
   if (code == 429) {
-    // Rate limited: adopt the server-requested interval for the next attempt. Doesn't count as
-    // a failed attempt.
+    // Rate limited: adopt the server-requested interval for the next attempt only (capped, in
+    // case the server sends something unreasonable), then fall back to the server's baseline
+    // cadence again once a poll succeeds -- see the restore below. Doesn't count as a failed
+    // attempt.
     if (retryAfterSeconds > 0) {
-      pollIntervalSeconds = retryAfterSeconds;
+      constexpr int kMaxRetryAfterSeconds = 60;
+      pollIntervalSeconds = (retryAfterSeconds < kMaxRetryAfterSeconds) ? retryAfterSeconds : kMaxRetryAfterSeconds;
     }
     return;
   }
@@ -188,6 +193,9 @@ void Html2XtcPairingActivity::pollStatus() {
     return;
   }
   consecutiveFailures = 0;
+  // A successful poll means the server is responsive again; drop any temporary Retry-After
+  // override from a prior 429 and go back to the server's requested cadence.
+  pollIntervalSeconds = basePollIntervalSeconds;
 
   const std::string status = doc["status"].as<std::string>();
 
@@ -285,7 +293,10 @@ void Html2XtcPairingActivity::loop() {
   }
 
   if (state == SUCCESS) {
-    if (mappedInput.wasReleased(MappedInputManager::Button::Confirm)) {
+    // The pairing itself is already complete at this point (credentials saved in savePairing()),
+    // so Back and Confirm are equivalent here -- both just dismiss the success screen.
+    if (mappedInput.wasReleased(MappedInputManager::Button::Confirm) ||
+        mappedInput.wasReleased(MappedInputManager::Button::Back)) {
       finishWithResult(false);
     }
     return;
@@ -350,7 +361,7 @@ void Html2XtcPairingActivity::render(RenderLock&&) {
   const int centerY = pageHeight / 2;
   if (state == SUCCESS) {
     renderer.drawCenteredText(UI_10_FONT_ID, centerY, tr(STR_XTC_PAIRING_SUCCESS), true, EpdFontFamily::BOLD);
-    const auto labels = mappedInput.mapLabels("", tr(STR_CONFIRM), "", "");
+    const auto labels = mappedInput.mapLabels(tr(STR_BACK), tr(STR_CONFIRM), "", "");
     GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
   } else if (state == REJECTED) {
     renderer.drawCenteredText(UI_10_FONT_ID, centerY, tr(STR_XTC_PAIRING_REJECTED), true, EpdFontFamily::BOLD);
