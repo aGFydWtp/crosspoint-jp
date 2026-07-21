@@ -363,6 +363,12 @@ To use custom sleep images, set the sleep screen mode to **Custom** or **Cover +
 > - X4: Use a resolution of 480x800 pixels to match the device's screen resolution.
 > - X3: Use a resolution of 528x792 pixels to match the device's screen resolution.
 
+### 3.8 My XTC Screen
+
+The **My XTC** menu entry opens your personal html2xtc library — a server-side service that converts web pages and HTML into XTC books. When the device is paired, selecting it launches the OPDS browser against the html2xtc server so you can browse and download your converted books over WiFi.
+
+If the device is not yet paired, an instruction screen is shown instead. For the current development milestone, pairing is provisioned manually by placing a `html2xtc.json` file with your pairing info (`deviceId` / `deviceToken`) in the `/.crosspoint/` directory on the SD card. A QR-code pairing flow will be added in a future update.
+
 ---
 
 ## 4. Reading Mode
