@@ -19,6 +19,17 @@ class HttpDownloader {
     ABORTED,
   };
 
+  /**
+   * Subset of HTTP response headers, populated by downloadToFile() when an output pointer is provided.
+   * etag/lastModified are intentionally omitted -- nothing in the codebase consumes them yet.
+   */
+  struct HttpResponseMetadata {
+    int statusCode = 0;
+    size_t contentLength = 0;
+    std::string contentType;
+    std::string contentDisposition;
+  };
+
   /// Last HTTP status code from downloadToFile (-1 = connection failed, -11 = timeout, etc.)
   static int lastHttpCode;
 
@@ -38,8 +49,11 @@ class HttpDownloader {
 
   /**
    * Download a file to the SD card with optional Basic auth credentials.
+   * @param outMetadata Optional output pointer; when non-null, Content-Type/Content-Disposition headers are
+   *                    collected and the response metadata is populated regardless of success/failure.
    */
   static DownloadError downloadToFile(const std::string& url, const std::string& destPath,
                                       ProgressCallback progress = nullptr, int timeoutMs = 0,
-                                      const std::string& username = "", const std::string& password = "");
+                                      const std::string& username = "", const std::string& password = "",
+                                      HttpResponseMetadata* outMetadata = nullptr);
 };

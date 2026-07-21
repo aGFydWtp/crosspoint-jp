@@ -109,9 +109,11 @@ void XMLCALL OpdsParser::startElement(void* userData, const XML_Char* name, cons
 
       if (self->inEntry) {
         if (rel && type && strstr(rel, "opds-spec.org/acquisition") != nullptr &&
-            strcmp(type, "application/epub+zip") == 0) {
+            (strcmp(type, "application/epub+zip") == 0 || strcmp(type, "application/octet-stream") == 0 ||
+             strcmp(type, "application/vnd.xteink.xtc") == 0)) {
           self->currentEntry.type = OpdsEntryType::BOOK;
           self->currentEntry.href = href;
+          self->currentEntry.mediaType = type;
         } else if (type && strstr(type, "application/atom+xml") != nullptr) {
           if (self->currentEntry.type != OpdsEntryType::BOOK) {
             self->currentEntry.type = OpdsEntryType::NAVIGATION;
