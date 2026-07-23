@@ -108,10 +108,20 @@ void XMLCALL OpdsParser::startElement(void* userData, const XML_Char* name, cons
       }
 
       if (self->inEntry) {
-        if (rel && type && strstr(rel, "opds-spec.org/acquisition") != nullptr &&
-            strcmp(type, "application/epub+zip") == 0) {
+        const bool isEpub = type && strcmp(type, "application/epub+zip") == 0;
+        const bool isOctetStream = type && strcmp(type, "application/octet-stream") == 0;
+        const bool isXtc = type && strcmp(type, "application/vnd.xteink.xtc") == 0;
+        // A generic octet-stream link must not clobber a link whose type already told us the
+        // concrete format -- some OPDS entries list multiple acquisition links (e.g. a specific
+        // format plus a generic fallback), and the specific one should win regardless of order.
+        const bool mediaTypeAlreadyConfirmed = self->currentEntry.type == OpdsEntryType::BOOK &&
+                                               (self->currentEntry.mediaType == "application/epub+zip" ||
+                                                self->currentEntry.mediaType == "application/vnd.xteink.xtc");
+        if (rel && strstr(rel, "opds-spec.org/acquisition") != nullptr && (isEpub || isOctetStream || isXtc) &&
+            !(isOctetStream && mediaTypeAlreadyConfirmed)) {
           self->currentEntry.type = OpdsEntryType::BOOK;
           self->currentEntry.href = href;
+          self->currentEntry.mediaType = type;
         } else if (type && strstr(type, "application/atom+xml") != nullptr) {
           if (self->currentEntry.type != OpdsEntryType::BOOK) {
             self->currentEntry.type = OpdsEntryType::NAVIGATION;

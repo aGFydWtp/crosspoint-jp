@@ -18,12 +18,13 @@
 #include "OpdsServerStore.h"
 #include "ReadingStatusHelper.h"
 #include "RecentBooksStore.h"
+#include "activities/browser/Html2XtcLibraryActivity.h"
 #include "activities/settings/AozoraActivity.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
 
 int HomeActivity::getMenuItemCount() const {
-  int count = 5;  // File Browser, Recents, Aozora, File transfer, Settings
+  int count = 6;  // File Browser, Recents, Aozora, My XTC, File transfer, Settings
   if (!recentBooks.empty()) {
     count += recentBooks.size();
   }
@@ -198,6 +199,7 @@ void HomeActivity::loop() {
     const int recentsIdx = idx++;
     const int opdsLibraryIdx = hasOpdsUrl ? idx++ : -1;
     const int aozoraIdx = idx++;
+    const int myXtcIdx = idx++;
     const int fileTransferIdx = idx++;
     const int settingsIdx = idx;
 
@@ -211,6 +213,8 @@ void HomeActivity::loop() {
       onOpdsBrowserOpen();
     } else if (menuSelectedIndex == aozoraIdx) {
       onAozoraOpen();
+    } else if (menuSelectedIndex == myXtcIdx) {
+      onMyXtcOpen();
     } else if (menuSelectedIndex == fileTransferIdx) {
       onFileTransferOpen();
     } else if (menuSelectedIndex == settingsIdx) {
@@ -244,11 +248,13 @@ void HomeActivity::render(RenderLock&&) {
     menuIcons.insert(menuIcons.begin() + 2, Library);
   }
 
-  // Insert Aozora Bunko after OPDS (or after Recents if no OPDS)
+  // Insert Aozora Bunko after OPDS (or after Recents if no OPDS), then My XTC right after Aozora
   {
     int aozoraPos = hasOpdsUrl ? 3 : 2;
     menuItems.insert(menuItems.begin() + aozoraPos, tr(STR_AOZORA_BUNKO));
     menuIcons.insert(menuIcons.begin() + aozoraPos, Book);
+    menuItems.insert(menuItems.begin() + aozoraPos + 1, tr(STR_MY_XTC));
+    menuIcons.insert(menuIcons.begin() + aozoraPos + 1, Library);
   }
 
   GUI.drawButtonMenu(
@@ -301,4 +307,22 @@ void HomeActivity::onAozoraOpen() {
     const auto& metrics = UITheme::getInstance().getMetrics();
     loadRecentBooks(metrics.homeRecentBooksCount);
   });
+}
+
+void HomeActivity::onMyXtcOpen() {
+  // カバーバッファと最近の本リストを解放（TLSバッファ用にヒープ確保）
+  freeCoverBuffer();
+  recentBooks.clear();
+  recentBooks.shrink_to_fit();
+
+  startActivityForResult(std::make_unique<Html2XtcLibraryActivity>(renderer, mappedInput),
+                         [this](const ActivityResult&) {
+                           // 戻ってきたら再読み込み（フラグリセットして描画を再トリガー）
+                           coverRendered = false;
+                           coverBufferStored = false;
+                           recentsLoaded = false;
+                           recentsLoading = false;
+                           const auto& metrics = UITheme::getInstance().getMetrics();
+                           loadRecentBooks(metrics.homeRecentBooksCount);
+                         });
 }

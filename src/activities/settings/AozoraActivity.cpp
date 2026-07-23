@@ -313,6 +313,7 @@ bool AozoraActivity::downloadBook() {
         downloadProgress_ = downloaded;
         downloadTotal_ = total;
         requestUpdate(true);
+        return true;
       },
       30000);
 
@@ -362,6 +363,7 @@ bool AozoraActivity::updateBook() {
         downloadProgress_ = downloaded;
         downloadTotal_ = total;
         requestUpdate(true);
+        return true;
       },
       30000);
 

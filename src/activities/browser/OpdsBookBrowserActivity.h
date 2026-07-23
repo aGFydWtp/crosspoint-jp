@@ -2,6 +2,7 @@
 #include <OpdsParser.h>
 
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -36,20 +37,47 @@ class OpdsBookBrowserActivity final : public Activity {
   bool consumeBack = false;  // Added missing member
   int selectorIndex = 0;
   std::string errorMessage;
+  std::string errorHint;  // Optional second line shown below errorMessage on the ERROR screen
   std::string statusMessage;
   size_t downloadProgress = 0;
   size_t downloadTotal = 0;
+  // Throttles DOWNLOADING re-renders to once per percentage point (see render()). Reset to -1 at
+  // the start of each downloadBook() call. When downloadTotal is unknown (0), -2 marks "the
+  // unknown-length placeholder has already been drawn once" so it isn't redrawn on every chunk.
+  int lastRenderedPercent = -1;
+  // Hold duration (ms) for Back to cancel an in-progress download; matches the GO_HOME_MS
+  // long-press convention used elsewhere in the codebase.
+  static constexpr unsigned long kDownloadCancelHoldMs = 1000;
+
+  // Downloaded-file index for the html2xtc "already downloaded" marker (server.verifyTls only).
+  // Key: 6-hex-digit id-hash suffix (see appendIdHashSuffix in the .cpp), value: full SD path.
+  // Rebuilt from a single /XTCFiles directory listing in fetchFeed(); never touched by render()
+  // so render() stays free of SD I/O. EPUB downloads (saved to the SD root, not /XTCFiles) are
+  // out of scope for this marker -- html2xtc only ever serves XTC.
+  std::unordered_map<std::string, std::string> downloadedByHash;
 
   OpdsServer server;  // Copied at construction — safe even if the store changes during browsing
 
   void checkAndConnectWifi();
   void launchWifiSelection();
   void onWifiSelectionComplete(bool connected);
+  // When server.verifyTls, makes sure the clock is synced (NTP) before any TLS-verified request
+  // is made -- a not-yet-synced clock makes every certificate look not-yet-valid. On failure,
+  // sets state=ERROR with a time-sync-specific message and returns false; TLS verification is
+  // never silently disabled as a fallback. No-op (returns true) when !server.verifyTls.
+  bool ensureTimeSyncedIfNeeded();
   void fetchFeed(const std::string& path);
   void navigateToEntry(const OpdsEntry& entry);
   void navigateBack();
   void downloadBook(const OpdsEntry& book);
   void launchSearch();
   void performSearch(const std::string& query);
+  // Populates downloadedByHash from a single listing of /XTCFiles. Only called when
+  // server.verifyTls (html2xtc); a no-op directory listing for generic OPDS servers would be
+  // wasted SD I/O with no matching entries anyway.
+  void scanDownloadedFiles();
+  // Returns the full SD path of a previously downloaded file matching this book's id hash, or
+  // "" if book.id is empty or no match was found. Pure map lookup -- safe to call from render().
+  std::string downloadedPathFor(const OpdsEntry& book) const;
   bool preventAutoSleep() override { return true; }
 };

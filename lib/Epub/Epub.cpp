@@ -348,6 +348,14 @@ bool Epub::load(const bool buildIfMissing, const bool skipLoadingCss) {
     if (!skipLoadingCss) {
       // Rebuild CSS cache when missing or when cache version changed (loadFromCache removes stale file)
       if (!cssParser->hasCache() || !cssParser->loadFromCache()) {
+        if (cssParser->lastLoadAbortedLowHeap()) {
+          // Transient memory pressure, not a corrupt cache: keep the cache file and
+          // section caches, and open the book unstyled this session instead of
+          // triggering an expensive rebuild (or an OOM abort) right now.
+          LOG_ERR("EBP", "Low heap: opening book without CSS styles this session");
+          LOG_DBG("EBP", "Loaded ePub: %s", filepath.c_str());
+          return true;
+        }
         LOG_DBG("EBP", "CSS rules cache missing or stale, attempting to parse CSS files");
         cssParser->deleteCache();
 

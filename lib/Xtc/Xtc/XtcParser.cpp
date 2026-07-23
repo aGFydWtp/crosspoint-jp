@@ -459,11 +459,14 @@ size_t XtcParser::loadPage(uint32_t pageIndex, uint8_t* buffer, size_t bufferSiz
   return bytesRead;
 }
 
-XtcError XtcParser::loadPageStreaming(uint32_t pageIndex,
-                                      std::function<void(const uint8_t* data, size_t size, size_t offset)> callback,
-                                      size_t chunkSize) {
+XtcError XtcParser::loadPageStreaming(uint32_t pageIndex, uint8_t* scratchBuffer, size_t scratchBufferSize,
+                                      PageStreamCallback callback, void* ctx) {
   if (!m_isOpen) {
     return XtcError::FILE_NOT_FOUND;
+  }
+
+  if (!scratchBuffer || scratchBufferSize == 0 || !callback) {
+    return XtcError::MEMORY_ERROR;
   }
 
   if (pageIndex >= m_header.pageCount) {
@@ -502,19 +505,18 @@ XtcError XtcParser::loadPageStreaming(uint32_t pageIndex,
     bitmapSize = ((pageHeader.width + 7) / 8) * pageHeader.height;
   }
 
-  // Read in chunks
-  std::vector<uint8_t> chunk(chunkSize);
+  // Read into the caller-provided scratch buffer in chunks (chunk size == scratchBufferSize)
   size_t totalRead = 0;
 
   while (totalRead < bitmapSize) {
-    size_t toRead = std::min(chunkSize, bitmapSize - totalRead);
-    size_t bytesRead = m_file.read(chunk.data(), toRead);
+    size_t toRead = std::min(scratchBufferSize, bitmapSize - totalRead);
+    size_t bytesRead = m_file.read(scratchBuffer, toRead);
 
     if (bytesRead == 0) {
       return XtcError::READ_ERROR;
     }
 
-    callback(chunk.data(), bytesRead, totalRead);
+    callback(ctx, scratchBuffer, bytesRead, totalRead);
     totalRead += bytesRead;
   }
 

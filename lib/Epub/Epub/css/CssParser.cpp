@@ -757,7 +757,18 @@ bool CssParser::saveToCache() const {
 }
 
 bool CssParser::loadFromCache() {
+  lastLoadAbortedLowHeap_ = false;
   if (cachePath.empty()) {
+    return false;
+  }
+
+  // Building the rule map allocates one hash node + selector string per rule via
+  // throwing operator new; with -fno-exceptions a failed allocation aborts the
+  // firmware. Refuse to start when heap is already too low for CSS to be useful
+  // (resolveStyle() would return empty styles below this threshold anyway).
+  if (ESP.getFreeHeap() < MIN_FREE_HEAP_FOR_CSS) {
+    LOG_ERR("CSS", "Skipping CSS cache load: low heap (%u bytes)", ESP.getFreeHeap());
+    lastLoadAbortedLowHeap_ = true;
     return false;
   }
 
@@ -801,8 +812,20 @@ bool CssParser::loadFromCache() {
   constexpr size_t CSS_FIXED_STYLE_BYTES =
       4 * sizeof(uint8_t) + (CSS_LENGTH_FIELD_COUNT * CSS_LENGTH_BYTES) + sizeof(uint8_t) + sizeof(uint16_t);
 
+  // Abort the load (without deleting the cache file) if heap drops this low while
+  // the rule map grows; the next allocation failure would otherwise abort() the
+  // firmware since -fno-exceptions cannot catch std::bad_alloc.
+  constexpr size_t MIN_FREE_HEAP_DURING_CSS_CACHE_LOAD = 20 * 1024;
+
   // Read each rule
   for (uint16_t i = 0; i < ruleCount; ++i) {
+    if ((i & 0x0F) == 0 && ESP.getFreeHeap() < MIN_FREE_HEAP_DURING_CSS_CACHE_LOAD) {
+      LOG_ERR("CSS", "Aborting CSS cache load at rule %u/%u: low heap (%u bytes)", i, ruleCount, ESP.getFreeHeap());
+      rulesBySelector_.clear();
+      lastLoadAbortedLowHeap_ = true;
+      return false;
+    }
+
     // Read selector string
     uint16_t selectorLen = 0;
     if (!hasRemainingBytes(sizeof(selectorLen))) {

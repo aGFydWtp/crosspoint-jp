@@ -24,6 +24,7 @@
 
 #include "CrossPointSettings.h"
 #include "CrossPointState.h"
+#include "Html2XtcCredentialStore.h"
 #include "KOReaderCredentialStore.h"
 #include "MappedInputManager.h"
 #include "OpdsServerStore.h"
@@ -362,6 +363,7 @@ void setup() {
   I18N.loadSettings();
   KOREADER_STORE.loadFromFile();
   OPDS_STORE.loadFromFile();
+  HTML2XTC_STORE.loadFromFile();
   UITheme::getInstance().reload();
   ButtonNavigator::setMappedInputManager(mappedInputManager);
 

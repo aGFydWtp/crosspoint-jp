@@ -12,11 +12,119 @@
 #include <utility>
 
 #include "CrossPointSettings.h"
+#include "SecureNetworkClient.h"
 #include "util/UrlUtils.h"
 
 int HttpDownloader::lastHttpCode = 0;
 
 namespace {
+
+// Builds the NetworkClient appropriate for the URL/verifyTls combination.
+// - https + verifyTls: SecureNetworkClient with the default CA bundle attached (chain + hostname
+//   verification). *outSecureForError is set so the caller can pull a diagnostic message on failure.
+// - https + !verifyTls: NetworkClientSecure with setInsecure() (unchanged legacy behavior).
+// - http (plain): NetworkClient, unless verifyTls was requested -- html2xtc is https-only, so
+//   verifyTls=true against a plain http:// URL is a caller error and yields nullptr.
+std::unique_ptr<NetworkClient> makeHttpClient(const std::string& url, bool verifyTls,
+                                              SecureNetworkClient** outSecureForError) {
+  if (outSecureForError) *outSecureForError = nullptr;
+
+  if (UrlUtils::isHttpsUrl(url)) {
+    if (verifyTls) {
+      auto* secureClient = new SecureNetworkClient();
+      secureClient->useDefaultCertBundle();
+      secureClient->setHandshakeTimeout(20);
+      if (outSecureForError) *outSecureForError = secureClient;
+      return std::unique_ptr<NetworkClient>(secureClient);
+    }
+    auto* secureClient = new NetworkClientSecure();
+    secureClient->setInsecure();
+    secureClient->setHandshakeTimeout(20);
+    return std::unique_ptr<NetworkClient>(secureClient);
+  }
+
+  if (verifyTls) {
+    LOG_ERR("HTTP", "verifyTls requested for a non-HTTPS URL: %s", url.c_str());
+    return nullptr;
+  }
+  return std::unique_ptr<NetworkClient>(new NetworkClient());
+}
+
+// Logs the mbedtls-level diagnostic for a TLS/connection failure. Only meaningful when
+// secureForError is non-null (i.e. verifyTls was in effect) and the HTTP layer reported a
+// transport-level failure (httpCode <= 0) rather than a genuine HTTP status code (>= 100).
+bool logTlsFailureIfAny(SecureNetworkClient* secureForError, int httpCode) {
+  if (!secureForError || httpCode > 0) {
+    return false;
+  }
+  char errBuf[128];
+  secureForError->lastError(errBuf, sizeof(errBuf));
+  LOG_ERR("HTTP", "TLS/connection error: %s (code=%d)", errBuf, httpCode);
+  return true;
+}
+
+// Shared implementation for postJson()/getJson(): issues an HTTP request with a JSON
+// Content-Type, an optional raw Authorization header, and reads the response body into a
+// std::string regardless of status code (error bodies can carry useful diagnostics too).
+int sendJsonRequest(const char* method, const std::string& url, const std::string& body, std::string& outResponse,
+                    const std::string& authorization, bool verifyTls, int* outRetryAfterSeconds) {
+  if (outRetryAfterSeconds) *outRetryAfterSeconds = 0;
+  outResponse.clear();
+
+  SecureNetworkClient* secureForError = nullptr;
+  std::unique_ptr<NetworkClient> client = makeHttpClient(url, verifyTls, &secureForError);
+  if (!client) {
+    HttpDownloader::lastHttpCode = HttpDownloader::TLS_ERROR_CODE;
+    return HttpDownloader::TLS_ERROR_CODE;
+  }
+  HTTPClient http;
+
+  http.begin(*client, url.c_str());
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  http.addHeader("User-Agent", "CrossPoint-ESP32-" CROSSPOINT_VERSION);
+  http.addHeader("Content-Type", "application/json");
+  if (!authorization.empty()) {
+    http.addHeader("Authorization", authorization.c_str());
+  }
+
+  // Headers must be registered before the request executes, or header() always returns empty.
+  if (outRetryAfterSeconds) {
+    static const char* kCollectedHeaders[] = {"Retry-After"};
+    http.collectHeaders(kCollectedHeaders, 1);
+  }
+
+  LOG_DBG("HTTP", "%s: %s (heap=%d)", method, url.c_str(), ESP.getFreeHeap());
+  const int httpCode = http.sendRequest(method, String(body.c_str()));
+  HttpDownloader::lastHttpCode = httpCode;
+
+  int resultCode = httpCode;
+  if (logTlsFailureIfAny(secureForError, httpCode)) {
+    resultCode = HttpDownloader::TLS_ERROR_CODE;
+    HttpDownloader::lastHttpCode = HttpDownloader::TLS_ERROR_CODE;
+  }
+
+  if (outRetryAfterSeconds && httpCode > 0) {
+    String retryAfter = http.header("Retry-After");
+    if (!retryAfter.isEmpty()) {
+      *outRetryAfterSeconds = retryAfter.toInt();
+    }
+  }
+
+  // Only a genuine HTTP response (httpCode > 0) has a readable body; a transport-level failure
+  // (negative code) leaves nothing to drain. Responses here are small JSON payloads (~400B), so
+  // http.getString() is used instead of a raw stream read: it already handles chunked transfer
+  // decoding internally, which a manual available()/readBytes() loop over the raw socket does not
+  // (chunk-size lines would otherwise leak into the body) and bounds the read to Content-Length /
+  // the chunked terminator instead of spinning on connected() for a keep-alive connection.
+  if (httpCode > 0) {
+    outResponse = http.getString().c_str();
+  }
+  http.end();
+
+  LOG_DBG("HTTP", "%s result: %d, %zu bytes", method, httpCode, outResponse.size());
+  return resultCode;
+}
+
 class FileWriteStream final : public Stream {
  public:
   FileWriteStream(FsFile& file, size_t total, HttpDownloader::ProgressCallback progress)
@@ -26,13 +134,27 @@ class FileWriteStream final : public Stream {
 
   size_t write(const uint8_t* buffer, size_t size) override {
     // Write-through stream for HTTPClient::writeToStream with progress tracking.
+    if (aborted_) {
+      // A previous call already requested cancellation via a short-write return. HTTPClient's
+      // writeToStreamDataBlock() retries the remainder of the same chunk once after a short
+      // write before giving up, so this can be invoked again after aborted_ is set. Reporting a
+      // short write again is harmless: downloadToFile() discards the entire temp file on error.
+      return 0;
+    }
+
     const size_t written = file_.write(buffer, size);
     if (written != size) {
       writeOk_ = false;
     }
     downloaded_ += written;
     if (progress_ && total_ > 0) {
-      progress_(downloaded_, total_);
+      if (!progress_(downloaded_, total_)) {
+        // Cancellation requested: report a short write so HTTPClient::writeToStreamDataBlock
+        // treats this as a stream error, stops the connection (via returnError()), and unwinds
+        // back to downloadToFile() with a negative writeResult.
+        aborted_ = true;
+        return 0;
+      }
     }
     return written;
   }
@@ -44,27 +166,25 @@ class FileWriteStream final : public Stream {
 
   size_t downloaded() const { return downloaded_; }
   bool ok() const { return writeOk_; }
+  bool aborted() const { return aborted_; }
 
  private:
   FsFile& file_;
   size_t total_;
   size_t downloaded_ = 0;
   bool writeOk_ = true;
+  bool aborted_ = false;
   HttpDownloader::ProgressCallback progress_;
 };
 }  // namespace
 
 bool HttpDownloader::fetchUrl(const std::string& url, Stream& outContent, const std::string& username,
-                              const std::string& password) {
-  // Use NetworkClientSecure for HTTPS, regular NetworkClient for HTTP
-  std::unique_ptr<NetworkClient> client;
-  if (UrlUtils::isHttpsUrl(url)) {
-    auto* secureClient = new NetworkClientSecure();
-    secureClient->setInsecure();
-    secureClient->setHandshakeTimeout(20);
-    client.reset(secureClient);
-  } else {
-    client.reset(new NetworkClient());
+                              const std::string& password, bool verifyTls) {
+  SecureNetworkClient* secureForError = nullptr;
+  std::unique_ptr<NetworkClient> client = makeHttpClient(url, verifyTls, &secureForError);
+  if (!client) {
+    lastHttpCode = TLS_ERROR_CODE;
+    return false;
   }
   HTTPClient http;
 
@@ -84,6 +204,9 @@ bool HttpDownloader::fetchUrl(const std::string& url, Stream& outContent, const 
   const int httpCode = http.GET();
   lastHttpCode = httpCode;
   LOG_DBG("HTTP", "GET result: %d, free heap: %d", httpCode, ESP.getFreeHeap());
+  if (logTlsFailureIfAny(secureForError, httpCode)) {
+    lastHttpCode = TLS_ERROR_CODE;
+  }
   if (httpCode != HTTP_CODE_OK) {
     LOG_ERR("HTTP", "Fetch failed: %d", httpCode);
     http.end();
@@ -104,16 +227,13 @@ bool HttpDownloader::fetchUrl(const std::string& url, Stream& outContent, const 
 }
 
 bool HttpDownloader::fetchUrl(const std::string& url, std::string& outContent, const std::string& username,
-                              const std::string& password) {
+                              const std::string& password, bool verifyTls) {
   // Direct string fetch: avoids StreamString and writeToStream issues.
-  std::unique_ptr<NetworkClient> client;
-  if (UrlUtils::isHttpsUrl(url)) {
-    auto* secureClient = new NetworkClientSecure();
-    secureClient->setInsecure();
-    secureClient->setHandshakeTimeout(20);
-    client.reset(secureClient);
-  } else {
-    client.reset(new NetworkClient());
+  SecureNetworkClient* secureForError = nullptr;
+  std::unique_ptr<NetworkClient> client = makeHttpClient(url, verifyTls, &secureForError);
+  if (!client) {
+    lastHttpCode = TLS_ERROR_CODE;
+    return false;
   }
   HTTPClient http;
 
@@ -131,6 +251,9 @@ bool HttpDownloader::fetchUrl(const std::string& url, std::string& outContent, c
   const int httpCode = http.GET();
   lastHttpCode = httpCode;
 
+  if (logTlsFailureIfAny(secureForError, httpCode)) {
+    lastHttpCode = TLS_ERROR_CODE;
+  }
   if (httpCode != HTTP_CODE_OK) {
     LOG_ERR("HTTP", "FetchStr failed: %d", httpCode);
     http.end();
@@ -175,16 +298,13 @@ bool HttpDownloader::fetchUrl(const std::string& url, std::string& outContent, c
 
 HttpDownloader::DownloadError HttpDownloader::downloadToFile(const std::string& url, const std::string& destPath,
                                                              ProgressCallback progress, int timeoutMs,
-                                                             const std::string& username, const std::string& password) {
-  // Use NetworkClientSecure for HTTPS, regular NetworkClient for HTTP
-  std::unique_ptr<NetworkClient> client;
-  if (UrlUtils::isHttpsUrl(url)) {
-    auto* secureClient = new NetworkClientSecure();
-    secureClient->setInsecure();
-    secureClient->setHandshakeTimeout(20);
-    client.reset(secureClient);
-  } else {
-    client.reset(new NetworkClient());
+                                                             const std::string& username, const std::string& password,
+                                                             HttpResponseMetadata* outMetadata, bool verifyTls) {
+  SecureNetworkClient* secureForError = nullptr;
+  std::unique_ptr<NetworkClient> client = makeHttpClient(url, verifyTls, &secureForError);
+  if (!client) {
+    lastHttpCode = TLS_ERROR_CODE;
+    return TLS_ERROR;
   }
   HTTPClient http;
 
@@ -204,12 +324,27 @@ HttpDownloader::DownloadError HttpDownloader::downloadToFile(const std::string& 
     http.addHeader("Authorization", "Basic " + encoded);
   }
 
+  // Headers must be registered before GET() or header() will always return empty afterwards.
+  if (outMetadata) {
+    static const char* kCollectedHeaders[] = {"Content-Type", "Content-Disposition"};
+    http.collectHeaders(kCollectedHeaders, 2);
+  }
+
   const int httpCode = http.GET();
   lastHttpCode = httpCode;
+  const bool tlsFailure = logTlsFailureIfAny(secureForError, httpCode);
+  if (tlsFailure) {
+    lastHttpCode = TLS_ERROR_CODE;
+  }
+  if (outMetadata) {
+    outMetadata->statusCode = httpCode;
+    outMetadata->contentType = http.header("Content-Type").c_str();
+    outMetadata->contentDisposition = http.header("Content-Disposition").c_str();
+  }
   if (httpCode != HTTP_CODE_OK) {
     LOG_ERR("HTTP", "Download failed: %d", httpCode);
     http.end();
-    return HTTP_ERROR;
+    return tlsFailure ? TLS_ERROR : HTTP_ERROR;
   }
 
   const int64_t reportedLength = http.getSize();
@@ -219,15 +354,23 @@ HttpDownloader::DownloadError HttpDownloader::downloadToFile(const std::string& 
   } else {
     LOG_DBG("HTTP", "Content-Length: unknown");
   }
+  if (outMetadata) {
+    outMetadata->contentLength = contentLength;
+  }
 
-  // Remove existing file if present
-  if (Storage.exists(destPath.c_str())) {
-    Storage.remove(destPath.c_str());
+  // Download into a temporary ".part" file and rename it to destPath only after
+  // all verification passes. This keeps destPath atomic: it either holds the old
+  // complete file or the new complete file, never a truncated download.
+  const std::string partPath = destPath + ".part";
+
+  // Clean up any stale .part file left over from a previous interrupted download.
+  if (Storage.exists(partPath.c_str())) {
+    Storage.remove(partPath.c_str());
   }
 
   // Open file for writing
   FsFile file;
-  if (!Storage.openFileForWrite("HTTP", destPath.c_str(), file)) {
+  if (!Storage.openFileForWrite("HTTP", partPath.c_str(), file)) {
     LOG_ERR("HTTP", "Failed to open file for writing");
     http.end();
     return FILE_ERROR;
@@ -241,10 +384,25 @@ HttpDownloader::DownloadError HttpDownloader::downloadToFile(const std::string& 
   http.end();
 
   if (writeResult < 0) {
+    if (fileStream.aborted()) {
+      LOG_INF("HTTP", "Download cancelled by progress callback (len=%zu, downloaded=%zu)", contentLength,
+              fileStream.downloaded());
+      Storage.remove(partPath.c_str());
+      return ABORTED;
+    }
     LOG_ERR("HTTP", "writeToStream error: %d (len=%zu)", writeResult, contentLength);
     lastHttpCode = writeResult;  // Store writeToStream error code for diagnostics
-    Storage.remove(destPath.c_str());
+    Storage.remove(partPath.c_str());
     return HTTP_ERROR;
+  }
+
+  // Defensive: if the framework ever tolerates the abort's short write and reports success,
+  // the file is still truncated -- never let an aborted download pass as OK.
+  if (fileStream.aborted()) {
+    LOG_INF("HTTP", "Download cancelled by progress callback (len=%zu, downloaded=%zu)", contentLength,
+            fileStream.downloaded());
+    Storage.remove(partPath.c_str());
+    return ABORTED;
   }
 
   const size_t downloaded = fileStream.downloaded();
@@ -254,23 +412,47 @@ HttpDownloader::DownloadError HttpDownloader::downloadToFile(const std::string& 
   if (!fileStream.ok()) {
     LOG_ERR("HTTP", "Write failed during download");
     lastHttpCode = -900;  // Custom code: SD write failure
-    Storage.remove(destPath.c_str());
+    Storage.remove(partPath.c_str());
     return FILE_ERROR;
   }
 
   if (contentLength == 0 && downloaded == 0) {
     LOG_ERR("HTTP", "Download failed: no data received");
     lastHttpCode = -901;  // Custom code: no data
-    Storage.remove(destPath.c_str());
+    Storage.remove(partPath.c_str());
     return HTTP_ERROR;
   }
 
   // Verify download size if known
   if (contentLength > 0 && downloaded != contentLength) {
     LOG_ERR("HTTP", "Size mismatch: got %zu, expected %zu", downloaded, contentLength);
-    Storage.remove(destPath.c_str());
+    Storage.remove(partPath.c_str());
     return HTTP_ERROR;
   }
 
+  // All checks passed: move the .part file into place. SdFat's rename() opens the
+  // target with O_EXCL semantics and fails if it already exists, so remove the old
+  // destination first.
+  if (Storage.exists(destPath.c_str())) {
+    Storage.remove(destPath.c_str());
+  }
+  if (!Storage.rename(partPath.c_str(), destPath.c_str())) {
+    // Keep the verified .part file: deleting it here would lose both the old file
+    // (removed above) and the fully downloaded data. The stale-.part cleanup at the
+    // top of this function reclaims it on the next download attempt.
+    LOG_ERR("HTTP", "Rename failed: %s -> %s", partPath.c_str(), destPath.c_str());
+    return FILE_ERROR;
+  }
+
   return OK;
+}
+
+int HttpDownloader::postJson(const std::string& url, const std::string& jsonBody, std::string& outResponse,
+                             const std::string& authorization, bool verifyTls, int* outRetryAfterSeconds) {
+  return sendJsonRequest("POST", url, jsonBody, outResponse, authorization, verifyTls, outRetryAfterSeconds);
+}
+
+int HttpDownloader::getJson(const std::string& url, std::string& outResponse, const std::string& authorization,
+                            bool verifyTls, int* outRetryAfterSeconds) {
+  return sendJsonRequest("GET", url, "", outResponse, authorization, verifyTls, outRetryAfterSeconds);
 }
