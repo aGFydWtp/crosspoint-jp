@@ -87,6 +87,9 @@ jobs:
             1. USB-C でデバイスをPCに接続
             2. `firmware.bin` をダウンロードし、フラッシュツールで書き込み
           generate_release_notes: true
-          prerelease: ${{ contains(github.ref, '-') }}
+          # ハイフン入りタグは prerelease 扱いだが、フォーク運用の
+          # vX.Y.Z-forked は正式リリース (Deploy Flasher の stable
+          # チャンネルが非 prerelease のみを拾うため)。
+          prerelease: ${{ contains(github.ref_name, '-') && !endsWith(github.ref_name, '-forked') }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
