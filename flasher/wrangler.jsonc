@@ -1,0 +1,24 @@
+{
+	"$schema": "https://raw.githubusercontent.com/cloudflare/workers-sdk/main/packages/wrangler/config-schema.json",
+	"name": "crosspoint-flasher",
+	"compatibility_date": "2026-07-01",
+	// 静的アセットのみの Worker(main なし)。_site/ は CI
+	// (.github/workflows/deploy-flasher.yml) がリリースバイナリと
+	// manifest を集めて生成する。CORS 回避のためバイナリを同一
+	// オリジンに同梱する設計は GitHub Pages 時代と同じ。
+	"assets": {
+		"directory": "../_site"
+	},
+	// workers.dev URL は公開しない(カスタムドメインのみで配信)。
+	"workers_dev": false,
+	"routes": [
+		{
+			// hr20k.com ゾーンのカスタムドメイン。xtc.hr20k.com (url-to-xtc
+			// Worker) と同様、デプロイ時に DNS レコードと証明書
+			// (Advanced Certificate) が自動作成されるため、2階層
+			// サブドメインでも Universal SSL の制限を受けない。
+			"pattern": "flasher.xtc.hr20k.com",
+			"custom_domain": true
+		}
+	]
+}
