@@ -3,6 +3,9 @@ on:
   push:
     tags:
       - '*'
+  # 手動実行: v<platformio.iniのversion>-forked.<N> を自動採番して
+  # リリースを作成する (タグは softprops/action-gh-release が作る)。
+  workflow_dispatch:
 
 jobs:
   build-release:
@@ -27,9 +30,27 @@ jobs:
       - name: Install PlatformIO Core
         run: uv pip install --system -U https://github.com/pioarduino/platformio-core/archive/refs/tags/v6.1.19.zip
 
+      - name: Determine release tag
+        id: tag
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+            # 既存の v<base>-forked / v<base>-forked.<N> タグから次の連番を採番
+            git fetch --tags --quiet
+            BASE="v$(sed -n 's/^version = //p' platformio.ini | tr -d '[:space:]')"
+            LAST=$(git tag -l "${BASE}-forked" "${BASE}-forked.*" \
+              | sed -e "s/^${BASE}-forked//" -e 's/^\.//' -e 's/^$/0/' \
+              | sort -n | tail -n1)
+            TAG="${BASE}-forked.$(( ${LAST:-0} + 1 ))"
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
+          echo "tag=${TAG}" >> "${GITHUB_OUTPUT}"
+          echo "Release tag: ${TAG}"
+
       - name: Sync version from tag
         run: |
-          TAG="${GITHUB_REF_NAME}"
+          TAG="${{ steps.tag.outputs.tag }}"
           VERSION="${TAG#v}"
           sed -i "s/^version = .*/version = ${VERSION}/" platformio.ini
           echo "Building with version: ${VERSION}"
@@ -56,7 +77,7 @@ jobs:
       - name: Upload Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: CrossPoint-${{ github.ref_name }}
+          name: CrossPoint-${{ steps.tag.outputs.tag }}
           path: |
             bootloader.bin
             partitions.bin
@@ -65,7 +86,8 @@ jobs:
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          name: CrossPoint Reader JP ${{ github.ref_name }}
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: CrossPoint Reader JP ${{ steps.tag.outputs.tag }}
           files: |
             firmware.bin
             bootloader.bin
@@ -74,7 +96,7 @@ jobs:
           # その下に GitHub が自動生成する変更点 (マージされた PR の一覧 / 新規 contributor /
           # Full Changelog リンク) が追記される。
           body: |
-            ## CrossPoint Reader JP ${{ github.ref_name }}
+            ## CrossPoint Reader JP ${{ steps.tag.outputs.tag }}
 
             ### 📦 ファームウェア
 
@@ -88,8 +110,8 @@ jobs:
             2. `firmware.bin` をダウンロードし、フラッシュツールで書き込み
           generate_release_notes: true
           # ハイフン入りタグは prerelease 扱いだが、フォーク運用の
-          # vX.Y.Z-forked は正式リリース (Deploy Flasher の stable
-          # チャンネルが非 prerelease のみを拾うため)。
-          prerelease: ${{ contains(github.ref_name, '-') && !endsWith(github.ref_name, '-forked') }}
+          # vX.Y.Z-forked / vX.Y.Z-forked.N は正式リリース (Deploy Flasher
+          # の stable チャンネルが非 prerelease のみを拾うため)。
+          prerelease: ${{ contains(steps.tag.outputs.tag, '-') && !contains(steps.tag.outputs.tag, '-forked') }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
