@@ -86,11 +86,8 @@ void Html2XtcLibraryActivity::render(RenderLock&&) {
   const auto pageHeight = renderer.getScreenHeight();
 
   renderer.drawCenteredText(UI_12_FONT_ID, 15, tr(STR_MY_XTC), true, EpdFontFamily::BOLD);
-  renderer.drawCenteredText(UI_10_FONT_ID, pageHeight / 2 - 45, tr(STR_XTC_NOT_PAIRED));
-  renderer.drawCenteredText(UI_10_FONT_ID, pageHeight / 2 - 15, tr(STR_XTC_START_PAIRING), true, EpdFontFamily::BOLD);
-  // Legacy manual-provisioning path, kept as a developer-facing fallback.
-  renderer.drawCenteredText(UI_10_FONT_ID, pageHeight / 2 + 20, tr(STR_XTC_PAIRING_HINT));
-  renderer.drawCenteredText(UI_10_FONT_ID, pageHeight / 2 + 50, tr(STR_XTC_PAIRING_PATH));
+  renderer.drawCenteredText(UI_10_FONT_ID, pageHeight / 2 - 25, tr(STR_XTC_NOT_PAIRED));
+  renderer.drawCenteredText(UI_10_FONT_ID, pageHeight / 2 + 5, tr(STR_XTC_START_PAIRING), true, EpdFontFamily::BOLD);
 
   const auto labels = mappedInput.mapLabels(tr(STR_BACK), tr(STR_CONFIRM), "", "");
   GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
