@@ -94,8 +94,85 @@ jobs:
           echo "=== Site contents ==="
           find _site -type f | sort
 
+      - name: Configure flasher asset headers
+        run: |
+          set -euo pipefail
+
+          cat > _site/_headers <<'HEADERS'
+          /manifest_dev.json
+            Access-Control-Allow-Origin: https://xtc.hr20k.com
+
+          /manifest_stable.json
+            Access-Control-Allow-Origin: https://xtc.hr20k.com
+
+          /dev/*
+            Access-Control-Allow-Origin: https://xtc.hr20k.com
+
+          /stable/*
+            Access-Control-Allow-Origin: https://xtc.hr20k.com
+          HEADERS
+
+          echo "=== _site/_headers ==="
+          cat _site/_headers
+
+      - name: Validate generated flasher site
+        run: |
+          set -euo pipefail
+
+          test -f _site/index.html
+          test -f _site/_headers
+
+          if [ -f _site/manifest_dev.json ]; then
+            test -f _site/dev/bootloader.bin
+            test -f _site/dev/partitions.bin
+            test -f _site/dev/firmware.bin
+            jq -e '.builds[0].chipFamily == "ESP32-C3"' _site/manifest_dev.json >/dev/null
+            jq -e '.builds[0].parts | map(.offset) == [0, 32768, 65536]' _site/manifest_dev.json >/dev/null
+          fi
+
+          if [ -f _site/manifest_stable.json ]; then
+            test -f _site/stable/bootloader.bin
+            test -f _site/stable/partitions.bin
+            test -f _site/stable/firmware.bin
+            jq -e '.builds[0].chipFamily == "ESP32-C3"' _site/manifest_stable.json >/dev/null
+            jq -e '.builds[0].parts | map(.offset) == [0, 32768, 65536]' _site/manifest_stable.json >/dev/null
+          fi
+
+          grep -F 'Access-Control-Allow-Origin: https://xtc.hr20k.com' _site/_headers
+
+          if grep -qF 'Access-Control-Allow-Origin: *' _site/_headers; then
+            echo "Wildcard CORS origin found in _site/_headers" >&2
+            exit 1
+          fi
+
       - name: Deploy to Cloudflare Workers
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: npx wrangler@4 deploy --config flasher/wrangler.jsonc
+
+      - name: Verify deployed CORS headers
+        run: |
+          set -euo pipefail
+
+          # No dev release means manifest_dev.json was never deployed; nothing to verify.
+          if [ ! -f _site/manifest_dev.json ]; then
+            echo "manifest_dev.json was not generated, skipping CORS verification"
+            exit 0
+          fi
+
+          URL="https://flasher.xtc.hr20k.com/manifest_dev.json"
+
+          for i in 1 2 3 4 5; do
+            output=$(curl -fsSI -H 'Origin: https://xtc.hr20k.com' "$URL" || true)
+            if echo "$output" | grep -Fiq 'access-control-allow-origin: https://xtc.hr20k.com'; then
+              echo "CORS header verified"
+              exit 0
+            fi
+            if [ "$i" -lt 5 ]; then
+              sleep 3
+            fi
+          done
+
+          echo "CORS header was not found"
+          exit 1
