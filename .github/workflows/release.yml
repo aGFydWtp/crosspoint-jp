@@ -36,7 +36,9 @@ jobs:
           set -euo pipefail
           if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
             # 既存の v<base>-forked / v<base>-forked.<N> タグから次の連番を採番
-            git fetch --tags --quiet
+            # --no-recurse-submodules: open-x4-sdk への再帰 fetch が
+            # "not our ref" で失敗するため (タグ取得に submodule は不要)
+            git fetch --tags --quiet --no-recurse-submodules origin
             BASE="v$(sed -n 's/^version = //p' platformio.ini | tr -d '[:space:]')"
             LAST=$(git tag -l "${BASE}-forked" "${BASE}-forked.*" \
               | sed -e "s/^${BASE}-forked//" -e 's/^\.//' -e 's/^$/0/' \
