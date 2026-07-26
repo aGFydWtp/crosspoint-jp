@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Files - CrossPoint Reader</title>
   <script src="/js/jszip.min.js"></script>
+  <script src="/js/aozora-epub.js"></script>
   <style>
     :root {
       --font-color: #333;
@@ -1668,6 +1669,20 @@
           </label>
         </div>
       </div>
+      <!-- TXT (Aozora format) to EPUB conversion options -->
+      <div class="convert-options" id="txtConvertOptions" style="display:none;">
+        <div class="convert-row">
+          <label class="convert-checkbox">
+            <input type="checkbox" id="txtConvertBeforeUpload" checked onchange="toggleTxtConvertOptions()">
+            <span>青空文庫 TXT → EPUB に変換</span>
+          </label>
+        </div>
+        <div class="convert-settings" id="txtConvertSettings">
+          <span>📖 縦書き</span>
+          <span>🈁 UTF-8 のみ</span>
+          <span>🌸 ルビ / 見出し / 改ページ</span>
+        </div>
+      </div>
       <!-- Sync compatibility warning - outside picker-columns -->
       <div class="convert-warning" id="convertWarning" style="display:none;" role="alert" aria-live="polite">
         ⚠️ Converting will modify files and can break hash‑based sync. ⚠️<br>
@@ -2955,11 +2970,13 @@
     const files = fileInput.files;
     const convertOptions = document.getElementById('convertOptions');
     const xtcConvertOptions = document.getElementById('xtcConvertOptions');
+    const txtConvertOptions = document.getElementById('txtConvertOptions');
     fileInput.classList.toggle('has-files', files.length > 0);
 
     // Detect file types
     const hasEpub = Array.from(files).some(f => f.name.toLowerCase().endsWith('.epub'));
     const hasZip = Array.from(files).some(f => isZipOrCbz(f.name));
+    const hasTxt = Array.from(files).some(f => f.name.toLowerCase().endsWith('.txt'));
 
     // Show/hide convert options based on file types
     if (files.length > 0 && hasEpub) {
@@ -2983,6 +3000,18 @@
       }
     } else {
       xtcConvertOptions.style.display = 'none';
+    }
+
+    // Show/hide TXT→EPUB convert options for .txt files
+    if (files.length > 0 && hasTxt) {
+      txtConvertOptions.style.display = 'block';
+      const txtChecked = document.getElementById('txtConvertBeforeUpload').checked;
+      if (txtChecked && !hasEpub && !hasZip) {
+        uploadBtn.textContent = 'Convert & Upload';
+        uploadBtn.classList.add('optimize');
+      }
+    } else {
+      txtConvertOptions.style.display = 'none';
     }
 
     if (files.length > 0) {
@@ -3040,6 +3069,18 @@ function isZipOrCbz(filename) {
 
 function toggleXtcConvertOptions() {
   const checked = document.getElementById('xtcConvertBeforeUpload').checked;
+  const uploadBtn = document.getElementById('uploadBtn');
+  if (checked) {
+    uploadBtn.textContent = 'Convert & Upload';
+    uploadBtn.classList.add('optimize');
+  } else {
+    uploadBtn.textContent = 'Upload';
+    uploadBtn.classList.remove('optimize');
+  }
+}
+
+function toggleTxtConvertOptions() {
+  const checked = document.getElementById('txtConvertBeforeUpload').checked;
   const uploadBtn = document.getElementById('uploadBtn');
   if (checked) {
     uploadBtn.textContent = 'Convert & Upload';
@@ -5121,11 +5162,15 @@ function uploadFile() {
     const isZip = isZipOrCbz(file.name);
     const xtcConvertEnabled = document.getElementById('xtcConvertBeforeUpload').checked;
     const needsXtcConversion = isZip && xtcConvertEnabled;
+    const isTxt = file.name.toLowerCase().endsWith('.txt');
+    const txtConvertCheckbox = document.getElementById('txtConvertBeforeUpload');
+    const txtConvertEnabled = txtConvertCheckbox ? txtConvertCheckbox.checked : false;
+    const needsTxtConversion = isTxt && txtConvertEnabled;
     let conversionSucceeded = false;
     let conversionFailed = false;  // Track if conversion actually failed
 
     const methodText = useWebSocket ? ' [WS]' : ' [HTTP]';
-    const stageText = (needsConversion || needsXtcConversion) ? 'Converting & uploading' : 'Uploading';
+    const stageText = (needsConversion || needsXtcConversion || needsTxtConversion) ? 'Converting & uploading' : 'Uploading';
     progressText.style.color = '';
     progressText.textContent = `${stageText} ${file.name} (${currentIndex + 1}/${files.length})${methodText}`;
 
@@ -5251,6 +5296,37 @@ function uploadFile() {
           progressText.textContent = `XTC conversion failed, uploading original ${file.name}...`;
           progressFill.style.backgroundColor = '#e67e22';
           progressFill.style.width = '0%';
+        }
+      }
+
+      // Convert TXT (Aozora format) to EPUB if needed
+      // 変換失敗時は元 TXT をアップロードせずスキップする（デバイス側の TXT レンダリングを避けるため）
+      if (needsTxtConversion) {
+        progressFill.style.backgroundColor = '#9b59b6';
+        progressText.textContent = `Converting TXT→EPUB: ${file.name} (${currentIndex + 1}/${files.length})...`;
+        if (!useBatchLog) {
+          clearLog();
+          showLog();
+        }
+
+        try {
+          const result = await window.AozoraEpub.convertTxtToEpub(file, (percent) => {
+            progressFill.style.width = (percent * 0.5 * 100) + '%';
+          });
+
+          file = new File([result.blob], result.name, { type: 'application/epub+zip' });
+          progressFill.style.backgroundColor = '#27ae60';
+          conversionSucceeded = true;
+        } catch (convError) {
+          if (operationCancelled) { if (uploadGeneration === myGeneration) restoreAfterCancel(); return; }
+          console.error('TXT→EPUB conversion error:', convError);
+          logError(`TXT→EPUB変換失敗: ${convError.message}`);
+          log('TXT ファイルはアップロードされません。', 'warning', 'INFO');
+          conversionFailed = true;
+          failedFiles.push({ name: file.name, error: convError.message, file: originalFile });
+          currentIndex++;
+          uploadNextFile();
+          return;
         }
       }
 
