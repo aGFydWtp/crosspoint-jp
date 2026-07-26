@@ -1673,7 +1673,7 @@
       <div class="convert-options" id="txtConvertOptions" style="display:none;">
         <div class="convert-row">
           <label class="convert-checkbox">
-            <input type="checkbox" id="txtConvertBeforeUpload" checked onchange="toggleTxtConvertOptions()">
+            <input type="checkbox" id="txtConvertBeforeUpload" onchange="toggleTxtConvertOptions()">
             <span>青空文庫 TXT → EPUB に変換</span>
           </label>
         </div>
@@ -3085,7 +3085,17 @@ function toggleTxtConvertOptions() {
   if (checked) {
     uploadBtn.textContent = 'Convert & Upload';
     uploadBtn.classList.add('optimize');
-  } else {
+    return;
+  }
+  // TXT 変換を OFF にしても、他 (EPUB / XTC) の変換が有効ならボタン表示は 'Convert & Upload' を維持する。
+  const epubOpts = document.getElementById('convertOptions');
+  const xtcOpts = document.getElementById('xtcConvertOptions');
+  const epubEl = document.getElementById('convertBeforeUpload');
+  const xtcEl = document.getElementById('xtcConvertBeforeUpload');
+  const otherActive =
+    (epubOpts && epubOpts.style.display !== 'none' && epubEl && epubEl.checked) ||
+    (xtcOpts && xtcOpts.style.display !== 'none' && xtcEl && xtcEl.checked);
+  if (!otherActive) {
     uploadBtn.textContent = 'Upload';
     uploadBtn.classList.remove('optimize');
   }
@@ -5300,7 +5310,9 @@ function uploadFile() {
       }
 
       // Convert TXT (Aozora format) to EPUB if needed
-      // 変換失敗時は元 TXT をアップロードせずスキップする（デバイス側の TXT レンダリングを避けるため）
+      // 変換失敗時は元 TXT をそのままアップロードするフォールバックに戻す。
+      // EPUB/XTC 変換パスと挙動を統一し、デバイスからファイルが消える驚きを避ける。
+      // (default OFF なので、この分岐に入るのは変換をユーザーが明示的にオンにした時のみ)
       if (needsTxtConversion) {
         progressFill.style.backgroundColor = '#9b59b6';
         progressText.textContent = `Converting TXT→EPUB: ${file.name} (${currentIndex + 1}/${files.length})...`;
@@ -5313,6 +5325,7 @@ function uploadFile() {
           const result = await window.AozoraEpub.convertTxtToEpub(file, (percent) => {
             progressFill.style.width = (percent * 0.5 * 100) + '%';
           });
+          if (operationCancelled) { if (uploadGeneration === myGeneration) restoreAfterCancel(); return; }
 
           file = new File([result.blob], result.name, { type: 'application/epub+zip' });
           progressFill.style.backgroundColor = '#27ae60';
@@ -5321,12 +5334,12 @@ function uploadFile() {
           if (operationCancelled) { if (uploadGeneration === myGeneration) restoreAfterCancel(); return; }
           console.error('TXT→EPUB conversion error:', convError);
           logError(`TXT→EPUB変換失敗: ${convError.message}`);
-          log('TXT ファイルはアップロードされません。', 'warning', 'INFO');
+          log('元のTXTファイルをそのままアップロードします。', 'warning', 'INFO');
           conversionFailed = true;
-          failedFiles.push({ name: file.name, error: convError.message, file: originalFile });
-          currentIndex++;
-          uploadNextFile();
-          return;
+          progressText.textContent = `TXT変換失敗、元ファイルをアップロード: ${file.name}...`;
+          progressFill.style.backgroundColor = '#e67e22';
+          progressFill.style.width = '0%';
+          // file は元のまま (TXT のまま) アップロードに進む
         }
       }
 
