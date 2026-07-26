@@ -330,6 +330,8 @@ bool AozoraActivity::downloadBook() {
   if (!indexManager_.addEntry(selectedWorkId_, selectedWorkTitle_, selectedWorkAuthor_, relPath.c_str())) {
     LOG_ERR("AOZORA", "Failed to add index entry");
     // File is downloaded but index failed -- not critical
+  } else {
+    invalidateDownloadedPageCache();
   }
 
   LOG_DBG("AOZORA", "Downloaded: %s", destPath);
@@ -785,6 +787,14 @@ void AozoraActivity::loop() {
       // ダウンロード済み: Left = 削除, Right = 更新
       if (mappedInput.wasPressed(MappedInputManager::Button::Left)) {
         if (indexManager_.removeEntry(selectedWorkId_)) {
+          invalidateDownloadedPageCache();
+          // 削除で selectedIndex_ が範囲外になり得る（DOWNLOADED_LIST 経由で来ている場合）
+          const int newTotal = static_cast<int>(indexManager_.activeCount());
+          if (selectedIndex_ >= newTotal && newTotal > 0) {
+            selectedIndex_ = newTotal - 1;
+          } else if (newTotal == 0) {
+            selectedIndex_ = 0;
+          }
           {
             RenderLock lock(*this);
             popState();
@@ -927,10 +937,10 @@ void AozoraActivity::loop() {
       return;
     }
 
-    const auto& entries = indexManager_.entries();
+    const int total = static_cast<int>(indexManager_.activeCount());
 
-    buttonNavigator_.onNextRelease([this, &entries] {
-      if (selectedIndex_ < static_cast<int>(entries.size()) - 1) {
+    buttonNavigator_.onNextRelease([this, total] {
+      if (selectedIndex_ < total - 1) {
         selectedIndex_++;
         requestUpdate();
       }
@@ -944,17 +954,25 @@ void AozoraActivity::loop() {
     });
 
     if (mappedInput.wasPressed(MappedInputManager::Button::Confirm)) {
-      if (!entries.empty() && selectedIndex_ < static_cast<int>(entries.size())) {
-        const auto& entry = entries[selectedIndex_];
-        selectedWorkId_ = entry.workId;
-        snprintf(selectedWorkTitle_, sizeof(selectedWorkTitle_), "%s", entry.title);
-        snprintf(selectedWorkAuthor_, sizeof(selectedWorkAuthor_), "%s", entry.author);
-
-        {
-          RenderLock lock(*this);
-          pushState(WORK_DETAIL);
+      if (total > 0 && selectedIndex_ < total) {
+        // 選択中のエントリがページキャッシュ内にあることを保証してから読む
+        const int pageStart = (selectedIndex_ / DL_PAGE_SIZE) * DL_PAGE_SIZE;
+        if (dlPageStart_ != pageStart) {
+          loadDownloadedPage(pageStart);
         }
-        requestUpdate();
+        const int localIdx = selectedIndex_ - dlPageStart_;
+        if (localIdx >= 0 && localIdx < dlPageCount_) {
+          const auto& entry = dlPageCache_[localIdx];
+          selectedWorkId_ = entry.workId;
+          snprintf(selectedWorkTitle_, sizeof(selectedWorkTitle_), "%s", entry.title);
+          snprintf(selectedWorkAuthor_, sizeof(selectedWorkAuthor_), "%s", entry.author);
+
+          {
+            RenderLock lock(*this);
+            pushState(WORK_DETAIL);
+          }
+          requestUpdate();
+        }
       }
     }
   } else if (state_ == ERROR) {
@@ -1192,19 +1210,35 @@ void AozoraActivity::render(RenderLock&&) {
     GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
 
   } else if (state_ == DOWNLOADED_LIST) {
-    const auto& entries = indexManager_.entries();
+    const int total = static_cast<int>(indexManager_.activeCount());
 
-    if (entries.empty()) {
+    if (total == 0) {
       renderer.drawCenteredText(UI_10_FONT_ID, centerY, tr(STR_NO_RESULTS));
       const auto labels = mappedInput.mapLabels(tr(STR_BACK), "", "", "");
       GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
     } else {
+      // 選択中のエントリを含むページをキャッシュに載せる
+      const int pageStart = (selectedIndex_ / DL_PAGE_SIZE) * DL_PAGE_SIZE;
+      if (dlPageStart_ != pageStart) {
+        loadDownloadedPage(pageStart);
+      }
+
       GUI.drawList(
           renderer,
           Rect{0, contentTop, pageWidth, pageHeight - contentTop - metrics.buttonHintsHeight - metrics.verticalSpacing},
-          static_cast<int>(entries.size()), selectedIndex_,
-          [&entries](int index) -> std::string { return entries[index].title; }, nullptr, nullptr,
-          [&entries](int index) -> std::string { return entries[index].author; }, false, nullptr);
+          total, selectedIndex_,
+          [this](int index) -> std::string {
+            const int localIdx = index - dlPageStart_;
+            if (localIdx < 0 || localIdx >= dlPageCount_) return "";
+            return dlPageCache_[localIdx].title;
+          },
+          nullptr, nullptr,
+          [this](int index) -> std::string {
+            const int localIdx = index - dlPageStart_;
+            if (localIdx < 0 || localIdx >= dlPageCount_) return "";
+            return dlPageCache_[localIdx].author;
+          },
+          false, nullptr);
 
       const auto labels = mappedInput.mapLabels(tr(STR_BACK), tr(STR_SELECT), tr(STR_DIR_UP), tr(STR_DIR_DOWN));
       GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
@@ -1220,4 +1254,22 @@ void AozoraActivity::render(RenderLock&&) {
   }
 
   renderer.displayBuffer();
+}
+
+void AozoraActivity::loadDownloadedPage(int start) {
+  const int total = static_cast<int>(indexManager_.activeCount());
+  if (start < 0) start = 0;
+
+  dlPageStart_ = start;
+  dlPageCount_ = 0;
+
+  for (int i = 0; i < DL_PAGE_SIZE; ++i) {
+    const int absIndex = start + i;
+    if (absIndex >= total) break;
+    if (!indexManager_.readEntryAt(absIndex, dlPageCache_[i])) {
+      LOG_ERR("AOZORA", "loadDownloadedPage: readEntryAt(%d) failed", absIndex);
+      break;
+    }
+    dlPageCount_++;
+  }
 }

@@ -1,112 +1,203 @@
 #include "AozoraIndexManager.h"
 
-#include <ArduinoJson.h>
 #include <Logging.h>
 
+#include <algorithm>
 #include <cstring>
 
 constexpr uint8_t AozoraIndexManager::BIN_HEADER_MAGIC[4];
 
 bool AozoraIndexManager::loadAndPurge() {
-  entries_.clear();
+  downloadedIds_.clear();
+  activeOffsets_.clear();
 
-  FsFile file;
-  if (!Storage.openFileForRead("AOZORA", INDEX_PATH, file)) {
-    LOG_DBG("AOZORA", "No index file, starting fresh");
-    return true;
+  if (Storage.exists(INDEX_BIN_PATH)) {
+    return loadFromBin_();
   }
 
-  JsonDocument doc;
-  DeserializationError err = deserializeJson(doc, file);
-  file.close();
-
-  if (err) {
-    LOG_ERR("AOZORA", "Index parse error: %s", err.c_str());
-    return true;
-  }
-
-  JsonArray arr = doc.as<JsonArray>();
-  entries_.reserve(arr.size());
-
-  bool needsSave = false;
-  for (JsonObject obj : arr) {
-    AozoraBookEntry entry;
-    entry.workId = obj["work_id"] | 0;
-    snprintf(entry.title, sizeof(entry.title), "%s", (const char*)(obj["title"] | ""));
-    snprintf(entry.author, sizeof(entry.author), "%s", (const char*)(obj["author"] | ""));
-    snprintf(entry.filename, sizeof(entry.filename), "%s", (const char*)(obj["filename"] | ""));
-
-    char fullPath[160];
-    snprintf(fullPath, sizeof(fullPath), "%s/%s", AOZORA_DIR, entry.filename);
-
-    if (Storage.exists(fullPath)) {
-      entries_.push_back(entry);
-    } else {
-      LOG_DBG("AOZORA", "Purging missing: %s", entry.filename);
-      needsSave = true;
-    }
-  }
-
-  if (needsSave) {
-    saveIndex();
-  }
-
+  LOG_DBG("AOZORA", "No index bin found, starting fresh");
   return true;
 }
 
-bool AozoraIndexManager::isDownloaded(int workId) const {
-  for (const auto& e : entries_) {
-    if (e.workId == workId) return true;
-  }
-  return false;
+bool AozoraIndexManager::isDownloaded(int32_t workId) const {
+  return std::binary_search(downloadedIds_.begin(), downloadedIds_.end(), workId);
 }
 
-bool AozoraIndexManager::addEntry(int workId, const char* title, const char* author, const char* filename) {
+bool AozoraIndexManager::addEntry(int32_t workId, const char* title, const char* author, const char* filename) {
   if (isDownloaded(workId)) return true;
 
   AozoraBookEntry entry;
+  memset(&entry, 0, sizeof(entry));
   entry.workId = workId;
   snprintf(entry.title, sizeof(entry.title), "%s", title);
   snprintf(entry.author, sizeof(entry.author), "%s", author);
   snprintf(entry.filename, sizeof(entry.filename), "%s", filename);
-  entries_.push_back(entry);
 
-  return saveIndex();
-}
-
-bool AozoraIndexManager::removeEntry(int workId) {
-  for (auto it = entries_.begin(); it != entries_.end(); ++it) {
-    if (it->workId == workId) {
-      char fullPath[160];
-      snprintf(fullPath, sizeof(fullPath), "%s/%s", AOZORA_DIR, it->filename);
-      Storage.remove(fullPath);
-      entries_.erase(it);
-      return saveIndex();
-    }
-  }
-  return false;
-}
-
-bool AozoraIndexManager::saveIndex() const {
-  JsonDocument doc;
-  JsonArray arr = doc.to<JsonArray>();
-
-  for (const auto& e : entries_) {
-    JsonObject obj = arr.add<JsonObject>();
-    obj["work_id"] = e.workId;
-    obj["title"] = e.title;
-    obj["author"] = e.author;
-    obj["filename"] = e.filename;
-  }
-
-  FsFile file;
-  if (!Storage.openFileForWrite("AOZORA", INDEX_PATH, file)) {
-    LOG_ERR("AOZORA", "Failed to open index for write");
+  HalFile file;
+  const bool binExists = Storage.exists(INDEX_BIN_PATH);
+  if (!Storage.openFileForWrite("AOZORA", INDEX_BIN_PATH, file)) {
+    LOG_ERR("AOZORA", "addEntry: open bin for write failed");
     return false;
   }
 
-  serializeJson(doc, file);
+  if (!binExists) {
+    if (!writeHeader_(file)) {
+      file.close();
+      Storage.remove(INDEX_BIN_PATH);
+      return false;
+    }
+  }
+
+  uint32_t offset = 0;
+  if (!appendRecord_(file, entry, offset)) {
+    file.close();
+    return false;
+  }
   file.close();
+
+  auto it = std::lower_bound(downloadedIds_.begin(), downloadedIds_.end(), workId);
+  downloadedIds_.insert(it, workId);
+  activeOffsets_.push_back(offset);
+  return true;
+}
+
+bool AozoraIndexManager::removeEntry(int32_t workId) {
+  auto idIt = std::lower_bound(downloadedIds_.begin(), downloadedIds_.end(), workId);
+  if (idIt == downloadedIds_.end() || *idIt != workId) return false;
+
+  // activeOffsets_ から該当エントリを見つけて、bin ファイルの実ファイルパスを取得し
+  // tombstone を書き込む。実ファイル削除もこの過程で行う。
+  HalFile file;
+  if (!Storage.openFileForWrite("AOZORA", INDEX_BIN_PATH, file)) {
+    LOG_ERR("AOZORA", "removeEntry: open bin failed");
+    return false;
+  }
+
+  bool found = false;
+  size_t foundIndex = 0;
+  for (size_t i = 0; i < activeOffsets_.size(); ++i) {
+    const uint32_t offset = activeOffsets_[i];
+    if (!file.seekSet(offset + 1)) continue;  // status バイトを飛ばして workId を読む
+    int32_t recWorkId = 0;
+    if (file.read(&recWorkId, sizeof(recWorkId)) != static_cast<int>(sizeof(recWorkId))) continue;
+    if (recWorkId != workId) continue;
+
+    // filename を読み出して SD から削除
+    AozoraBookEntry entry;
+    memset(&entry, 0, sizeof(entry));
+    if (!file.seekSet(offset + 1)) {
+      file.close();
+      return false;
+    }
+    if (file.read(&entry, sizeof(entry)) != static_cast<int>(sizeof(entry))) {
+      file.close();
+      return false;
+    }
+
+    if (!markTombstone_(file, offset)) {
+      file.close();
+      return false;
+    }
+
+    char fullPath[160];
+    snprintf(fullPath, sizeof(fullPath), "%s/%s", AOZORA_DIR, entry.filename);
+    Storage.remove(fullPath);
+
+    found = true;
+    foundIndex = i;
+    break;
+  }
+  file.close();
+
+  if (!found) {
+    LOG_ERR("AOZORA", "removeEntry: workId %d not found in bin", workId);
+    return false;
+  }
+
+  downloadedIds_.erase(idIt);
+  activeOffsets_.erase(activeOffsets_.begin() + foundIndex);
+  return true;
+}
+
+bool AozoraIndexManager::readEntryAt(size_t indexInActive, AozoraBookEntry& out) const {
+  if (indexInActive >= activeOffsets_.size()) return false;
+  const uint32_t offset = activeOffsets_[indexInActive];
+
+  HalFile file;
+  if (!Storage.openFileForRead("AOZORA", INDEX_BIN_PATH, file)) {
+    LOG_ERR("AOZORA", "readEntryAt: open bin failed");
+    return false;
+  }
+  if (!file.seekSet(offset + 1)) {  // status バイトを飛ばす
+    file.close();
+    return false;
+  }
+  const int bytes = file.read(&out, sizeof(out));
+  file.close();
+  if (bytes != static_cast<int>(sizeof(out))) {
+    LOG_ERR("AOZORA", "readEntryAt: short read at offset %u", offset);
+    return false;
+  }
+  return true;
+}
+
+bool AozoraIndexManager::loadFromBin_() {
+  HalFile file;
+  if (!Storage.openFileForRead("AOZORA", INDEX_BIN_PATH, file)) {
+    LOG_ERR("AOZORA", "loadFromBin: open failed");
+    return false;
+  }
+
+  if (!checkHeader_(file)) {
+    LOG_ERR("AOZORA", "loadFromBin: header invalid");
+    file.close();
+    return false;
+  }
+
+  const size_t fileSize = file.fileSize();
+  if (fileSize < BIN_HEADER_SIZE) {
+    file.close();
+    return true;  // 空のインデックス
+  }
+
+  const size_t estimatedCount = (fileSize - BIN_HEADER_SIZE) / BIN_RECORD_SIZE;
+  downloadedIds_.reserve(estimatedCount);
+  activeOffsets_.reserve(estimatedCount);
+
+  // 全レコードを走査。tombstone はスキップ、実ファイル欠損は tombstone マーク。
+  size_t offset = BIN_HEADER_SIZE;
+  while (offset + BIN_RECORD_SIZE <= fileSize) {
+    if (!file.seekSet(offset)) break;
+
+    uint8_t status = 0;
+    if (file.read(&status, 1) != 1) break;
+
+    if (status != STATUS_ACTIVE) {
+      offset += BIN_RECORD_SIZE;
+      continue;
+    }
+
+    AozoraBookEntry entry;
+    memset(&entry, 0, sizeof(entry));
+    if (file.read(&entry, sizeof(entry)) != static_cast<int>(sizeof(entry))) break;
+
+    // 実ファイル存在チェック
+    char fullPath[160];
+    snprintf(fullPath, sizeof(fullPath), "%s/%s", AOZORA_DIR, entry.filename);
+    if (Storage.exists(fullPath)) {
+      auto it = std::lower_bound(downloadedIds_.begin(), downloadedIds_.end(), entry.workId);
+      downloadedIds_.insert(it, entry.workId);
+      activeOffsets_.push_back(static_cast<uint32_t>(offset));
+    } else {
+      LOG_DBG("AOZORA", "Purging missing: %s", entry.filename);
+      markTombstone_(file, static_cast<uint32_t>(offset));
+    }
+
+    offset += BIN_RECORD_SIZE;
+  }
+
+  file.close();
+  LOG_DBG("AOZORA", "Loaded %zu active entries from bin", activeOffsets_.size());
   return true;
 }
 

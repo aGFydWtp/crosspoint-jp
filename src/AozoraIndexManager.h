@@ -14,10 +14,19 @@ struct AozoraBookEntry {
 };
 static_assert(sizeof(AozoraBookEntry) == 180, "AozoraBookEntry のレイアウトはディスク形式と一致する必要がある");
 
+/**
+ * 青空文庫のダウンロード履歴を管理する。
+ *
+ * SD 上の /Aozora/.aozora_index.bin に append-only の固定長バイナリレコードで保存し、
+ * メモリ上には workId のソート済み配列のみを保持する。詳細（title/author）は
+ * 表示時にファイルからページ単位で読み出す。
+ *
+ * これにより 500 件以上の履歴でもヒープ断片化によるクラッシュを回避する。
+ */
 class AozoraIndexManager {
  public:
   static constexpr const char* AOZORA_DIR = "/Aozora";
-  static constexpr const char* INDEX_PATH = "/Aozora/.aozora_index.json";
+  static constexpr const char* INDEX_PATH = "/Aozora/.aozora_index.json";  // 旧形式（マイグレ用）
   static constexpr const char* INDEX_BIN_PATH = "/Aozora/.aozora_index.bin";
   static constexpr const char* INDEX_TMP_PATH = "/Aozora/.aozora_index.bin.tmp";
 
@@ -30,10 +39,25 @@ class AozoraIndexManager {
   static constexpr size_t BIN_RECORD_SIZE = 181;  // status(1) + entry(180)
 
   bool loadAndPurge();
-  bool isDownloaded(int workId) const;
-  bool addEntry(int workId, const char* title, const char* author, const char* filename);
-  bool removeEntry(int workId);
-  const std::vector<AozoraBookEntry>& entries() const { return entries_; }
+
+  /** O(log N) の workId 検索 */
+  bool isDownloaded(int32_t workId) const;
+
+  /** append-only 書き込み + ソート済み配列への挿入 */
+  bool addEntry(int32_t workId, const char* title, const char* author, const char* filename);
+
+  /** tombstone マークで無効化 + SD 上の EPUB ファイルを削除 */
+  bool removeEntry(int32_t workId);
+
+  /** アクティブなエントリの件数（tombstone を除く） */
+  size_t activeCount() const { return activeOffsets_.size(); }
+
+  /**
+   * アクティブなエントリを挿入順で読み出す。indexInActive は [0, activeCount()) の範囲。
+   * 呼び出し側は out に対する所有権を持つ（内部でヒープを保持しない）。
+   */
+  bool readEntryAt(size_t indexInActive, AozoraBookEntry& out) const;
+
   /** 著者名/workId_タイトル.epub 形式の相対パスを生成 */
   static std::string makeRelativePath(int workId, const char* title, const char* author);
   static bool ensureDirectory();
@@ -41,10 +65,12 @@ class AozoraIndexManager {
   static bool ensureAuthorDirectory(const char* author);
 
  private:
-  std::vector<AozoraBookEntry> entries_;
-  bool saveIndex() const;
+  std::vector<int32_t> downloadedIds_;   // ソート済み workId
+  std::vector<uint32_t> activeOffsets_;  // 挿入順で bin ファイル内のバイトオフセット
 
-  // バイナリ形式 I/O ヘルパ（次コミットで呼び出しを追加する）
+  bool loadFromBin_();
+
+  // バイナリ形式 I/O ヘルパ
   static bool writeHeader_(HalFile& file);
   static bool checkHeader_(HalFile& file);
   static bool appendRecord_(HalFile& file, const AozoraBookEntry& entry, uint32_t& outOffset);
