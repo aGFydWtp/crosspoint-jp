@@ -1,10 +1,10 @@
 #pragma once
 
-#include <HalStorage.h>
-
+#include <cstddef>
 #include <cstdint>
-#include <string>
 #include <vector>
+
+class HalFile;
 
 struct AozoraBookEntry {
   int32_t workId;

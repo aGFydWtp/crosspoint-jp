@@ -1,6 +1,7 @@
 #include "AozoraIndexManager.h"
 
 #include <ArduinoJson.h>
+#include <HalStorage.h>
 #include <Logging.h>
 
 #include <algorithm>
