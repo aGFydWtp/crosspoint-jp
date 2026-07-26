@@ -1,5 +1,6 @@
 #include "AozoraIndexManager.h"
 
+#include <ArduinoJson.h>
 #include <Logging.h>
 
 #include <algorithm>
@@ -11,11 +12,26 @@ bool AozoraIndexManager::loadAndPurge() {
   downloadedIds_.clear();
   activeOffsets_.clear();
 
+  // 前回のマイグレが中断した場合の残骸を削除
+  if (Storage.exists(INDEX_TMP_PATH)) {
+    LOG_DBG("AOZORA", "Removing stale tmp file");
+    Storage.remove(INDEX_TMP_PATH);
+  }
+
   if (Storage.exists(INDEX_BIN_PATH)) {
     return loadFromBin_();
   }
 
-  LOG_DBG("AOZORA", "No index bin found, starting fresh");
+  if (Storage.exists(INDEX_PATH)) {
+    LOG_DBG("AOZORA", "Migrating legacy JSON to binary format");
+    if (migrateFromJson_()) {
+      return loadFromBin_();
+    }
+    LOG_ERR("AOZORA", "Migration failed, keeping legacy JSON");
+    return true;
+  }
+
+  LOG_DBG("AOZORA", "No index found, starting fresh");
   return true;
 }
 
@@ -198,6 +214,128 @@ bool AozoraIndexManager::loadFromBin_() {
 
   file.close();
   LOG_DBG("AOZORA", "Loaded %zu active entries from bin", activeOffsets_.size());
+  return true;
+}
+
+/**
+ * 旧 JSON 形式 (/Aozora/.aozora_index.json) をバイナリ形式にワンショット変換する。
+ *
+ * 全件を JsonDocument に一度に載せると断片化を助長するので、配列を 1 要素ずつ小さな
+ * JsonDocument でパースし逐次 bin に append する。.tmp に書き終えたら rename で
+ * atomic swap し、成功時は旧 JSON を削除する。
+ */
+bool AozoraIndexManager::migrateFromJson_() {
+  HalFile src;
+  if (!Storage.openFileForRead("AOZORA", INDEX_PATH, src)) {
+    LOG_ERR("AOZORA", "migrate: open JSON failed");
+    return false;
+  }
+
+  // 先頭の '[' までスキップ
+  int c = -1;
+  while ((c = src.read()) != -1 && c != '[') {
+  }
+  if (c != '[') {
+    LOG_ERR("AOZORA", "migrate: no array start");
+    src.close();
+    return false;
+  }
+
+  // .tmp を新規作成しヘッダを書き込む
+  Storage.remove(INDEX_TMP_PATH);  // 万が一残骸があれば削除
+  HalFile dst;
+  if (!Storage.openFileForWrite("AOZORA", INDEX_TMP_PATH, dst)) {
+    LOG_ERR("AOZORA", "migrate: open tmp for write failed");
+    src.close();
+    return false;
+  }
+  if (!writeHeader_(dst)) {
+    dst.close();
+    Storage.remove(INDEX_TMP_PATH);
+    src.close();
+    return false;
+  }
+
+  auto peekChar = [&src]() -> int {
+    const size_t pos = src.position();
+    int ch = src.read();
+    if (ch != -1) src.seekSet(pos);
+    return ch;
+  };
+
+  int migratedCount = 0;
+  bool ok = true;
+
+  while (src.available()) {
+    // 空白と ',' をスキップ、']' が来たら終了
+    while (src.available()) {
+      const int ch = peekChar();
+      if (ch == -1) break;
+      if (ch == ']') {
+        src.read();
+        goto done;  // 配列終了
+      }
+      if (ch == ',' || ch == ' ' || ch == '\r' || ch == '\n' || ch == '\t') {
+        src.read();
+        continue;
+      }
+      break;
+    }
+    if (!src.available()) break;
+
+    // 1 オブジェクトずつ小さな JsonDocument でパース
+    JsonDocument doc;
+    DeserializationError err = deserializeJson(doc, src);
+    if (err) {
+      LOG_ERR("AOZORA", "migrate: parse error: %s", err.c_str());
+      ok = false;
+      break;
+    }
+
+    JsonObject obj = doc.as<JsonObject>();
+    AozoraBookEntry entry;
+    memset(&entry, 0, sizeof(entry));
+    entry.workId = obj["work_id"] | 0;
+    snprintf(entry.title, sizeof(entry.title), "%s", (const char*)(obj["title"] | ""));
+    snprintf(entry.author, sizeof(entry.author), "%s", (const char*)(obj["author"] | ""));
+    snprintf(entry.filename, sizeof(entry.filename), "%s", (const char*)(obj["filename"] | ""));
+
+    // 実ファイル存在チェック（欠損は自動的にスキップ）
+    char fullPath[160];
+    snprintf(fullPath, sizeof(fullPath), "%s/%s", AOZORA_DIR, entry.filename);
+    if (!Storage.exists(fullPath)) {
+      LOG_DBG("AOZORA", "migrate: skip missing %s", entry.filename);
+      continue;
+    }
+
+    uint32_t offset = 0;
+    if (!appendRecord_(dst, entry, offset)) {
+      LOG_ERR("AOZORA", "migrate: appendRecord failed");
+      ok = false;
+      break;
+    }
+    migratedCount++;
+  }
+
+done:
+  dst.close();
+  src.close();
+
+  if (!ok) {
+    Storage.remove(INDEX_TMP_PATH);
+    return false;
+  }
+
+  // atomic swap: tmp を本番パスに rename
+  if (!Storage.rename(INDEX_TMP_PATH, INDEX_BIN_PATH)) {
+    LOG_ERR("AOZORA", "migrate: rename failed");
+    Storage.remove(INDEX_TMP_PATH);
+    return false;
+  }
+
+  // 旧 JSON を削除（rename 成功後）
+  Storage.remove(INDEX_PATH);
+  LOG_DBG("AOZORA", "Migrated %d entries from JSON", migratedCount);
   return true;
 }
 

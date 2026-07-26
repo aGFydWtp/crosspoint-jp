@@ -69,6 +69,7 @@ class AozoraIndexManager {
   std::vector<uint32_t> activeOffsets_;  // 挿入順で bin ファイル内のバイトオフセット
 
   bool loadFromBin_();
+  bool migrateFromJson_();
 
   // バイナリ形式 I/O ヘルパ
   static bool writeHeader_(HalFile& file);
