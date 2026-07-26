@@ -59,10 +59,11 @@ bool AozoraIndexManager::addEntry(int32_t workId, const char* title, const char*
   snprintf(entry.author, sizeof(entry.author), "%s", author);
   snprintf(entry.filename, sizeof(entry.filename), "%s", filename);
 
-  HalFile file;
+  // O_TRUNC 付きで開くと既存レコードが全消失するため、O_RDWR | O_CREAT で開く
   const bool binExists = Storage.exists(INDEX_BIN_PATH);
-  if (!Storage.openFileForWrite("AOZORA", INDEX_BIN_PATH, file)) {
-    LOG_ERR("AOZORA", "addEntry: open bin for write failed");
+  HalFile file = Storage.open(INDEX_BIN_PATH, O_RDWR | O_CREAT);
+  if (!file) {
+    LOG_ERR("AOZORA", "addEntry: open bin for RW failed");
     return false;
   }
 
@@ -93,8 +94,9 @@ bool AozoraIndexManager::removeEntry(int32_t workId) {
 
   // activeOffsets_ から該当エントリを見つけて、bin ファイルの実ファイルパスを取得し
   // tombstone を書き込む。実ファイル削除もこの過程で行う。
-  HalFile file;
-  if (!Storage.openFileForWrite("AOZORA", INDEX_BIN_PATH, file)) {
+  // O_TRUNC 付きで開くと bin 全体が消えるので O_RDWR で開く。
+  HalFile file = Storage.open(INDEX_BIN_PATH, O_RDWR);
+  if (!file) {
     LOG_ERR("AOZORA", "removeEntry: open bin failed");
     return false;
   }
