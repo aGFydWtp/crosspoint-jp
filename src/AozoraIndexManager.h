@@ -70,6 +70,7 @@ class AozoraIndexManager {
 
   bool loadFromBin_();
   bool migrateFromJson_();
+  bool rebuildFromDirectoryScan_();
 
   // バイナリ形式 I/O ヘルパ
   static bool writeHeader_(HalFile& file);

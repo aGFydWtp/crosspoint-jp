@@ -31,6 +31,15 @@ bool AozoraIndexManager::loadAndPurge() {
     return true;
   }
 
+  // 最後の砦: SD 上の EPUB ファイル配置から履歴を再構築
+  if (Storage.exists(AOZORA_DIR)) {
+    LOG_DBG("AOZORA", "Rebuilding index from SD directory scan");
+    if (rebuildFromDirectoryScan_()) {
+      return loadFromBin_();
+    }
+    LOG_ERR("AOZORA", "Directory scan rebuild failed");
+  }
+
   LOG_DBG("AOZORA", "No index found, starting fresh");
   return true;
 }
@@ -336,6 +345,138 @@ done:
   // 旧 JSON を削除（rename 成功後）
   Storage.remove(INDEX_PATH);
   LOG_DBG("AOZORA", "Migrated %d entries from JSON", migratedCount);
+  return true;
+}
+
+/**
+ * JSON も bin も無いか壊れている場合の最終手段として、SD 上の
+ * /Aozora/著者名/workId_タイトル.epub 配置からレコードを再構築する。
+ *
+ * makeRelativePath() の命名規則を逆手にとってファイル名から workId とタイトルを
+ * 抽出する。この処理により、SD カード上に EPUB が残っていれば履歴 JSON が消えても
+ * 完全に回復できる。
+ */
+bool AozoraIndexManager::rebuildFromDirectoryScan_() {
+  HalFile rootDir;
+  if (!Storage.openFileForRead("AOZORA", AOZORA_DIR, rootDir)) {
+    LOG_ERR("AOZORA", "rebuild: open /Aozora failed");
+    return false;
+  }
+  if (!rootDir.isDirectory()) {
+    LOG_ERR("AOZORA", "rebuild: /Aozora is not a directory");
+    rootDir.close();
+    return false;
+  }
+
+  Storage.remove(INDEX_TMP_PATH);
+  HalFile dst;
+  if (!Storage.openFileForWrite("AOZORA", INDEX_TMP_PATH, dst)) {
+    LOG_ERR("AOZORA", "rebuild: open tmp failed");
+    rootDir.close();
+    return false;
+  }
+  if (!writeHeader_(dst)) {
+    dst.close();
+    Storage.remove(INDEX_TMP_PATH);
+    rootDir.close();
+    return false;
+  }
+
+  int rebuiltCount = 0;
+  bool ok = true;
+
+  rootDir.rewindDirectory();
+  HalFile authorDir = rootDir.openNextFile();
+  while (authorDir.isOpen()) {
+    if (!authorDir.isDirectory()) {
+      authorDir.close();
+      authorDir = rootDir.openNextFile();
+      continue;
+    }
+
+    char authorName[48] = {};
+    authorDir.getName(authorName, sizeof(authorName));
+
+    // 隠しディレクトリ (例: .Trashes) はスキップ
+    if (authorName[0] == '.') {
+      authorDir.close();
+      authorDir = rootDir.openNextFile();
+      continue;
+    }
+
+    authorDir.rewindDirectory();
+    HalFile bookFile = authorDir.openNextFile();
+    while (bookFile.isOpen()) {
+      if (bookFile.isDirectory()) {
+        bookFile.close();
+        bookFile = authorDir.openNextFile();
+        continue;
+      }
+
+      char fname[96] = {};
+      bookFile.getName(fname, sizeof(fname));
+      bookFile.close();
+
+      const size_t len = strlen(fname);
+      if (len < 6 || strcmp(fname + len - 5, ".epub") != 0) {
+        bookFile = authorDir.openNextFile();
+        continue;
+      }
+
+      int workId = 0;
+      if (sscanf(fname, "%d_", &workId) != 1 || workId <= 0) {
+        bookFile = authorDir.openNextFile();
+        continue;
+      }
+
+      const char* titleStart = strchr(fname, '_');
+      if (!titleStart) {
+        bookFile = authorDir.openNextFile();
+        continue;
+      }
+      titleStart++;
+      const size_t titleLen = len - (titleStart - fname) - 5;  // ".epub" を除く
+      if (titleLen == 0) {
+        bookFile = authorDir.openNextFile();
+        continue;
+      }
+
+      AozoraBookEntry entry;
+      memset(&entry, 0, sizeof(entry));
+      entry.workId = workId;
+      snprintf(entry.title, sizeof(entry.title), "%.*s", static_cast<int>(titleLen), titleStart);
+      snprintf(entry.author, sizeof(entry.author), "%s", authorName);
+      snprintf(entry.filename, sizeof(entry.filename), "%s/%s", authorName, fname);
+
+      uint32_t offset = 0;
+      if (!appendRecord_(dst, entry, offset)) {
+        LOG_ERR("AOZORA", "rebuild: appendRecord failed");
+        ok = false;
+        break;
+      }
+      rebuiltCount++;
+
+      bookFile = authorDir.openNextFile();
+    }
+    authorDir.close();
+    if (!ok) break;
+    authorDir = rootDir.openNextFile();
+  }
+  rootDir.close();
+  dst.close();
+
+  if (!ok) {
+    Storage.remove(INDEX_TMP_PATH);
+    return false;
+  }
+
+  if (!Storage.rename(INDEX_TMP_PATH, INDEX_BIN_PATH)) {
+    LOG_ERR("AOZORA", "rebuild: rename failed");
+    Storage.remove(INDEX_TMP_PATH);
+    return false;
+  }
+
+  LOG_DBG("AOZORA", "Rebuilt %d entries from directory scan", rebuiltCount);
   return true;
 }
 
