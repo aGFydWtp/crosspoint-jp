@@ -28,8 +28,9 @@ bool AozoraIndexManager::loadAndPurge() {
     if (migrateFromJson_()) {
       return loadFromBin_();
     }
-    LOG_ERR("AOZORA", "Migration failed, keeping legacy JSON");
-    return true;
+    // 破損 JSON は再度マイグレしても同じ結果になるため、退避して SD 走査に落とす。
+    LOG_ERR("AOZORA", "Migration failed, removing corrupt JSON and falling back to directory scan");
+    Storage.remove(INDEX_PATH);
   }
 
   // 最後の砦: SD 上の EPUB ファイル配置から履歴を再構築
@@ -166,12 +167,18 @@ bool AozoraIndexManager::readEntryAt(size_t indexInActive, AozoraBookEntry& out)
     LOG_ERR("AOZORA", "readEntryAt: short read at offset %u", offset);
     return false;
   }
+  // 破損データによる over-read を防ぐため末尾を必ず null 終端する
+  out.title[sizeof(out.title) - 1] = '\0';
+  out.author[sizeof(out.author) - 1] = '\0';
+  out.filename[sizeof(out.filename) - 1] = '\0';
   return true;
 }
 
 bool AozoraIndexManager::loadFromBin_() {
-  HalFile file;
-  if (!Storage.openFileForRead("AOZORA", INDEX_BIN_PATH, file)) {
+  // 走査中に SD 上の実ファイルが欠損しているレコードを tombstone マークするため、
+  // 読み書き両用で開く。
+  HalFile file = Storage.open(INDEX_BIN_PATH, O_RDWR);
+  if (!file) {
     LOG_ERR("AOZORA", "loadFromBin: open failed");
     return false;
   }
@@ -312,6 +319,12 @@ bool AozoraIndexManager::migrateFromJson_() {
     snprintf(entry.author, sizeof(entry.author), "%s", (const char*)(obj["author"] | ""));
     snprintf(entry.filename, sizeof(entry.filename), "%s", (const char*)(obj["filename"] | ""));
 
+    // 不正な行は捨てる（workId 未設定・空文字列で filename パスが AOZORA_DIR と衝突する等）
+    if (entry.workId <= 0 || entry.filename[0] == '\0') {
+      LOG_DBG("AOZORA", "migrate: skip invalid entry workId=%d", entry.workId);
+      continue;
+    }
+
     // 実ファイル存在チェック（欠損は自動的にスキップ）
     char fullPath[160];
     snprintf(fullPath, sizeof(fullPath), "%s/%s", AOZORA_DIR, entry.filename);
@@ -397,7 +410,10 @@ bool AozoraIndexManager::rebuildFromDirectoryScan_() {
       continue;
     }
 
-    char authorName[48] = {};
+    // CJK UTF-8 で 47 バイトの制約は容易に超える。SdFat の LFN 上限 (255) 未満まで拡大する。
+    // ただし author が本当に長い場合は entry.author[32] で truncate されるので、その場合は
+    // 復元後に実ファイルとパスが一致せず drop される（既知の制約）。
+    char authorName[64] = {};
     authorDir.getName(authorName, sizeof(authorName));
 
     // 隠しディレクトリ (例: .Trashes) はスキップ
@@ -416,7 +432,7 @@ bool AozoraIndexManager::rebuildFromDirectoryScan_() {
         continue;
       }
 
-      char fname[96] = {};
+      char fname[128] = {};
       bookFile.getName(fname, sizeof(fname));
       bookFile.close();
 
