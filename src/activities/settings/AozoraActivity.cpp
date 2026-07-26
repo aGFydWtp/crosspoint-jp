@@ -8,6 +8,8 @@
 #include <Logging.h>
 #include <WiFi.h>
 
+#include <algorithm>
+
 #include "MappedInputManager.h"
 #include "activities/network/WifiSelectionActivity.h"
 #include "components/UITheme.h"
@@ -297,9 +299,15 @@ bool AozoraActivity::downloadBook() {
   char url[256];
   snprintf(url, sizeof(url), "%s/api/convert?work_id=%d", API_BASE, selectedWorkId_);
 
-  std::string relPath = AozoraIndexManager::makeRelativePath(selectedWorkId_, selectedWorkTitle_, selectedWorkAuthor_);
-  char destPath[160];
-  snprintf(destPath, sizeof(destPath), "%s/%s", AozoraIndexManager::AOZORA_DIR, relPath.c_str());
+  char relPath[160];
+  if (!AozoraIndexManager::makeRelativePath(selectedWorkId_, selectedWorkTitle_, selectedWorkAuthor_, relPath,
+                                            sizeof(relPath))) {
+    LOG_ERR("AOZORA", "Failed to make relative path");
+    errorMessage_ = "Path error";
+    return false;
+  }
+  char destPath[192];
+  snprintf(destPath, sizeof(destPath), "%s/%s", AozoraIndexManager::AOZORA_DIR, relPath);
 
   if (!AozoraIndexManager::ensureDirectory() || !AozoraIndexManager::ensureAuthorDirectory(selectedWorkAuthor_)) {
     LOG_ERR("AOZORA", "Failed to create directory");
@@ -327,9 +335,11 @@ bool AozoraActivity::downloadBook() {
   }
 
   // Add to index
-  if (!indexManager_.addEntry(selectedWorkId_, selectedWorkTitle_, selectedWorkAuthor_, relPath.c_str())) {
+  if (!indexManager_.addEntry(selectedWorkId_, selectedWorkTitle_, selectedWorkAuthor_, relPath)) {
     LOG_ERR("AOZORA", "Failed to add index entry");
     // File is downloaded but index failed -- not critical
+  } else {
+    invalidateDownloadedPageCache();
   }
 
   LOG_DBG("AOZORA", "Downloaded: %s", destPath);
@@ -340,10 +350,16 @@ bool AozoraActivity::updateBook() {
   char url[256];
   snprintf(url, sizeof(url), "%s/api/convert?work_id=%d", API_BASE, selectedWorkId_);
 
-  std::string relPath = AozoraIndexManager::makeRelativePath(selectedWorkId_, selectedWorkTitle_, selectedWorkAuthor_);
-  char destPath[160];
-  char tmpPath[168];
-  snprintf(destPath, sizeof(destPath), "%s/%s", AozoraIndexManager::AOZORA_DIR, relPath.c_str());
+  char relPath[160];
+  if (!AozoraIndexManager::makeRelativePath(selectedWorkId_, selectedWorkTitle_, selectedWorkAuthor_, relPath,
+                                            sizeof(relPath))) {
+    LOG_ERR("AOZORA", "Failed to make relative path");
+    errorMessage_ = "Path error";
+    return false;
+  }
+  char destPath[192];
+  char tmpPath[200];
+  snprintf(destPath, sizeof(destPath), "%s/%s", AozoraIndexManager::AOZORA_DIR, relPath);
   snprintf(tmpPath, sizeof(tmpPath), "%s.tmp", destPath);
 
   if (!AozoraIndexManager::ensureDirectory() || !AozoraIndexManager::ensureAuthorDirectory(selectedWorkAuthor_)) {
@@ -785,6 +801,20 @@ void AozoraActivity::loop() {
       // ダウンロード済み: Left = 削除, Right = 更新
       if (mappedInput.wasPressed(MappedInputManager::Button::Left)) {
         if (indexManager_.removeEntry(selectedWorkId_)) {
+          invalidateDownloadedPageCache();
+          // popState() は selectedIndex_ を selectedIndexStack_.back() で上書きするため、
+          // 親 state が DOWNLOADED_LIST の場合は削除後の件数に合わせてスタック側を
+          // クランプする。他 state（TOP_MENU など）の selectedIndex は履歴件数と無関係
+          // なので触らない。
+          if (!stateStack_.empty() && stateStack_.back() == DOWNLOADED_LIST && !selectedIndexStack_.empty()) {
+            const int newTotal = static_cast<int>(indexManager_.activeCount());
+            int& parentSel = selectedIndexStack_.back();
+            if (newTotal == 0) {
+              parentSel = 0;
+            } else if (parentSel >= newTotal) {
+              parentSel = newTotal - 1;
+            }
+          }
           {
             RenderLock lock(*this);
             popState();
@@ -927,10 +957,10 @@ void AozoraActivity::loop() {
       return;
     }
 
-    const auto& entries = indexManager_.entries();
+    const int total = static_cast<int>(indexManager_.activeCount());
 
-    buttonNavigator_.onNextRelease([this, &entries] {
-      if (selectedIndex_ < static_cast<int>(entries.size()) - 1) {
+    buttonNavigator_.onNextRelease([this, total] {
+      if (selectedIndex_ < total - 1) {
         selectedIndex_++;
         requestUpdate();
       }
@@ -944,17 +974,24 @@ void AozoraActivity::loop() {
     });
 
     if (mappedInput.wasPressed(MappedInputManager::Button::Confirm)) {
-      if (!entries.empty() && selectedIndex_ < static_cast<int>(entries.size())) {
-        const auto& entry = entries[selectedIndex_];
-        selectedWorkId_ = entry.workId;
-        snprintf(selectedWorkTitle_, sizeof(selectedWorkTitle_), "%s", entry.title);
-        snprintf(selectedWorkAuthor_, sizeof(selectedWorkAuthor_), "%s", entry.author);
-
-        {
-          RenderLock lock(*this);
-          pushState(WORK_DETAIL);
+      if (total > 0 && selectedIndex_ < total) {
+        // 選択中のエントリがキャッシュ範囲外なら selectedIndex_ を中央に置いて再ロードする
+        if (selectedIndex_ < dlPageStart_ || selectedIndex_ >= dlPageStart_ + dlPageCount_) {
+          loadDownloadedPage(selectedIndex_ - DL_PAGE_SIZE / 2);
         }
-        requestUpdate();
+        const int localIdx = selectedIndex_ - dlPageStart_;
+        if (localIdx >= 0 && localIdx < dlPageCount_) {
+          const auto& entry = dlPageCache_[localIdx];
+          selectedWorkId_ = entry.workId;
+          snprintf(selectedWorkTitle_, sizeof(selectedWorkTitle_), "%s", entry.title);
+          snprintf(selectedWorkAuthor_, sizeof(selectedWorkAuthor_), "%s", entry.author);
+
+          {
+            RenderLock lock(*this);
+            pushState(WORK_DETAIL);
+          }
+          requestUpdate();
+        }
       }
     }
   } else if (state_ == ERROR) {
@@ -1192,19 +1229,37 @@ void AozoraActivity::render(RenderLock&&) {
     GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
 
   } else if (state_ == DOWNLOADED_LIST) {
-    const auto& entries = indexManager_.entries();
+    const int total = static_cast<int>(indexManager_.activeCount());
 
-    if (entries.empty()) {
+    if (total == 0) {
       renderer.drawCenteredText(UI_10_FONT_ID, centerY, tr(STR_NO_RESULTS));
       const auto labels = mappedInput.mapLabels(tr(STR_BACK), "", "", "");
       GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
     } else {
+      // drawList のページサイズは theme と画面高に依存し、DL_PAGE_SIZE と一致しないため、
+      // selectedIndex_ がキャッシュ範囲外に出たら selectedIndex_ を中央に置いて再ロードする。
+      // これにより drawList が要求する [selectedIdx / pageItems * pageItems, +pageItems) の
+      // 範囲は pageItems <= DL_PAGE_SIZE / 2 の限り必ずキャッシュ内に収まる。
+      if (selectedIndex_ < dlPageStart_ || selectedIndex_ >= dlPageStart_ + dlPageCount_) {
+        loadDownloadedPage(selectedIndex_ - DL_PAGE_SIZE / 2);
+      }
+
       GUI.drawList(
           renderer,
           Rect{0, contentTop, pageWidth, pageHeight - contentTop - metrics.buttonHintsHeight - metrics.verticalSpacing},
-          static_cast<int>(entries.size()), selectedIndex_,
-          [&entries](int index) -> std::string { return entries[index].title; }, nullptr, nullptr,
-          [&entries](int index) -> std::string { return entries[index].author; }, false, nullptr);
+          total, selectedIndex_,
+          [this](int index) -> std::string {
+            const int localIdx = index - dlPageStart_;
+            if (localIdx < 0 || localIdx >= dlPageCount_) return "";
+            return dlPageCache_[localIdx].title;
+          },
+          nullptr, nullptr,
+          [this](int index) -> std::string {
+            const int localIdx = index - dlPageStart_;
+            if (localIdx < 0 || localIdx >= dlPageCount_) return "";
+            return dlPageCache_[localIdx].author;
+          },
+          false, nullptr);
 
       const auto labels = mappedInput.mapLabels(tr(STR_BACK), tr(STR_SELECT), tr(STR_DIR_UP), tr(STR_DIR_DOWN));
       GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
@@ -1220,4 +1275,33 @@ void AozoraActivity::render(RenderLock&&) {
   }
 
   renderer.displayBuffer();
+}
+
+void AozoraActivity::loadDownloadedPage(int desiredStart) {
+  const int total = static_cast<int>(indexManager_.activeCount());
+  if (total == 0) {
+    dlPageStart_ = 0;
+    dlPageCount_ = 0;
+    return;
+  }
+
+  // start をリストの末尾側でクランプしてキャッシュサイズを最大化する
+  int start = desiredStart;
+  if (start < 0) start = 0;
+  if (start + DL_PAGE_SIZE > total) {
+    start = std::max(0, total - DL_PAGE_SIZE);
+  }
+
+  dlPageStart_ = start;
+  dlPageCount_ = 0;
+
+  for (int i = 0; i < DL_PAGE_SIZE; ++i) {
+    const int absIndex = start + i;
+    if (absIndex >= total) break;
+    if (!indexManager_.readEntryAt(absIndex, dlPageCache_[i])) {
+      LOG_ERR("AOZORA", "loadDownloadedPage: readEntryAt(%d) failed", absIndex);
+      break;
+    }
+    dlPageCount_++;
+  }
 }
