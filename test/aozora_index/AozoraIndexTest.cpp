@@ -21,24 +21,24 @@
 static int testsPassed = 0;
 static int testsFailed = 0;
 
-#define ASSERT_EQ(a, b)                                                                              \
-  do {                                                                                               \
-    if ((a) != (b)) {                                                                                \
-      fprintf(stderr, "  FAIL: %s:%d: (%s) == %ld, expected %ld\n", __FILE__, __LINE__, #a,          \
-              static_cast<long>(a), static_cast<long>(b));                                           \
-      testsFailed++;                                                                                 \
-      return;                                                                                        \
-    }                                                                                                \
+#define ASSERT_EQ(a, b)                                                                                           \
+  do {                                                                                                            \
+    if ((a) != (b)) {                                                                                             \
+      fprintf(stderr, "  FAIL: %s:%d: (%s) == %ld, expected %ld\n", __FILE__, __LINE__, #a, static_cast<long>(a), \
+              static_cast<long>(b));                                                                              \
+      testsFailed++;                                                                                              \
+      return;                                                                                                     \
+    }                                                                                                             \
   } while (0)
 
-#define ASSERT_EQ_U(a, b)                                                                            \
-  do {                                                                                               \
-    if ((a) != (b)) {                                                                                \
-      fprintf(stderr, "  FAIL: %s:%d: (%s) == %lu, expected %lu\n", __FILE__, __LINE__, #a,          \
-              static_cast<unsigned long>(a), static_cast<unsigned long>(b));                         \
-      testsFailed++;                                                                                 \
-      return;                                                                                        \
-    }                                                                                                \
+#define ASSERT_EQ_U(a, b)                                                                   \
+  do {                                                                                      \
+    if ((a) != (b)) {                                                                       \
+      fprintf(stderr, "  FAIL: %s:%d: (%s) == %lu, expected %lu\n", __FILE__, __LINE__, #a, \
+              static_cast<unsigned long>(a), static_cast<unsigned long>(b));                \
+      testsFailed++;                                                                        \
+      return;                                                                               \
+    }                                                                                       \
   } while (0)
 
 #define ASSERT_TRUE(cond)                                                \
