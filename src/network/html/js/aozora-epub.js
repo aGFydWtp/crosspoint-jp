@@ -481,17 +481,41 @@
     return { title: fallbackTitle, author: '不明' };
   }
 
+  // 青空文庫の配布 TXT は歴史的経緯から Shift_JIS が標準。BOM 付き UTF-8 や
+  // UTF-8 で保存されたファイルも扱えるよう、UTF-8 (fatal) → Shift_JIS の順で試す。
+  function decodeTxtAuto(buf) {
+    var uint8 = new Uint8Array(buf);
+    // UTF-8 BOM: EF BB BF
+    if (uint8.length >= 3 && uint8[0] === 0xef && uint8[1] === 0xbb && uint8[2] === 0xbf) {
+      return { text: new TextDecoder('utf-8').decode(buf), encoding: 'utf-8' };
+    }
+    // UTF-8 として厳密デコード。日本語を含む Shift_JIS はほぼ確実にここで失敗する
+    // (Shift_JIS 2バイト目 0x40-0xFC が UTF-8 continuation range 0x80-0xBF から外れるため)。
+    try {
+      return {
+        text: new TextDecoder('utf-8', { fatal: true }).decode(buf),
+        encoding: 'utf-8',
+      };
+    } catch (e) {
+      // Shift_JIS で再挑戦。ブラウザの 'shift_jis' ラベルは CP932 (Windows-31J) にマッピングされる。
+      try {
+        return {
+          text: new TextDecoder('shift_jis', { fatal: true }).decode(buf),
+          encoding: 'shift_jis',
+        };
+      } catch (e2) {
+        throw new Error('文字コードを判別できませんでした (UTF-8 / Shift_JIS どちらでも不正なバイトを検出)。');
+      }
+    }
+  }
+
   async function convertTxtToEpub(file, progressCallback) {
     var cb = typeof progressCallback === 'function' ? progressCallback : function () {};
 
     cb(0.05);
     var buf = await file.arrayBuffer();
-    var text;
-    try {
-      text = new TextDecoder('utf-8', { fatal: true }).decode(buf);
-    } catch (e) {
-      throw new Error('UTF-8デコードに失敗しました。Shift_JISファイルは非対応です。');
-    }
+    var decoded = decodeTxtAuto(buf);
+    var text = decoded.text;
 
     cb(0.15);
     var meta = extractTitleAuthor(text, file.name);
@@ -517,7 +541,7 @@
 
     cb(1.0);
     var epubName = file.name.replace(/\.txt$/i, '.epub');
-    return { blob: blob, name: epubName };
+    return { blob: blob, name: epubName, encoding: decoded.encoding };
   }
 
   window.AozoraEpub = {
@@ -526,5 +550,6 @@
     buildEpub: buildEpub,
     extractTitleAuthor: extractTitleAuthor,
     convertTxtToEpub: convertTxtToEpub,
+    decodeTxtAuto: decodeTxtAuto,
   };
 })();
