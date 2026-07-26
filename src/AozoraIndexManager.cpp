@@ -3,6 +3,10 @@
 #include <ArduinoJson.h>
 #include <Logging.h>
 
+#include <cstring>
+
+constexpr uint8_t AozoraIndexManager::BIN_HEADER_MAGIC[4];
+
 bool AozoraIndexManager::loadAndPurge() {
   entries_.clear();
 
@@ -145,4 +149,70 @@ bool AozoraIndexManager::ensureAuthorDirectory(const char* author) {
 bool AozoraIndexManager::ensureDirectory() {
   if (Storage.exists(AOZORA_DIR)) return true;
   return Storage.mkdir(AOZORA_DIR);
+}
+
+// --- バイナリ形式 I/O ヘルパ ---
+
+bool AozoraIndexManager::writeHeader_(HalFile& file) {
+  uint8_t header[BIN_HEADER_SIZE] = {
+      BIN_HEADER_MAGIC[0],
+      BIN_HEADER_MAGIC[1],
+      BIN_HEADER_MAGIC[2],
+      BIN_HEADER_MAGIC[3],
+      BIN_HEADER_VERSION,
+      0x00,
+      0x00,
+      0x00,
+  };
+  if (!file.seekSet(0)) {
+    LOG_ERR("AOZORA", "writeHeader: seek(0) failed");
+    return false;
+  }
+  if (file.write(header, sizeof(header)) != sizeof(header)) {
+    LOG_ERR("AOZORA", "writeHeader: write failed");
+    return false;
+  }
+  return true;
+}
+
+bool AozoraIndexManager::checkHeader_(HalFile& file) {
+  if (!file.seekSet(0)) return false;
+  uint8_t header[BIN_HEADER_SIZE];
+  if (file.read(header, sizeof(header)) != static_cast<int>(sizeof(header))) return false;
+  if (memcmp(header, BIN_HEADER_MAGIC, sizeof(BIN_HEADER_MAGIC)) != 0) return false;
+  if (header[4] != BIN_HEADER_VERSION) return false;
+  return true;
+}
+
+bool AozoraIndexManager::appendRecord_(HalFile& file, const AozoraBookEntry& entry, uint32_t& outOffset) {
+  const size_t endPos = file.fileSize();
+  if (!file.seekSet(endPos)) {
+    LOG_ERR("AOZORA", "appendRecord: seek(end) failed");
+    return false;
+  }
+  const uint8_t status = STATUS_ACTIVE;
+  if (file.write(&status, 1) != 1) {
+    LOG_ERR("AOZORA", "appendRecord: write status failed");
+    return false;
+  }
+  if (file.write(&entry, sizeof(entry)) != sizeof(entry)) {
+    LOG_ERR("AOZORA", "appendRecord: write entry failed");
+    return false;
+  }
+  outOffset = static_cast<uint32_t>(endPos);
+  return true;
+}
+
+bool AozoraIndexManager::markTombstone_(HalFile& file, uint32_t offset) {
+  if (!file.seekSet(offset)) {
+    LOG_ERR("AOZORA", "markTombstone: seek(%u) failed", offset);
+    return false;
+  }
+  const uint8_t status = STATUS_TOMBSTONE;
+  if (file.write(&status, 1) != 1) {
+    LOG_ERR("AOZORA", "markTombstone: write failed");
+    return false;
+  }
+  file.flush();
+  return true;
 }
