@@ -58,8 +58,11 @@ class AozoraIndexManager {
    */
   bool readEntryAt(size_t indexInActive, AozoraBookEntry& out) const;
 
-  /** 著者名/workId_タイトル.epub 形式の相対パスを生成 */
-  static std::string makeRelativePath(int workId, const char* title, const char* author);
+  /**
+   * 著者名/workId_タイトル.epub 形式の相対パスを out に書き込む。
+   * 成功時 true。ホットパスから std::string を排除するため out バッファを受け取る形式。
+   */
+  static bool makeRelativePath(int workId, const char* title, const char* author, char* out, size_t outSize);
   static bool ensureDirectory();
   /** 著者名サブディレクトリを含む保存先を確保 */
   static bool ensureAuthorDirectory(const char* author);

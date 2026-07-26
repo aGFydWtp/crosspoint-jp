@@ -493,16 +493,18 @@ static void sanitizeForFat32(const char* src, char* dest, size_t destSize) {
   dest[pos] = '\0';
 }
 
-std::string AozoraIndexManager::makeRelativePath(int workId, const char* title, const char* author) {
+bool AozoraIndexManager::makeRelativePath(int workId, const char* title, const char* author, char* out,
+                                          size_t outSize) {
+  if (!out || outSize == 0) return false;
+
   char safeAuthor[48];
   sanitizeForFat32(author, safeAuthor, sizeof(safeAuthor));
 
   char safeTitle[52];
   sanitizeForFat32(title, safeTitle, sizeof(safeTitle));
 
-  char result[160];
-  snprintf(result, sizeof(result), "%s/%d_%s.epub", safeAuthor, workId, safeTitle);
-  return std::string(result);
+  const int written = snprintf(out, outSize, "%s/%d_%s.epub", safeAuthor, workId, safeTitle);
+  return written > 0 && static_cast<size_t>(written) < outSize;
 }
 
 bool AozoraIndexManager::ensureAuthorDirectory(const char* author) {

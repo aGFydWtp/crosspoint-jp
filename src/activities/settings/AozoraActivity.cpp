@@ -297,9 +297,15 @@ bool AozoraActivity::downloadBook() {
   char url[256];
   snprintf(url, sizeof(url), "%s/api/convert?work_id=%d", API_BASE, selectedWorkId_);
 
-  std::string relPath = AozoraIndexManager::makeRelativePath(selectedWorkId_, selectedWorkTitle_, selectedWorkAuthor_);
-  char destPath[160];
-  snprintf(destPath, sizeof(destPath), "%s/%s", AozoraIndexManager::AOZORA_DIR, relPath.c_str());
+  char relPath[160];
+  if (!AozoraIndexManager::makeRelativePath(selectedWorkId_, selectedWorkTitle_, selectedWorkAuthor_, relPath,
+                                            sizeof(relPath))) {
+    LOG_ERR("AOZORA", "Failed to make relative path");
+    errorMessage_ = "Path error";
+    return false;
+  }
+  char destPath[192];
+  snprintf(destPath, sizeof(destPath), "%s/%s", AozoraIndexManager::AOZORA_DIR, relPath);
 
   if (!AozoraIndexManager::ensureDirectory() || !AozoraIndexManager::ensureAuthorDirectory(selectedWorkAuthor_)) {
     LOG_ERR("AOZORA", "Failed to create directory");
@@ -327,7 +333,7 @@ bool AozoraActivity::downloadBook() {
   }
 
   // Add to index
-  if (!indexManager_.addEntry(selectedWorkId_, selectedWorkTitle_, selectedWorkAuthor_, relPath.c_str())) {
+  if (!indexManager_.addEntry(selectedWorkId_, selectedWorkTitle_, selectedWorkAuthor_, relPath)) {
     LOG_ERR("AOZORA", "Failed to add index entry");
     // File is downloaded but index failed -- not critical
   } else {
@@ -342,10 +348,16 @@ bool AozoraActivity::updateBook() {
   char url[256];
   snprintf(url, sizeof(url), "%s/api/convert?work_id=%d", API_BASE, selectedWorkId_);
 
-  std::string relPath = AozoraIndexManager::makeRelativePath(selectedWorkId_, selectedWorkTitle_, selectedWorkAuthor_);
-  char destPath[160];
-  char tmpPath[168];
-  snprintf(destPath, sizeof(destPath), "%s/%s", AozoraIndexManager::AOZORA_DIR, relPath.c_str());
+  char relPath[160];
+  if (!AozoraIndexManager::makeRelativePath(selectedWorkId_, selectedWorkTitle_, selectedWorkAuthor_, relPath,
+                                            sizeof(relPath))) {
+    LOG_ERR("AOZORA", "Failed to make relative path");
+    errorMessage_ = "Path error";
+    return false;
+  }
+  char destPath[192];
+  char tmpPath[200];
+  snprintf(destPath, sizeof(destPath), "%s/%s", AozoraIndexManager::AOZORA_DIR, relPath);
   snprintf(tmpPath, sizeof(tmpPath), "%s.tmp", destPath);
 
   if (!AozoraIndexManager::ensureDirectory() || !AozoraIndexManager::ensureAuthorDirectory(selectedWorkAuthor_)) {
