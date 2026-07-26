@@ -48,6 +48,8 @@
   }
 
   // 最初の空行までのタイトル/著者ブロックを本文から取り除く
+  // 空行が1つもない場合はタイトル行を認識できないため本文丸ごと保持する
+  // (短編・自作原稿・タイトルブロックを既に剥がしたテキストで内容が消えるのを防ぐ)
   function removeTitleBlock(text) {
     var lines = text.split('\n');
     var firstBlankIndex = -1;
@@ -57,7 +59,7 @@
         break;
       }
     }
-    if (firstBlankIndex === -1) return '';
+    if (firstBlankIndex === -1) return text;
     return lines.slice(firstBlankIndex + 1).join('\n');
   }
 
@@ -78,10 +80,12 @@
         /^［＃([0-9０-９]+)字下げ］(.+)［＃「(.+)」は(大|中|小)見出し］$/
       );
       if (indentHeadingMatch) {
+        // 見出しは可視テキスト (group 2) を採用。注記の quoted text (group 3) は範囲指定でしかなく、
+        // 章番号や補助語がgroup 2 側に含まれるためこちらを保持する。
         nodes.push({
           type: 'heading',
           level: headingLevelFromSize(indentHeadingMatch[4]),
-          children: parseInline(indentHeadingMatch[3]),
+          children: parseInline(indentHeadingMatch[2]),
         });
         continue;
       }
@@ -96,10 +100,15 @@
       }
       var headingMatch = line.match(/^(.*)［＃「(.+)」は(大|中|小)見出し］(.*)$/);
       if (headingMatch) {
+        // 見出しは可視テキスト (group 1 + group 4) を採用。注記の quoted text (group 2) は
+        // 範囲指定でしかなく、章番号などが group 1 側に含まれるため両側を保持する。
+        // 可視テキストが空なら quoted を fallback として使う。
+        var visibleText = headingMatch[1] + headingMatch[4];
+        var headingText = visibleText.trim() !== '' ? visibleText : headingMatch[2];
         nodes.push({
           type: 'heading',
           level: headingLevelFromSize(headingMatch[3]),
-          children: parseInline(headingMatch[2]),
+          children: parseInline(headingText),
         });
         continue;
       }
@@ -141,21 +150,13 @@
       }
       var emphasisMatch = remaining.match(/^［＃「([^」]+)」に傍点］/);
       if (emphasisMatch) {
-        nodes.push({
-          type: 'emphasis',
-          style: 'sesame',
-          children: [{ type: 'text', content: emphasisMatch[1] }],
-        });
+        pushEmphasis(nodes, emphasisMatch[1], 'sesame');
         remaining = remaining.slice(emphasisMatch[0].length);
         continue;
       }
       var circleEmphasisMatch = remaining.match(/^［＃「([^」]+)」に丸傍点］/);
       if (circleEmphasisMatch) {
-        nodes.push({
-          type: 'emphasis',
-          style: 'circle',
-          children: [{ type: 'text', content: circleEmphasisMatch[1] }],
-        });
+        pushEmphasis(nodes, circleEmphasisMatch[1], 'circle');
         remaining = remaining.slice(circleEmphasisMatch[0].length);
         continue;
       }
@@ -177,6 +178,22 @@
       }
     }
     return nodes;
+  }
+
+  // 傍点注記は青空文庫では後置記法 (対象テキストが本文に現れた「後」に注記が続く)。
+  // 例: `先生［＃「先生」に傍点］` の場合、parseInline はまず `先生` を text ノードに
+  // 積むため、注記処理時に直前 text ノード末尾から同じ文字列を剥がさないと二重表示になる。
+  function pushEmphasis(nodes, target, style) {
+    if (nodes.length > 0) {
+      var last = nodes[nodes.length - 1];
+      if (last && last.type === 'text' && last.content.length >= target.length &&
+          last.content.slice(last.content.length - target.length) === target) {
+        last.content = last.content.slice(0, last.content.length - target.length);
+        if (last.content === '') nodes.pop();
+      }
+    }
+    // emphasis の中身も parseInline に通し、内側の ruby / explicit-ruby / 未対応注記を解釈する
+    nodes.push({ type: 'emphasis', style: style, children: parseInline(target) });
   }
 
   function findNextSpecial(text) {
@@ -202,22 +219,27 @@
   function splitChapters(nodes) {
     var chapters = [];
     var currentTitle = '';
+    var currentTitleNodes = null;
     var currentNodes = [];
     for (var i = 0; i < nodes.length; i++) {
       var node = nodes[i];
       if (node.type === 'heading') {
-        chapters.push({ title: currentTitle, nodes: currentNodes });
+        chapters.push({ title: currentTitle, titleNodes: currentTitleNodes, nodes: currentNodes });
         currentTitle = extractHeadingText(node.children);
+        // 見出し内 ruby / emphasis を保持したまま XHTML レンダリングするための元ノードを保存する
+        // (dc:title / TOC は plain text しか使えないため currentTitle も残す)
+        currentTitleNodes = node.children;
         currentNodes = [];
       } else if (node.type === 'pagebreak') {
-        chapters.push({ title: currentTitle, nodes: currentNodes });
+        chapters.push({ title: currentTitle, titleNodes: currentTitleNodes, nodes: currentNodes });
         currentTitle = '';
+        currentTitleNodes = null;
         currentNodes = [];
       } else {
         currentNodes.push(node);
       }
     }
-    chapters.push({ title: currentTitle, nodes: currentNodes });
+    chapters.push({ title: currentTitle, titleNodes: currentTitleNodes, nodes: currentNodes });
     return chapters.filter(function (ch) {
       if (ch.title !== '') return true;
       return hasMeaningfulContent(ch.nodes);
@@ -251,8 +273,14 @@
   // EPUB Builder
   // ============================================================
 
+  // XML 1.0 で許可されていない制御文字を除去する。許可されるのは U+0009 (Tab) /
+  // U+000A (LF) / U+000D (CR) と U+0020 以降のみ。破損 TXT や Shift_JIS の stray NUL 等が
+  // XHTML に混入すると epubcheck 等の厳格リーダーで書籍全体が読めなくなるため予防する。
+  var XML10_ILLEGAL = /[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g;
+
   function escapeXml(str) {
     return str
+      .replace(XML10_ILLEGAL, '')
       .replace(/&/g, '&amp;')
       .replace(/</g, '&lt;')
       .replace(/>/g, '&gt;')
@@ -294,10 +322,16 @@
     return result;
   }
 
-  function buildChapterXhtml(title, nodes) {
+  function buildChapterXhtml(title, nodes, titleNodes) {
     var body = nodesToXhtml(nodes);
     var titleEscaped = escapeXml(title);
-    var titleBlock = title ? '<p><b>' + titleEscaped + '</b></p>\n' : '';
+    // 章タイトルは titleNodes があれば ruby/emphasis を保持した XHTML でレンダリング
+    var titleBlock = '';
+    if (titleNodes && titleNodes.length > 0) {
+      titleBlock = '<p><b>' + nodesToXhtml(titleNodes) + '</b></p>\n';
+    } else if (title) {
+      titleBlock = '<p><b>' + titleEscaped + '</b></p>\n';
+    }
     return (
       '<?xml version="1.0" encoding="UTF-8"?>\n' +
       '<!DOCTYPE html>\n' +
@@ -452,7 +486,11 @@
     zip.file('OEBPS/style.css', buildStyleCss(), opts);
     for (var i = 0; i < chapters.length; i++) {
       var filename = 'chapter_' + pad3(i + 1) + '.xhtml';
-      zip.file('OEBPS/' + filename, buildChapterXhtml(chapters[i].title, chapters[i].nodes), opts);
+      zip.file(
+        'OEBPS/' + filename,
+        buildChapterXhtml(chapters[i].title, chapters[i].nodes, chapters[i].titleNodes),
+        opts
+      );
     }
     return await zip.generateAsync({
       type: 'blob',
@@ -485,9 +523,18 @@
   // UTF-8 で保存されたファイルも扱えるよう、UTF-8 (fatal) → Shift_JIS の順で試す。
   function decodeTxtAuto(buf) {
     var uint8 = new Uint8Array(buf);
-    // UTF-8 BOM: EF BB BF
+    // UTF-8 BOM: EF BB BF。BOM があっても fatal で厳密デコードする。BOM を貼り付けたまま
+    // Shift_JIS で再保存された事故ファイルは U+FFFD で silently 埋まる代わりにここで例外を投げ、
+    // Shift_JIS フォールバックへ流す。
     if (uint8.length >= 3 && uint8[0] === 0xef && uint8[1] === 0xbb && uint8[2] === 0xbf) {
-      return { text: new TextDecoder('utf-8').decode(buf), encoding: 'utf-8' };
+      try {
+        return {
+          text: new TextDecoder('utf-8', { fatal: true }).decode(buf),
+          encoding: 'utf-8-bom',
+        };
+      } catch (e) {
+        // Fall through to Shift_JIS
+      }
     }
     // UTF-8 として厳密デコード。日本語を含む Shift_JIS はほぼ確実にここで失敗する
     // (Shift_JIS 2バイト目 0x40-0xFC が UTF-8 continuation range 0x80-0xBF から外れるため)。
