@@ -19,6 +19,11 @@ int HttpDownloader::lastHttpCode = 0;
 
 namespace {
 
+// Maximum time the streaming read loop waits without receiving a single body byte before it
+// gives up. Only reached when the peer stops sending mid-body but keeps the socket open; a
+// well-behaved response either delivers Content-Length bytes or closes the connection.
+constexpr uint32_t STREAM_IDLE_TIMEOUT_MS = 10000;
+
 // Builds the NetworkClient appropriate for the URL/verifyTls combination.
 // - https + verifyTls: SecureNetworkClient with the default CA bundle attached (chain + hostname
 //   verification). *outSecureForError is set so the caller can pull a diagnostic message on failure.
@@ -215,16 +220,36 @@ bool HttpDownloader::fetchUrl(const std::string& url, const DataCallback& onData
   }
 
   NetworkClient* stream = http.getStreamPtr();
+  // Content-Length bounds the body exactly. Without it the loop can only stop when the peer
+  // closes the socket -- and HTTPClient sends Connection: keep-alive by default, so a server
+  // that holds the connection open after the body would leave available()==0 &&
+  // connected()==true forever. A negative/zero size means chunked or unknown length; that case
+  // still relies on connected(), with STREAM_IDLE_TIMEOUT_MS as the backstop.
+  const int contentLen = http.getSize();
+  const size_t expected = contentLen > 0 ? static_cast<size_t>(contentLen) : 0;
+
   uint8_t buf[512];
   size_t total = 0;
   bool aborted = false;
+  bool timedOut = false;
+  uint32_t lastDataMs = millis();
   while (stream->available() || stream->connected()) {
+    if (expected > 0 && total >= expected) break;
+
     int avail = stream->available();
     if (avail <= 0) {
-      delay(1);
+      // Unsigned subtraction so a millis() rollover still yields the true elapsed interval.
+      if (static_cast<uint32_t>(millis() - lastDataMs) >= STREAM_IDLE_TIMEOUT_MS) {
+        timedOut = true;
+        break;
+      }
+      delay(1);  // Yield so the task watchdog is fed while waiting for more body bytes.
       continue;
     }
-    int toRead = (avail < static_cast<int>(sizeof(buf))) ? avail : static_cast<int>(sizeof(buf));
+    size_t toRead = (avail < static_cast<int>(sizeof(buf))) ? static_cast<size_t>(avail) : sizeof(buf);
+    if (expected > 0 && toRead > expected - total) {
+      toRead = expected - total;  // Never read past the body into a pipelined keep-alive response.
+    }
     int bytesRead = stream->readBytes(buf, toRead);
     if (bytesRead <= 0) break;
     if (onData && !onData(buf, static_cast<size_t>(bytesRead))) {
@@ -232,11 +257,17 @@ bool HttpDownloader::fetchUrl(const std::string& url, const DataCallback& onData
       break;
     }
     total += bytesRead;
+    lastDataMs = millis();
   }
   http.end();
 
   if (aborted) {
     LOG_DBG("HTTP", "FetchStream aborted by callback after %zu bytes", total);
+    return false;
+  }
+  if (timedOut) {
+    LOG_ERR("HTTP", "FetchStream stalled after %zu bytes (contentLen=%d)", total, contentLen);
+    lastHttpCode = -902;  // Custom code: no body data received within STREAM_IDLE_TIMEOUT_MS
     return false;
   }
   if (total == 0) {
