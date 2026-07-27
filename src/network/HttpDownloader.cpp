@@ -275,6 +275,16 @@ bool HttpDownloader::fetchUrl(const std::string& url, const DataCallback& onData
     lastHttpCode = -901;
     return false;
   }
+  // The loop also exits when the peer closes the socket, which happens before the body is
+  // complete if the connection drops mid-response. Without this check a truncated body would be
+  // reported as success and the caller would parse a partial payload (e.g. a release JSON whose
+  // download URL is cut in half). Only enforceable when Content-Length was present; expected == 0
+  // means chunked/unknown length, where the connected() + idle-timeout logic above is all we have.
+  if (expected > 0 && total < expected) {
+    LOG_ERR("HTTP", "FetchStream truncated: got %zu bytes, expected %zu", total, expected);
+    lastHttpCode = -903;  // Custom code: body shorter than Content-Length
+    return false;
+  }
 
   LOG_DBG("HTTP", "FetchStream success: %zu bytes", total);
   return true;
