@@ -97,6 +97,21 @@ class AozoraActivity : public Activity {
   AozoraIndexManager indexManager_;
   FavoriteAuthorsManager favoritesManager_;
 
+  // DOWNLOADED_LIST 表示用のページキャッシュ。
+  // indexManager_ からオンデマンドで読み出し、常駐メモリを最小化する。
+  static constexpr int DL_PAGE_SIZE = 30;
+  AozoraBookEntry dlPageCache_[DL_PAGE_SIZE] = {};
+  int dlPageStart_ = -1;  // -1 = キャッシュ無効
+  int dlPageCount_ = 0;
+
+  // ページキャッシュに [start, start+DL_PAGE_SIZE) 範囲のエントリを読み込む。
+  void loadDownloadedPage(int start);
+  // 追加・削除でキャッシュを無効化。次の描画で自動的に再ロードされる。
+  void invalidateDownloadedPageCache() {
+    dlPageStart_ = -1;
+    dlPageCount_ = 0;
+  }
+
   // AUTHOR_ACTION state
   int actionMenuIndex_ = 0;
 

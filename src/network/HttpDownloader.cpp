@@ -19,6 +19,11 @@ int HttpDownloader::lastHttpCode = 0;
 
 namespace {
 
+// Maximum time the streaming read loop waits without receiving a single body byte before it
+// gives up. Only reached when the peer stops sending mid-body but keeps the socket open; a
+// well-behaved response either delivers Content-Length bytes or closes the connection.
+constexpr uint32_t STREAM_IDLE_TIMEOUT_MS = 10000;
+
 // Builds the NetworkClient appropriate for the URL/verifyTls combination.
 // - https + verifyTls: SecureNetworkClient with the default CA bundle attached (chain + hostname
 //   verification). *outSecureForError is set so the caller can pull a diagnostic message on failure.
@@ -177,6 +182,122 @@ class FileWriteStream final : public Stream {
   HttpDownloader::ProgressCallback progress_;
 };
 }  // namespace
+
+bool HttpDownloader::fetchUrl(const std::string& url, const DataCallback& onData, const std::string& username,
+                              const std::string& password, bool verifyTls) {
+  // Streaming variant: identical connection setup to the std::string overload,
+  // but pushes body chunks into onData instead of buffering them. Used by the
+  // OTA release-check path where TLS session heap + full-body buffer would OOM.
+  SecureNetworkClient* secureForError = nullptr;
+  std::unique_ptr<NetworkClient> client = makeHttpClient(url, verifyTls, &secureForError);
+  if (!client) {
+    lastHttpCode = TLS_ERROR_CODE;
+    return false;
+  }
+  HTTPClient http;
+
+  http.begin(*client, url.c_str());
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  http.addHeader("User-Agent", "CrossPoint-ESP32-" CROSSPOINT_VERSION);
+
+  if (!username.empty() && !password.empty()) {
+    std::string credentials = username + ":" + password;
+    String encoded = base64::encode(credentials.c_str());
+    http.addHeader("Authorization", "Basic " + encoded);
+  }
+
+  LOG_DBG("HTTP", "FetchStream: %s (heap=%d)", url.c_str(), ESP.getFreeHeap());
+  const int httpCode = http.GET();
+  lastHttpCode = httpCode;
+
+  if (logTlsFailureIfAny(secureForError, httpCode)) {
+    lastHttpCode = TLS_ERROR_CODE;
+  }
+  if (httpCode != HTTP_CODE_OK) {
+    LOG_ERR("HTTP", "FetchStream failed: %d", httpCode);
+    http.end();
+    return false;
+  }
+
+  NetworkClient* stream = http.getStreamPtr();
+  // getStreamPtr() returns nullptr when connected() is false, i.e. the peer closed the socket
+  // (or the TLS session dropped) after the 200 header but before sending any body byte. The read
+  // loop below dereferences stream unconditionally, so bail out here instead of panicking.
+  if (!stream) {
+    LOG_ERR("HTTP", "FetchStream: no stream (connection closed before body)");
+    http.end();
+    lastHttpCode = -904;  // Custom code: stream unavailable after 200 response
+    return false;
+  }
+  // Content-Length bounds the body exactly. Without it the loop can only stop when the peer
+  // closes the socket -- and HTTPClient sends Connection: keep-alive by default, so a server
+  // that holds the connection open after the body would leave available()==0 &&
+  // connected()==true forever. A negative/zero size means chunked or unknown length; that case
+  // still relies on connected(), with STREAM_IDLE_TIMEOUT_MS as the backstop.
+  const int contentLen = http.getSize();
+  const size_t expected = contentLen > 0 ? static_cast<size_t>(contentLen) : 0;
+
+  uint8_t buf[512];
+  size_t total = 0;
+  bool aborted = false;
+  bool timedOut = false;
+  uint32_t lastDataMs = millis();
+  while (stream->available() || stream->connected()) {
+    if (expected > 0 && total >= expected) break;
+
+    int avail = stream->available();
+    if (avail <= 0) {
+      // Unsigned subtraction so a millis() rollover still yields the true elapsed interval.
+      if (static_cast<uint32_t>(millis() - lastDataMs) >= STREAM_IDLE_TIMEOUT_MS) {
+        timedOut = true;
+        break;
+      }
+      delay(1);  // Yield so the task watchdog is fed while waiting for more body bytes.
+      continue;
+    }
+    size_t toRead = (avail < static_cast<int>(sizeof(buf))) ? static_cast<size_t>(avail) : sizeof(buf);
+    if (expected > 0 && toRead > expected - total) {
+      toRead = expected - total;  // Never read past the body into a pipelined keep-alive response.
+    }
+    int bytesRead = stream->readBytes(buf, toRead);
+    if (bytesRead <= 0) break;
+    if (onData && !onData(buf, static_cast<size_t>(bytesRead))) {
+      aborted = true;
+      break;
+    }
+    total += bytesRead;
+    lastDataMs = millis();
+  }
+  http.end();
+
+  if (aborted) {
+    LOG_DBG("HTTP", "FetchStream aborted by callback after %zu bytes", total);
+    return false;
+  }
+  if (timedOut) {
+    LOG_ERR("HTTP", "FetchStream stalled after %zu bytes (contentLen=%d)", total, contentLen);
+    lastHttpCode = -902;  // Custom code: no body data received within STREAM_IDLE_TIMEOUT_MS
+    return false;
+  }
+  if (total == 0) {
+    LOG_ERR("HTTP", "FetchStream: empty body");
+    lastHttpCode = -901;
+    return false;
+  }
+  // The loop also exits when the peer closes the socket, which happens before the body is
+  // complete if the connection drops mid-response. Without this check a truncated body would be
+  // reported as success and the caller would parse a partial payload (e.g. a release JSON whose
+  // download URL is cut in half). Only enforceable when Content-Length was present; expected == 0
+  // means chunked/unknown length, where the connected() + idle-timeout logic above is all we have.
+  if (expected > 0 && total < expected) {
+    LOG_ERR("HTTP", "FetchStream truncated: got %zu bytes, expected %zu", total, expected);
+    lastHttpCode = -903;  // Custom code: body shorter than Content-Length
+    return false;
+  }
+
+  LOG_DBG("HTTP", "FetchStream success: %zu bytes", total);
+  return true;
+}
 
 bool HttpDownloader::fetchUrl(const std::string& url, Stream& outContent, const std::string& username,
                               const std::string& password, bool verifyTls) {

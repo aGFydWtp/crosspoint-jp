@@ -26,6 +26,7 @@
 #include "html/HomePageHtml.generated.h"
 #include "html/SettingsPageHtml.generated.h"
 #include "html/SleepPageHtml.generated.h"
+#include "html/js/aozora_epubJs.generated.h"
 #include "html/js/jszip_minJs.generated.h"
 
 extern GfxRenderer renderer;
@@ -252,6 +253,7 @@ void CrossPointWebServer::begin() {
   server->on("/", HTTP_GET, [this] { handleRoot(); });
   server->on("/files", HTTP_GET, [this] { handleFileList(); });
   server->on("/js/jszip.min.js", HTTP_GET, [this] { handleJszip(); });
+  server->on("/js/aozora-epub.js", HTTP_GET, [this] { handleAozoraEpubJs(); });
 
   server->on("/api/status", HTTP_GET, [this] { handleStatus(); });
   server->on("/api/files", HTTP_GET, [this] { handleFileListData(); });
@@ -466,6 +468,12 @@ void CrossPointWebServer::handleJszip() const {
   server->sendHeader("Content-Encoding", "gzip");
   server->send_P(200, "application/javascript", jszip_minJs, jszip_minJsCompressedSize);
   LOG_DBG("WEB", "Served jszip.min.js");
+}
+
+void CrossPointWebServer::handleAozoraEpubJs() const {
+  server->sendHeader("Content-Encoding", "gzip");
+  server->send_P(200, "application/javascript", aozora_epubJs, aozora_epubJsCompressedSize);
+  LOG_DBG("WEB", "Served aozora-epub.js");
 }
 
 void CrossPointWebServer::handleNotFound() const {

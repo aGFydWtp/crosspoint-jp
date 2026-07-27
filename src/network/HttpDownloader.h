@@ -16,6 +16,12 @@ class HttpDownloader {
   /// downloadToFile() to return ABORTED (the partial temp file is removed automatically).
   using ProgressCallback = std::function<bool(size_t downloaded, size_t total)>;
 
+  /// Streaming body callback: called with each response chunk as it arrives.
+  /// Return false to abort. Lets a streaming parser consume the response
+  /// without buffering the whole body (TLS session + full-body buffer would
+  /// otherwise contend for the same tight heap arena and OOM on ESP32-C3).
+  using DataCallback = std::function<bool(const uint8_t* data, size_t len)>;
+
   enum DownloadError {
     OK = 0,
     HTTP_ERROR,
@@ -57,6 +63,17 @@ class HttpDownloader {
                        const std::string& password = "", bool verifyTls = false);
 
   static bool fetchUrl(const std::string& url, Stream& stream, const std::string& username = "",
+                       const std::string& password = "", bool verifyTls = false);
+
+  /**
+   * Stream the response body to onData as it arrives, without buffering it.
+   * Use when the response is large (>10KB) or when heap is tight during TLS
+   * (OTA release JSON check, streaming JSON parse, etc.).
+   * @param verifyTls Same semantics as the other fetchUrl() overloads: when true (https only),
+   *                  the server certificate chain and hostname are verified against the embedded
+   *                  default CA bundle. Requesting verifyTls=true for a plain http:// URL is an error.
+   */
+  static bool fetchUrl(const std::string& url, const DataCallback& onData, const std::string& username = "",
                        const std::string& password = "", bool verifyTls = false);
 
   /**

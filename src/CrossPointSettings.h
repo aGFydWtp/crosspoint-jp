@@ -185,7 +185,10 @@ class CrossPointSettings {
   // Sleep screen cover mode settings
   uint8_t sleepScreenCoverMode = FIT;
   // Sleep screen cover filter
-  uint8_t sleepScreenCoverFilter = NO_FILTER;
+  // デフォルトは BLACK_AND_WHITE。NO_FILTER (grayscale) だと X3 で BW→grayscale
+  // 遷移が「壁紙が数秒後に淡くなる」現象として認識されるため。ユーザーは設定で
+  // NO_FILTER に戻すことで grayscale 表示を選択できる。
+  uint8_t sleepScreenCoverFilter = BLACK_AND_WHITE;
   // RTC (DS3231) feature master switch — controls sleep mode on X3
   // 0=OFF (full power-off, battery-efficient), 1=ON (deep sleep, DS3231 time preserved)
   uint8_t rtcEnabled = 0;
