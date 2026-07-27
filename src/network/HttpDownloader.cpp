@@ -220,6 +220,15 @@ bool HttpDownloader::fetchUrl(const std::string& url, const DataCallback& onData
   }
 
   NetworkClient* stream = http.getStreamPtr();
+  // getStreamPtr() returns nullptr when connected() is false, i.e. the peer closed the socket
+  // (or the TLS session dropped) after the 200 header but before sending any body byte. The read
+  // loop below dereferences stream unconditionally, so bail out here instead of panicking.
+  if (!stream) {
+    LOG_ERR("HTTP", "FetchStream: no stream (connection closed before body)");
+    http.end();
+    lastHttpCode = -904;  // Custom code: stream unavailable after 200 response
+    return false;
+  }
   // Content-Length bounds the body exactly. Without it the loop can only stop when the peer
   // closes the socket -- and HTTPClient sends Connection: keep-alive by default, so a server
   // that holds the connection open after the body would leave available()==0 &&
