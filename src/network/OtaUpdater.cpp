@@ -59,12 +59,19 @@ OtaUpdater::OtaUpdaterError OtaUpdater::checkForUpdate() {
   // on top of the TLS session's heap during the fetch; with -fno-exceptions an
   // OOM there aborts. The old ArduinoJson + esp_http_client event_handler path
   // also silently dropped chunked-transfer responses. HttpDownloader::fetchUrl
-  // handles verified-https GET, redirects, and User-Agent for us.
+  // handles the GET, redirects, and User-Agent for us.
+  //
+  // verifyTls=true keeps the chain verification the previous esp_http_client
+  // path had via crt_bundle_attach: this response decides which binary gets
+  // flashed, so it must not be served over an unauthenticated TLS session.
   ReleaseJsonParser releaseParser;
-  const bool ok = HttpDownloader::fetchUrl(latestReleaseUrl, [&releaseParser](const uint8_t* data, size_t len) {
-    releaseParser.feed(reinterpret_cast<const char*>(data), len);
-    return true;
-  });
+  const bool ok = HttpDownloader::fetchUrl(
+      latestReleaseUrl,
+      [&releaseParser](const uint8_t* data, size_t len) {
+        releaseParser.feed(reinterpret_cast<const char*>(data), len);
+        return true;
+      },
+      "", "", /*verifyTls=*/true);
   if (!ok) {
     LOG_ERR("OTA", "Release check fetch failed");
     return HTTP_ERROR;

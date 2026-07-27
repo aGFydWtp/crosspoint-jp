@@ -69,9 +69,12 @@ class HttpDownloader {
    * Stream the response body to onData as it arrives, without buffering it.
    * Use when the response is large (>10KB) or when heap is tight during TLS
    * (OTA release JSON check, streaming JSON parse, etc.).
+   * @param verifyTls Same semantics as the other fetchUrl() overloads: when true (https only),
+   *                  the server certificate chain and hostname are verified against the embedded
+   *                  default CA bundle. Requesting verifyTls=true for a plain http:// URL is an error.
    */
   static bool fetchUrl(const std::string& url, const DataCallback& onData, const std::string& username = "",
-                       const std::string& password = "");
+                       const std::string& password = "", bool verifyTls = false);
 
   /**
    * Download a file to the SD card with optional Basic auth credentials.

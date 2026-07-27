@@ -179,18 +179,15 @@ class FileWriteStream final : public Stream {
 }  // namespace
 
 bool HttpDownloader::fetchUrl(const std::string& url, const DataCallback& onData, const std::string& username,
-                              const std::string& password) {
+                              const std::string& password, bool verifyTls) {
   // Streaming variant: identical connection setup to the std::string overload,
   // but pushes body chunks into onData instead of buffering them. Used by the
   // OTA release-check path where TLS session heap + full-body buffer would OOM.
-  std::unique_ptr<NetworkClient> client;
-  if (UrlUtils::isHttpsUrl(url)) {
-    auto* secureClient = new NetworkClientSecure();
-    secureClient->setInsecure();
-    secureClient->setHandshakeTimeout(20);
-    client.reset(secureClient);
-  } else {
-    client.reset(new NetworkClient());
+  SecureNetworkClient* secureForError = nullptr;
+  std::unique_ptr<NetworkClient> client = makeHttpClient(url, verifyTls, &secureForError);
+  if (!client) {
+    lastHttpCode = TLS_ERROR_CODE;
+    return false;
   }
   HTTPClient http;
 
@@ -208,6 +205,9 @@ bool HttpDownloader::fetchUrl(const std::string& url, const DataCallback& onData
   const int httpCode = http.GET();
   lastHttpCode = httpCode;
 
+  if (logTlsFailureIfAny(secureForError, httpCode)) {
+    lastHttpCode = TLS_ERROR_CODE;
+  }
   if (httpCode != HTTP_CODE_OK) {
     LOG_ERR("HTTP", "FetchStream failed: %d", httpCode);
     http.end();
