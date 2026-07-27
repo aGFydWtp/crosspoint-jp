@@ -17,7 +17,7 @@
 #include <string>
 
 namespace {
-constexpr char latestReleaseUrl[] = "https://api.github.com/repos/zrn-ns/crosspoint-jp/releases/latest";
+constexpr char latestReleaseUrl[] = "https://api.github.com/repos/aGFydWtp/crosspoint-jp/releases/latest";
 
 /*
  * When esp_crt_bundle.h included, it is pointing wrong header file
