@@ -241,7 +241,16 @@ void SleepActivity::renderBitmapSleepScreen(const Bitmap& bitmap) const {
   // カレンダーをBWパスに挿入（displayBuffer前）
   drawCalendarIfPending();
 
-  renderer.displayBuffer(HalDisplay::HALF_REFRESH);
+  if (hasGreyscale && !SETTINGS.sleepCalendar) {
+    // OEM grayscale pipeline base: on X3 this displays the frame with the
+    // dedicated "AA-pre-BW(mid)" differential waveform, leaving every pixel
+    // in the calibrated state the gray nudge refresh expects; on X4 it is a
+    // plain HALF refresh (previous behavior). 差分波形を通さないとgray LUTが
+    // 期待通り動作せずスリープ壁紙が数秒後に淡くなる (upstream #2334)。
+    renderer.displayGrayscaleBase(HalDisplay::HALF_REFRESH);
+  } else {
+    renderer.displayBuffer(HalDisplay::HALF_REFRESH);
+  }
 
   if (hasGreyscale && !SETTINGS.sleepCalendar) {
     bitmap.rewindToData();
