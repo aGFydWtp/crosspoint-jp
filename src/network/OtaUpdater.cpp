@@ -17,7 +17,7 @@
 #include <string>
 
 namespace {
-constexpr char latestReleaseUrl[] = "https://api.github.com/repos/zrn-ns/crosspoint-jp/releases/latest";
+constexpr char latestReleaseUrl[] = "https://api.github.com/repos/aGFydWtp/crosspoint-jp/releases/latest";
 
 /*
  * When esp_crt_bundle.h included, it is pointing wrong header file
@@ -37,6 +37,32 @@ bool parseSemver3(const char* version, int* major, int* minor, int* patch) {
     p++;
   }
   return sscanf(p, "%d.%d.%d", major, minor, patch) == 3;
+}
+
+/*
+ * Returns the fork release sequence encoded in versions like "0.1.11-forked.3".
+ * parseSemver3 only reads three numeric segments, so without this the whole
+ * "-forked.N" suffix is discarded and consecutive fork releases of the same
+ * base version compare as equal.
+ *
+ * The numbering mirrors .github/workflows/release.yml: a bare "-forked" is
+ * sequence 0 and "-forked.N" is N. A version with no "-forked" suffix returns
+ * -1 so that any fork release sorts after it.
+ */
+int parseForkedSeq(const char* version) {
+  if (!version) {
+    return -1;
+  }
+  const char* suffix = strstr(version, "-forked");
+  if (!suffix) {
+    return -1;
+  }
+  suffix += sizeof("-forked") - 1;
+  if (*suffix != '.') {
+    return 0;
+  }
+  int seq;
+  return sscanf(suffix + 1, "%d", &seq) == 1 ? seq : 0;
 }
 
 esp_err_t http_client_set_header_cb(esp_http_client_handle_t http_client) {
@@ -135,6 +161,16 @@ bool OtaUpdater::isUpdateNewer() const {
    * Check patch versions.
    */
   if (latestPatch != currentPatch) return latestPatch > currentPatch;
+
+  /*
+   * Same major.minor.patch. This fork republishes upstream base versions as
+   * vX.Y.Z-forked.N, so compare that sequence too; otherwise every fork release
+   * of an unchanged base version looks identical to the installed build and is
+   * never offered over OTA.
+   */
+  const int latestForked = parseForkedSeq(latestVersion.c_str());
+  const int currentForked = parseForkedSeq(currentVersion);
+  if (latestForked != currentForked) return latestForked > currentForked;
 
   // If we reach here, it means all segments are equal.
   // One final check, if we're on an RC build (contains "-rc"), we should consider the latest version as newer even if
