@@ -159,7 +159,9 @@ static bool fetchApiJson(const char* url, JsonDocument& doc) {
       LOG_DBG("AOZORA", "Retry %d/%d", attempt + 1, API_MAX_RETRIES);
       delay(1000);
     }
-    result = HttpDownloader::downloadToFile(url, API_TMP_FILE, nullptr, 30000);
+    // HttpDownloader は esp_http_client の HTTP_TIMEOUT_MS=60000 を使うため、
+    // 従来 fork にあった 30000 ms タイムアウト引数は不要 (本家 API に合わせて除去)。
+    result = HttpDownloader::downloadToFile(url, API_TMP_FILE);
     if (result == HttpDownloader::OK) break;
     LOG_ERR("AOZORA", "API fetch attempt %d failed: err=%d http=%d", attempt + 1, result, HttpDownloader::lastHttpCode);
     Storage.remove(API_TMP_FILE);
@@ -315,14 +317,12 @@ bool AozoraActivity::downloadBook() {
     return false;
   }
 
-  auto result = HttpDownloader::downloadToFile(
-      std::string(url), std::string(destPath),
-      [this](size_t downloaded, size_t total) {
-        downloadProgress_ = downloaded;
-        downloadTotal_ = total;
-        requestUpdate(true);
-      },
-      30000);
+  auto result = HttpDownloader::downloadToFile(std::string(url), std::string(destPath),
+                                               [this](size_t downloaded, size_t total) {
+                                                 downloadProgress_ = downloaded;
+                                                 downloadTotal_ = total;
+                                                 requestUpdate(true);
+                                               });
 
   if (result != HttpDownloader::OK) {
     LOG_ERR("AOZORA", "Download failed: err=%d http=%d", static_cast<int>(result), HttpDownloader::lastHttpCode);
@@ -372,14 +372,12 @@ bool AozoraActivity::updateBook() {
   Storage.remove(tmpPath);
 
   // 一時ファイルにダウンロード（既存ファイルはこの時点では無傷）
-  auto result = HttpDownloader::downloadToFile(
-      std::string(url), std::string(tmpPath),
-      [this](size_t downloaded, size_t total) {
-        downloadProgress_ = downloaded;
-        downloadTotal_ = total;
-        requestUpdate(true);
-      },
-      30000);
+  auto result = HttpDownloader::downloadToFile(std::string(url), std::string(tmpPath),
+                                               [this](size_t downloaded, size_t total) {
+                                                 downloadProgress_ = downloaded;
+                                                 downloadTotal_ = total;
+                                                 requestUpdate(true);
+                                               });
 
   if (result != HttpDownloader::OK) {
     LOG_ERR("AOZORA", "Update download failed: err=%d http=%d", static_cast<int>(result), HttpDownloader::lastHttpCode);
