@@ -127,4 +127,11 @@ class CrossPointWebServer {
   void handleWifiSave() const;
   void handleWifiList() const;
   void handleWifiDelete() const;
+
+  // OPDS server management. Backs the "OPDS Servers" card in SettingsPage.html, which lets a
+  // phone browser type in a catalog URL and its credentials instead of the on-device keyboard.
+  // Passwords are never sent back to the client -- the list reports hasPassword only.
+  void handleOpdsList() const;
+  void handleOpdsSave() const;
+  void handleOpdsDelete() const;
 };

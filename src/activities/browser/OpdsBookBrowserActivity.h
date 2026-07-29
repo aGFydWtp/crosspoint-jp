@@ -52,11 +52,11 @@ class OpdsBookBrowserActivity final : public Activity {
   // long-press convention used elsewhere in the codebase.
   static constexpr unsigned long kDownloadCancelHoldMs = 1000;
 
-  // Downloaded-file index for the html2xtc "already downloaded" marker (server.verifyTls only).
+  // Downloaded-file index behind the "already downloaded" marker, maintained for every server.
   // Key: 6-hex-digit id-hash suffix (see appendIdHashSuffix in the .cpp), value: full SD path.
   // Rebuilt from a single /XTCFiles directory listing in fetchFeed(); never touched by render()
   // so render() stays free of SD I/O. EPUB downloads (saved to the SD root, not /XTCFiles) are
-  // out of scope for this marker -- html2xtc only ever serves XTC.
+  // out of scope for this marker.
   std::unordered_map<std::string, std::string> downloadedByHash;
 
   OpdsServer server;  // Copied at construction — safe even if the store changes during browsing
@@ -64,10 +64,10 @@ class OpdsBookBrowserActivity final : public Activity {
   void checkAndConnectWifi();
   void launchWifiSelection();
   void onWifiSelectionComplete(bool connected);
-  // When server.verifyTls, makes sure the clock is synced (NTP) before any TLS-verified request
-  // is made -- a not-yet-synced clock makes every certificate look not-yet-valid. On failure,
-  // sets state=ERROR with a time-sync-specific message and returns false; TLS verification is
-  // never silently disabled as a fallback. No-op (returns true) when !server.verifyTls.
+  // When the server has TLS verification enabled, makes sure the clock is synced (NTP) before any
+  // verified request is made -- a not-yet-synced clock makes every certificate look not-yet-valid.
+  // On failure, sets state=ERROR with a time-sync-specific message and returns false; TLS
+  // verification is never silently disabled as a fallback. No-op (returns true) when it is off.
   bool ensureTimeSyncedIfNeeded();
   void fetchFeed(const std::string& path);
   void navigateToEntry(const OpdsEntry& entry);
@@ -78,9 +78,7 @@ class OpdsBookBrowserActivity final : public Activity {
   void downloadBook(const OpdsEntry& book, const OpdsAcquisitionLink& acquisition);
   void launchSearch();
   void performSearch(const std::string& query);
-  // Populates downloadedByHash from a single listing of /XTCFiles. Only called when
-  // server.verifyTls (html2xtc); a no-op directory listing for generic OPDS servers would be
-  // wasted SD I/O with no matching entries anyway.
+  // Populates downloadedByHash from a single listing of /XTCFiles, once per fetched feed.
   void scanDownloadedFiles();
   // Returns the full SD path of a previously downloaded file matching this book's id hash, or
   // "" if book.id is empty or no match was found. Pure map lookup -- safe to call from render().

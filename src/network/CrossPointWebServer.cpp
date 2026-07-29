@@ -17,6 +17,7 @@
 
 #include "CrossPointSettings.h"
 #include "FontInstaller.h"
+#include "OpdsServerStore.h"
 #include "SdCardFontGlobals.h"
 #include "SettingsList.h"
 #include "WebDAVHandler.h"
@@ -296,6 +297,11 @@ void CrossPointWebServer::begin() {
   server->on("/api/wifi/save", HTTP_POST, [this] { handleWifiSave(); });
   server->on("/api/wifi/list", HTTP_GET, [this] { handleWifiList(); });
   server->on("/api/wifi/delete", HTTP_POST, [this] { handleWifiDelete(); });
+
+  // OPDS server management endpoints (consumed by the OPDS card in SettingsPage.html)
+  server->on("/api/opds", HTTP_GET, [this] { handleOpdsList(); });
+  server->on("/api/opds", HTTP_POST, [this] { handleOpdsSave(); });
+  server->on("/api/opds/delete", HTTP_POST, [this] { handleOpdsDelete(); });
 
   server->onNotFound([this] { handleNotFound(); });
   LOG_DBG("WEB", "[MEM] Free heap after route setup: %d bytes", ESP.getFreeHeap());
@@ -2064,5 +2070,141 @@ void CrossPointWebServer::handleWifiDelete() const {
     LOG_DBG("WEB", "WiFi credential deleted for SSID: %s", ssid);
   } else {
     server->send(404, "application/json", "{\"error\":\"Credential not found\"}");
+  }
+}
+
+// ---- OPDS server management ----
+// Typing a catalog URL plus a long device token on the on-device keyboard is slow and
+// error-prone, so these endpoints let the same values be entered from a phone browser while it
+// is connected to the file-transfer server.
+
+namespace {
+// Mirrors the 63/127-char limits the on-device editor passes to KeyboardEntryActivity, so a
+// server configured over the web stays editable on the device afterwards.
+constexpr size_t kMaxOpdsNameLen = 63;
+constexpr size_t kMaxOpdsUrlLen = 127;
+constexpr size_t kMaxOpdsCredentialLen = 63;
+
+bool opdsFieldTooLong(const char* value, size_t maxLen) { return value && strlen(value) > maxLen; }
+}  // namespace
+
+void CrossPointWebServer::handleOpdsList() const {
+  OPDS_STORE.loadFromFile();
+
+  JsonDocument doc;
+  JsonArray arr = doc.to<JsonArray>();
+  for (const auto& srv : OPDS_STORE.getServers()) {
+    JsonObject obj = arr.add<JsonObject>();
+    obj["name"] = srv.name;
+    obj["url"] = srv.url;
+    obj["username"] = srv.username;
+    // The password itself never leaves the device; the client only needs to know whether one is
+    // already stored so it can show its "(unchanged)" placeholder.
+    obj["hasPassword"] = !srv.password.empty();
+    obj["verifyTls"] = srv.verifyTls;
+  }
+
+  String json;
+  serializeJson(doc, json);
+  server->send(200, "application/json", json);
+}
+
+void CrossPointWebServer::handleOpdsSave() const {
+  if (!server->hasArg("plain")) {
+    server->send(400, "application/json", "{\"error\":\"Missing request body\"}");
+    return;
+  }
+
+  JsonDocument doc;
+  const DeserializationError err = deserializeJson(doc, server->arg("plain"));
+  if (err) {
+    server->send(400, "application/json", "{\"error\":\"Invalid JSON\"}");
+    return;
+  }
+
+  const char* name = doc["name"];
+  const char* url = doc["url"];
+  const char* username = doc["username"];
+
+  if (!url || strlen(url) == 0) {
+    server->send(400, "application/json", "{\"error\":\"URL is required\"}");
+    return;
+  }
+  if (opdsFieldTooLong(name, kMaxOpdsNameLen) || opdsFieldTooLong(url, kMaxOpdsUrlLen) ||
+      opdsFieldTooLong(username, kMaxOpdsCredentialLen) || opdsFieldTooLong(doc["password"], kMaxOpdsCredentialLen)) {
+    server->send(400, "application/json", "{\"error\":\"Field too long\"}");
+    return;
+  }
+
+  OPDS_STORE.loadFromFile();
+
+  // Absent "index" means "create"; otherwise update the server at that index in place.
+  const bool isNew = doc["index"].isNull();
+  size_t index = 0;
+  OpdsServer srv;
+  if (isNew) {
+    // Secure by default for anything created here -- see OpdsServer::verifyTls. A client that
+    // does not send the flag still gets verification rather than silently falling back to an
+    // unverified connection for credentials it just transmitted.
+    srv.verifyTls = true;
+  } else {
+    const int rawIndex = doc["index"] | -1;
+    if (rawIndex < 0 || static_cast<size_t>(rawIndex) >= OPDS_STORE.getCount()) {
+      server->send(400, "application/json", "{\"error\":\"Invalid index\"}");
+      return;
+    }
+    index = static_cast<size_t>(rawIndex);
+    srv = *OPDS_STORE.getServer(index);
+  }
+
+  srv.name = name ? name : "";
+  srv.url = url;
+  srv.username = username ? username : "";
+  // An omitted password means "keep the stored one" (the client omits it unless the user typed
+  // a new value), so only overwrite when the key is actually present.
+  if (!doc["password"].isNull()) {
+    srv.password = doc["password"].as<const char*>();
+  }
+  if (!doc["verifyTls"].isNull()) {
+    srv.verifyTls = doc["verifyTls"].as<bool>();
+  }
+
+  const bool ok = isNew ? OPDS_STORE.addServer(srv) : OPDS_STORE.updateServer(index, srv);
+  if (ok) {
+    server->send(200, "application/json", "{\"success\":true}");
+    LOG_DBG("WEB", "OPDS server %s: %s", isNew ? "added" : "updated", srv.url.c_str());
+  } else {
+    // addServer() also fails once MAX_SERVERS is reached, not just on a write error.
+    server->send(500, "application/json", "{\"error\":\"Failed to save server\"}");
+    LOG_ERR("WEB", "Failed to save OPDS server: %s", srv.url.c_str());
+  }
+}
+
+void CrossPointWebServer::handleOpdsDelete() const {
+  if (!server->hasArg("plain")) {
+    server->send(400, "application/json", "{\"error\":\"Missing request body\"}");
+    return;
+  }
+
+  JsonDocument doc;
+  const DeserializationError err = deserializeJson(doc, server->arg("plain"));
+  if (err) {
+    server->send(400, "application/json", "{\"error\":\"Invalid JSON\"}");
+    return;
+  }
+
+  OPDS_STORE.loadFromFile();
+
+  const int rawIndex = doc["index"] | -1;
+  if (rawIndex < 0 || static_cast<size_t>(rawIndex) >= OPDS_STORE.getCount()) {
+    server->send(400, "application/json", "{\"error\":\"Invalid index\"}");
+    return;
+  }
+
+  if (OPDS_STORE.removeServer(static_cast<size_t>(rawIndex))) {
+    server->send(200, "application/json", "{\"success\":true}");
+    LOG_DBG("WEB", "OPDS server deleted at index %d", rawIndex);
+  } else {
+    server->send(500, "application/json", "{\"error\":\"Failed to delete server\"}");
   }
 }

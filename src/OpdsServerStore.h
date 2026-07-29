@@ -8,9 +8,14 @@ struct OpdsServer {
   std::string username;
   std::string password;  // Plaintext in memory; obfuscated with hardware key on disk
   // When true, HTTPS requests to this server verify the certificate chain and hostname against
-  // the embedded default CA bundle (see HttpDownloader verifyTls). Defaults to false to preserve
-  // existing behavior for generic OPDS servers, which are frequently self-signed. Not persisted
-  // by JsonSettingsIO -- only set ad-hoc for the html2xtc server built in Html2XtcLibraryActivity.
+  // the embedded default CA bundle (see HttpDownloader verifyTls), and the clock is NTP-synced
+  // first (an unsynced clock makes every certificate look not-yet-valid).
+  //
+  // The struct default is false so that servers loaded from an opds.json written before this
+  // field existed keep behaving as they did -- generic OPDS servers are frequently self-signed.
+  // Newly created servers are secure-by-default instead: both the on-device editor
+  // (OpdsSettingsActivity) and the web API (/api/opds) start them at true, so a user entering
+  // token-bearing credentials does not send them over an unverified connection by accident.
   bool verifyTls = false;
 };
 

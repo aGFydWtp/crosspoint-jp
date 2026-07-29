@@ -269,10 +269,7 @@ void OpdsBookBrowserActivity::render(RenderLock&&) {
   GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
 
   if (entries.empty()) {
-    // html2xtc (verifyTls) gets a friendlier message: an empty library right after pairing is
-    // the expected first-run state, not a lookup failure.
-    renderer.drawCenteredText(UI_10_FONT_ID, pageHeight / 2,
-                              server.verifyTls ? tr(STR_XTC_LIBRARY_EMPTY) : tr(STR_NO_ENTRIES));
+    renderer.drawCenteredText(UI_10_FONT_ID, pageHeight / 2, tr(STR_NO_ENTRIES));
   } else {
     const auto pageStartIndex = selectorIndex / PAGE_ITEMS * PAGE_ITEMS;
     renderer.fillRect(0, 60 + (selectorIndex % PAGE_ITEMS) * 30 - 2, pageWidth - 1, 30);
@@ -314,17 +311,6 @@ void OpdsBookBrowserActivity::fetchFeed(const std::string& path) {
       if (HttpDownloader::lastHttpCode == HttpDownloader::TLS_ERROR_CODE) {
         errorMessage = tr(STR_ERROR_TLS_VERIFICATION_FAILED);
         errorHint = tr(STR_ERROR_TLS_CHECK_HINT);
-      } else if (server.verifyTls && HttpDownloader::lastHttpCode == 401) {
-        // html2xtc returns 401 for every auth failure (unknown device, bad token, revoked
-        // device) -- it never returns 403. Guarded by verifyTls so generic OPDS servers keep
-        // their existing generic error.
-        errorMessage = tr(STR_XTC_AUTH_FAILED);
-        errorHint = tr(STR_XTC_REPAIR_HINT);
-      } else if (server.verifyTls && HttpDownloader::lastHttpCode == 403) {
-        // Defensive only: the real html2xtc server never sends 403 (see 401 comment above), but
-        // handle it the same way in case that ever changes.
-        errorMessage = tr(STR_XTC_DEVICE_REVOKED);
-        errorHint = tr(STR_XTC_REPAIR_HINT);
       } else {
         errorMessage = tr(STR_FETCH_FEED_FAILED);
         errorHint.clear();
@@ -355,14 +341,14 @@ void OpdsBookBrowserActivity::fetchFeed(const std::string& path) {
 
   selectorIndex = 0;
 
-  // Refresh the "already downloaded" index for html2xtc feeds. Generic OPDS servers never
-  // populate downloadedByHash, so their entries just never match in downloadedPathFor().
-  if (server.verifyTls) {
-    scanDownloadedFiles();
-  }
+  // Refresh the "already downloaded" index. One directory listing per feed, for every OPDS
+  // server: XTC/XTCH downloads land in /XTCFiles regardless of which server served them, so
+  // the marker is meaningful anywhere, and a server that has never been downloaded from just
+  // yields entries that don't match in downloadedPathFor().
+  scanDownloadedFiles();
 
-  // An empty feed is a valid response (e.g. a freshly paired html2xtc device with no books
-  // assigned yet), not an error -- the BROWSING render path shows its own empty-state message.
+  // An empty feed is a valid response (e.g. a catalog with nothing assigned to this device
+  // yet), not an error -- the BROWSING render path shows its own empty-state message.
   state = BrowserState::BROWSING;
   requestUpdate();
 }
@@ -491,14 +477,6 @@ void OpdsBookBrowserActivity::downloadBook(const OpdsEntry& book, const OpdsAcqu
     if (result == HttpDownloader::TLS_ERROR) {
       errorMessage = tr(STR_ERROR_TLS_VERIFICATION_FAILED);
       errorHint = tr(STR_ERROR_TLS_CHECK_HINT);
-    } else if (server.verifyTls && HttpDownloader::lastHttpCode == 401) {
-      // See the matching comment in fetchFeed(): html2xtc always returns 401 for auth failures.
-      errorMessage = tr(STR_XTC_AUTH_FAILED);
-      errorHint = tr(STR_XTC_REPAIR_HINT);
-    } else if (server.verifyTls && HttpDownloader::lastHttpCode == 403) {
-      // Defensive only; see the matching comment in fetchFeed().
-      errorMessage = tr(STR_XTC_DEVICE_REVOKED);
-      errorHint = tr(STR_XTC_REPAIR_HINT);
     } else {
       errorMessage = tr(STR_DOWNLOAD_FAILED);
       errorHint.clear();
