@@ -230,7 +230,9 @@ void FontDownloadActivity::downloadFamily(ManifestFamily& family) {
 
     auto result = HttpDownloader::downloadToFile(url, destPath, [this](size_t downloaded, size_t total) {
       fileProgress_ = downloaded;
-      fileTotal_ = total;
+      // A chunked response reports total == 0; keep the manifest-declared size in that case so
+      // the progress bar still has a denominator.
+      if (total > 0) fileTotal_ = total;
       requestUpdate(true);
       return true;
     });

@@ -152,7 +152,11 @@ class FileWriteStream final : public Stream {
       writeOk_ = false;
     }
     downloaded_ += written;
-    if (progress_ && total_ > 0) {
+    // Reported even when total_ is 0 (a chunked response carries no Content-Length). Gating on a
+    // known total used to make such downloads both progress-less and impossible to cancel, since
+    // cancellation is signalled through this very callback. Callers already treat total == 0 as
+    // "length unknown" and skip their progress bar.
+    if (progress_) {
       if (!progress_(downloaded_, total_)) {
         // Cancellation requested: report a short write so HTTPClient::writeToStreamDataBlock
         // treats this as a stream error, stops the connection (via returnError()), and unwinds
