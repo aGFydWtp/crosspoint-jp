@@ -13,8 +13,17 @@
 
 extern "C" void wolfSSL_Arduino_Serial_Print(const char* const msg) { LOG_DBG("WOLFSSL", "%s", msg); }
 #else
-#include <esp_crt_bundle.h>
 #include <esp_http_client.h>
+
+/*
+ * When esp_crt_bundle.h is included, it points to the wrong header file
+ * (something under WiFiClientSecure) because our framework is based on the
+ * Arduino platform. To manage this obstacle, don't include anything, just
+ * extern and it will point to the correct one.
+ */
+extern "C" {
+extern esp_err_t esp_crt_bundle_attach(void* conf);
+}
 #endif
 
 // fork-only: activities show this in error messages for diagnostics
