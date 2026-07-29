@@ -54,6 +54,11 @@ bool OpdsServerStore::migrateFromSettings() {
   server.url = SETTINGS.opdsServerUrl;
   server.username = SETTINGS.opdsUsername;
   server.password = SETTINGS.opdsPassword;
+  // This creates a server entry rather than loading one, so it follows the same secure-by-default
+  // rule as the editors (see OpdsServer::verifyTls): an https URL gets verification, since the
+  // credentials being carried over are sent on every request. A self-signed server can be turned
+  // back off in the editor -- the failure is reported as a TLS error, not a generic one.
+  server.verifyTls = server.url.rfind("https://", 0) == 0;
   servers.push_back(std::move(server));
 
   if (saveToFile()) {
