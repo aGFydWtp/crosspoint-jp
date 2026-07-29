@@ -17,6 +17,13 @@
 namespace {
 constexpr char latestReleaseUrl[] = "https://api.github.com/repos/zrn-ns/crosspoint-jp/releases/latest";
 
+// esp_err_to_name の "ESP_ERR_" prefix を削って画面幅に収まる短い名前にする。
+const char* shortErrName(const char* name) {
+  if (!name) return "?";
+  if (strncmp(name, "ESP_ERR_", 8) == 0) return name + 8;
+  return name;
+}
+
 bool parseSemver3(const char* version, int* major, int* minor, int* patch) {
   if (!version || !major || !minor || !patch) {
     return false;
@@ -38,6 +45,7 @@ OtaUpdater::OtaUpdaterError OtaUpdater::checkForUpdate() {
   otaSize = 0;
   processedSize = 0;
   totalSize = 0;
+  lastErrorDetail.clear();
 
   // Stream the ~32KB release JSON straight into the parser as it arrives.
   // Buffering the whole body in a std::string would add a growing allocation
@@ -51,6 +59,10 @@ OtaUpdater::OtaUpdaterError OtaUpdater::checkForUpdate() {
   });
   if (!ok) {
     LOG_ERR("OTA", "Release check fetch failed");
+    char buf[64];
+    snprintf(buf, sizeof(buf), "fetch fail http=%d heap=%dKB", HttpDownloader::lastHttpCode,
+             static_cast<int>(ESP.getFreeHeap() / 1024));
+    lastErrorDetail = buf;
     return HTTP_ERROR;
   }
 
@@ -130,6 +142,7 @@ OtaUpdater::OtaUpdaterError OtaUpdater::installUpdate(ProgressCallback onProgres
   if (!isUpdateNewer()) {
     return UPDATE_OLDER_ERROR;
   }
+  lastErrorDetail.clear();
 
   // esp_https_ota is hardwired to esp-tls/mbedTLS, whose precompiled build on this
   // package can't negotiate TLS 1.3 (see SecureClient.h). Drive the OTA partition
@@ -139,6 +152,7 @@ OtaUpdater::OtaUpdaterError OtaUpdater::installUpdate(ProgressCallback onProgres
   const esp_partition_t* updatePartition = esp_ota_get_next_update_partition(nullptr);
   if (!updatePartition) {
     LOG_ERR("OTA", "No OTA partition available");
+    lastErrorDetail = "no ota partition";
     return INTERNAL_UPDATE_ERROR;
   }
 
@@ -146,6 +160,10 @@ OtaUpdater::OtaUpdaterError OtaUpdater::installUpdate(ProgressCallback onProgres
   esp_err_t esp_err = esp_ota_begin(updatePartition, OTA_SIZE_UNKNOWN, &otaHandle);
   if (esp_err != ESP_OK) {
     LOG_ERR("OTA", "esp_ota_begin failed: %s", esp_err_to_name(esp_err));
+    char buf[96];
+    snprintf(buf, sizeof(buf), "begin:%s heap=%dKB", shortErrName(esp_err_to_name(esp_err)),
+             static_cast<int>(ESP.getFreeHeap() / 1024));
+    lastErrorDetail = buf;
     return INTERNAL_UPDATE_ERROR;
   }
 
@@ -155,8 +173,10 @@ OtaUpdater::OtaUpdaterError OtaUpdater::installUpdate(ProgressCallback onProgres
   processedSize = 0;
   int lastReportedPct = -1;
   bool flashOk = true;
+  esp_err_t writeErr = ESP_OK;
   const bool fetchOk = HttpDownloader::fetchUrl(otaUrl, [&](const uint8_t* data, size_t len) {
-    if (esp_ota_write(otaHandle, data, len) != ESP_OK) {
+    writeErr = esp_ota_write(otaHandle, data, len);
+    if (writeErr != ESP_OK) {
       flashOk = false;
       return false;  // abort the transfer
     }
@@ -179,6 +199,17 @@ OtaUpdater::OtaUpdaterError OtaUpdater::installUpdate(ProgressCallback onProgres
 
   if (!fetchOk || !flashOk) {
     LOG_ERR("OTA", "Firmware install failed (%s)", flashOk ? "download" : "flash write");
+    char buf[128];
+    if (!flashOk) {
+      snprintf(buf, sizeof(buf), "write:%s r=%d/%d|heap=%dKB blk=%dKB", shortErrName(esp_err_to_name(writeErr)),
+               static_cast<int>(processedSize), static_cast<int>(totalSize), static_cast<int>(ESP.getFreeHeap() / 1024),
+               static_cast<int>(ESP.getMaxAllocHeap() / 1024));
+    } else {
+      snprintf(buf, sizeof(buf), "fetch http=%d r=%d/%d|heap=%dKB blk=%dKB", HttpDownloader::lastHttpCode,
+               static_cast<int>(processedSize), static_cast<int>(totalSize), static_cast<int>(ESP.getFreeHeap() / 1024),
+               static_cast<int>(ESP.getMaxAllocHeap() / 1024));
+    }
+    lastErrorDetail = buf;
     esp_ota_abort(otaHandle);
     return flashOk ? HTTP_ERROR : INTERNAL_UPDATE_ERROR;
   }
@@ -186,12 +217,20 @@ OtaUpdater::OtaUpdaterError OtaUpdater::installUpdate(ProgressCallback onProgres
   esp_err = esp_ota_end(otaHandle);  // verifies the written image
   if (esp_err != ESP_OK) {
     LOG_ERR("OTA", "esp_ota_end failed: %s", esp_err_to_name(esp_err));
+    char buf[128];
+    snprintf(buf, sizeof(buf), "end:%s r=%d/%d|heap=%dKB blk=%dKB", shortErrName(esp_err_to_name(esp_err)),
+             static_cast<int>(processedSize), static_cast<int>(totalSize), static_cast<int>(ESP.getFreeHeap() / 1024),
+             static_cast<int>(ESP.getMaxAllocHeap() / 1024));
+    lastErrorDetail = buf;
     return INTERNAL_UPDATE_ERROR;
   }
 
   esp_err = esp_ota_set_boot_partition(updatePartition);
   if (esp_err != ESP_OK) {
     LOG_ERR("OTA", "esp_ota_set_boot_partition failed: %s", esp_err_to_name(esp_err));
+    char buf[96];
+    snprintf(buf, sizeof(buf), "setboot:%s", shortErrName(esp_err_to_name(esp_err)));
+    lastErrorDetail = buf;
     return INTERNAL_UPDATE_ERROR;
   }
 

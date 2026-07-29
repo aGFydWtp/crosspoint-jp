@@ -9,6 +9,9 @@ class OtaUpdater {
   size_t otaSize = 0;
   size_t processedSize = 0;
   size_t totalSize = 0;
+  // 失敗ステップと esp_err_t の名前を短くまとめた診断文字列。
+  // シリアルが取れない環境で FAILED 画面に表示するため。
+  std::string lastErrorDetail;
 
  public:
   using ProgressCallback = void (*)(void* ctx);
@@ -28,6 +31,8 @@ class OtaUpdater {
   size_t getProcessedSize() const { return processedSize; }
 
   size_t getTotalSize() const { return totalSize; }
+
+  const std::string& getLastErrorDetail() const { return lastErrorDetail; }
 
   OtaUpdater() = default;
   bool isUpdateNewer() const;
