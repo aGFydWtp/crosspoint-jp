@@ -10,7 +10,6 @@
 
 #include "CrossPointSettings.h"
 #include "CrossPointState.h"
-#include "Html2XtcCredentialStore.h"
 #include "KOReaderCredentialStore.h"
 #include "OpdsServerStore.h"
 #include "RecentBooksStore.h"
@@ -375,51 +374,6 @@ bool JsonSettingsIO::loadKOReader(KOReaderCredentialStore& store, const char* js
   return true;
 }
 
-// ---- Html2XtcCredentialStore ----
-
-bool JsonSettingsIO::saveHtml2Xtc(const Html2XtcCredentialStore& store, const char* path) {
-  JsonDocument doc;
-  doc["version"] = 1;
-  doc["serverUrl"] = store.serverUrl;
-  doc["deviceId"] = store.deviceId;
-  doc["deviceToken_obf"] = obfuscation::obfuscateToBase64(store.deviceToken);
-  doc["deviceName"] = store.deviceName;
-
-  String json;
-  serializeJson(doc, json);
-  return Storage.writeFile(path, json);
-}
-
-bool JsonSettingsIO::loadHtml2Xtc(Html2XtcCredentialStore& store, const char* json, bool* needsResave) {
-  if (needsResave) *needsResave = false;
-  JsonDocument doc;
-  auto error = deserializeJson(doc, json);
-  if (error) {
-    LOG_ERR("XTC", "JSON parse error: %s", error.c_str());
-    return false;
-  }
-
-  store.serverUrl = doc["serverUrl"] | std::string(HTML2XTC_SERVER_URL);
-  if (store.serverUrl.empty()) {
-    store.serverUrl = HTML2XTC_SERVER_URL;
-  }
-  store.deviceId = doc["deviceId"] | std::string("");
-  store.deviceName = doc["deviceName"] | std::string("");
-  bool ok = false;
-  store.deviceToken = obfuscation::deobfuscateFromBase64(doc["deviceToken_obf"] | "", &ok);
-  if (!ok || store.deviceToken.empty()) {
-    // Dev-provisioning fallback: accept a plaintext "deviceToken" key once and
-    // request a re-save so the plaintext does not persist on the SD card
-    store.deviceToken = doc["deviceToken"] | std::string("");
-    if (!store.deviceToken.empty() && needsResave) *needsResave = true;
-  }
-
-  // Never log the token value; log presence/length only
-  LOG_DBG("XTC", "Loaded html2xtc credentials (deviceId: %s, token len=%u)", store.deviceId.c_str(),
-          static_cast<unsigned>(store.deviceToken.size()));
-  return true;
-}
-
 // ---- WifiCredentialStore ----
 
 bool JsonSettingsIO::saveWifi(const WifiCredentialStore& store, const char* path) {
@@ -524,6 +478,7 @@ bool JsonSettingsIO::saveOpds(const OpdsServerStore& store, const char* path) {
     obj["url"] = server.url;
     obj["username"] = server.username;
     obj["password_obf"] = obfuscation::obfuscateToBase64(server.password);
+    obj["verifyTls"] = server.verifyTls;
   }
 
   String json;
@@ -556,6 +511,10 @@ bool JsonSettingsIO::loadOpds(OpdsServerStore& store, const char* json, bool* ne
       server.password = obj["password"] | std::string("");
       if (!server.password.empty() && needsResave) *needsResave = true;
     }
+    // Absent in files written before the toggle existed. Defaulting to false keeps those
+    // servers behaving exactly as they did (many generic OPDS servers are self-signed);
+    // secure-by-default applies only to newly added servers, which start with verifyTls=true.
+    server.verifyTls = obj["verifyTls"] | false;
     store.servers.push_back(std::move(server));
   }
 

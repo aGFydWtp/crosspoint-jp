@@ -8,6 +8,7 @@
 #include <WiFi.h>
 
 #include <algorithm>
+#include <array>
 #include <functional>
 
 #include "MappedInputManager.h"
@@ -44,6 +45,22 @@ std::string idHashHex(const std::string& id) {
 // Deterministic short suffix derived from the OPDS entry id, used to disambiguate filename
 // collisions while keeping repeat downloads of the same item idempotent.
 std::string appendIdHashSuffix(const std::string& base, const std::string& id) { return base + "_" + idHashHex(id); }
+
+// Bridges the feed-declared format (OpdsParser) to the on-disk format (DownloadFormat). Kept
+// here rather than in either header so lib/OpdsParser stays independent of src/util.
+DownloadFormat toDownloadFormat(const OpdsAcquisitionFormat format) {
+  switch (format) {
+    case OpdsAcquisitionFormat::EPUB:
+      return DownloadFormat::EPUB;
+    case OpdsAcquisitionFormat::XTC:
+      return DownloadFormat::XTC;
+    case OpdsAcquisitionFormat::XTCH:
+      return DownloadFormat::XTCH;
+    case OpdsAcquisitionFormat::UNKNOWN:
+    default:
+      return DownloadFormat::UNKNOWN;
+  }
+}
 }  // namespace
 
 void OpdsBookBrowserActivity::onEnter() {
@@ -80,13 +97,26 @@ void OpdsBookBrowserActivity::loop() {
     return;
   }
 
-  if (consumeConfirm && mappedInput.wasReleased(MappedInputManager::Button::Confirm)) {
-    consumeConfirm = false;
+  if (formatPopup.isActive()) {
+    // The popup acts on wasPressed(); note Back here so the matching release is swallowed below
+    // instead of also triggering navigateBack() on this screen.
+    const bool dismissingWithBack = mappedInput.wasPressed(MappedInputManager::Button::Back);
+    formatPopup.handleInput(mappedInput, [this] { requestUpdate(); });
+    if (dismissingWithBack) consumeBack = true;
     return;
   }
-  if (consumeBack && mappedInput.wasReleased(MappedInputManager::Button::Back)) {
-    consumeBack = false;
-    return;
+
+  // Also clear the flag when the button is no longer held: a consume request raised while the
+  // button was already up would otherwise stay armed and swallow the user's next press.
+  if (consumeConfirm) {
+    const bool released = mappedInput.wasReleased(MappedInputManager::Button::Confirm);
+    if (released || !mappedInput.isPressed(MappedInputManager::Button::Confirm)) consumeConfirm = false;
+    if (released) return;
+  }
+  if (consumeBack) {
+    const bool released = mappedInput.wasReleased(MappedInputManager::Button::Back);
+    if (released || !mappedInput.isPressed(MappedInputManager::Button::Back)) consumeBack = false;
+    if (released) return;
   }
 
   if (state == BrowserState::ERROR) {
@@ -123,7 +153,7 @@ void OpdsBookBrowserActivity::loop() {
           navigateToEntry(entry);
         } else {
           const std::string downloadedPath = downloadedPathFor(entry);
-          downloadedPath.empty() ? downloadBook(entry) : onSelectBook(downloadedPath);
+          downloadedPath.empty() ? chooseBookFormat(entry) : onSelectBook(downloadedPath);
         }
       }
     } else if (mappedInput.wasReleased(MappedInputManager::Button::Back)) {
@@ -154,6 +184,9 @@ void OpdsBookBrowserActivity::loop() {
 }
 
 void OpdsBookBrowserActivity::render(RenderLock&&) {
+  // Drawn over the catalog list already in the framebuffer, so this must run before clearScreen().
+  if (formatPopup.processRender(renderer, mappedInput)) return;
+
   renderer.clearScreen();
   const auto pageWidth = renderer.getScreenWidth();
   const auto pageHeight = renderer.getScreenHeight();
@@ -216,13 +249,11 @@ void OpdsBookBrowserActivity::render(RenderLock&&) {
       renderer.drawCenteredText(UI_10_FONT_ID, barY + barHeight + 15 + 40, sizeText.c_str());
     }
 
-    // Cancellation is detected inside the progress callback, which only fires when the response
-    // has a Content-Length (FileWriteStream gates on total > 0) -- don't advertise it otherwise.
-    if (downloadTotal > 0) {
-      GUI.drawHelpText(renderer,
-                       Rect{0, pageHeight - metrics.buttonHintsHeight - metrics.contentSidePadding - 15, pageWidth, 20},
-                       tr(STR_DOWNLOAD_CANCEL_HINT));
-    }
+    // Cancellation is detected inside the progress callback, which now fires for chunked
+    // responses too, so the hint applies whether or not the length is known.
+    GUI.drawHelpText(renderer,
+                     Rect{0, pageHeight - metrics.buttonHintsHeight - metrics.contentSidePadding - 15, pageWidth, 20},
+                     tr(STR_DOWNLOAD_CANCEL_HINT));
 
     renderer.displayBuffer();
     return;
@@ -238,10 +269,7 @@ void OpdsBookBrowserActivity::render(RenderLock&&) {
   GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
 
   if (entries.empty()) {
-    // html2xtc (verifyTls) gets a friendlier message: an empty library right after pairing is
-    // the expected first-run state, not a lookup failure.
-    renderer.drawCenteredText(UI_10_FONT_ID, pageHeight / 2,
-                              server.verifyTls ? tr(STR_XTC_LIBRARY_EMPTY) : tr(STR_NO_ENTRIES));
+    renderer.drawCenteredText(UI_10_FONT_ID, pageHeight / 2, tr(STR_NO_ENTRIES));
   } else {
     const auto pageStartIndex = selectorIndex / PAGE_ITEMS * PAGE_ITEMS;
     renderer.fillRect(0, 60 + (selectorIndex % PAGE_ITEMS) * 30 - 2, pageWidth - 1, 30);
@@ -283,17 +311,6 @@ void OpdsBookBrowserActivity::fetchFeed(const std::string& path) {
       if (HttpDownloader::lastHttpCode == HttpDownloader::TLS_ERROR_CODE) {
         errorMessage = tr(STR_ERROR_TLS_VERIFICATION_FAILED);
         errorHint = tr(STR_ERROR_TLS_CHECK_HINT);
-      } else if (server.verifyTls && HttpDownloader::lastHttpCode == 401) {
-        // html2xtc returns 401 for every auth failure (unknown device, bad token, revoked
-        // device) -- it never returns 403. Guarded by verifyTls so generic OPDS servers keep
-        // their existing generic error.
-        errorMessage = tr(STR_XTC_AUTH_FAILED);
-        errorHint = tr(STR_XTC_REPAIR_HINT);
-      } else if (server.verifyTls && HttpDownloader::lastHttpCode == 403) {
-        // Defensive only: the real html2xtc server never sends 403 (see 401 comment above), but
-        // handle it the same way in case that ever changes.
-        errorMessage = tr(STR_XTC_DEVICE_REVOKED);
-        errorHint = tr(STR_XTC_REPAIR_HINT);
       } else {
         errorMessage = tr(STR_FETCH_FEED_FAILED);
         errorHint.clear();
@@ -316,22 +333,22 @@ void OpdsBookBrowserActivity::fetchFeed(const std::string& path) {
   entries = std::move(parser).getEntries();
 
   if (!prevUrl.empty()) {
-    entries.insert(entries.begin(), OpdsEntry{OpdsEntryType::NAVIGATION, tr(STR_PREV_PAGE), "", prevUrl, "", ""});
+    entries.insert(entries.begin(), OpdsEntry{OpdsEntryType::NAVIGATION, tr(STR_PREV_PAGE), "", prevUrl, ""});
   }
   if (!nextUrl.empty()) {
-    entries.push_back(OpdsEntry{OpdsEntryType::NAVIGATION, tr(STR_NEXT_PAGE), "", nextUrl, "", ""});
+    entries.push_back(OpdsEntry{OpdsEntryType::NAVIGATION, tr(STR_NEXT_PAGE), "", nextUrl, ""});
   }
 
   selectorIndex = 0;
 
-  // Refresh the "already downloaded" index for html2xtc feeds. Generic OPDS servers never
-  // populate downloadedByHash, so their entries just never match in downloadedPathFor().
-  if (server.verifyTls) {
-    scanDownloadedFiles();
-  }
+  // Refresh the "already downloaded" index. One directory listing per feed, for every OPDS
+  // server: XTC/XTCH downloads land in /XTCFiles regardless of which server served them, so
+  // the marker is meaningful anywhere, and a server that has never been downloaded from just
+  // yields entries that don't match in downloadedPathFor().
+  scanDownloadedFiles();
 
-  // An empty feed is a valid response (e.g. a freshly paired html2xtc device with no books
-  // assigned yet), not an error -- the BROWSING render path shows its own empty-state message.
+  // An empty feed is a valid response (e.g. a catalog with nothing assigned to this device
+  // yet), not an error -- the BROWSING render path shows its own empty-state message.
   state = BrowserState::BROWSING;
   requestUpdate();
 }
@@ -365,7 +382,49 @@ void OpdsBookBrowserActivity::navigateBack() {
   }
 }
 
-void OpdsBookBrowserActivity::downloadBook(const OpdsEntry& book) {
+void OpdsBookBrowserActivity::chooseBookFormat(const OpdsEntry& book) {
+  if (book.acquisitionLinks.empty()) {
+    // The parser only marks an entry as a BOOK once it has stored at least one link, so this is
+    // defensive rather than reachable through a well-formed feed.
+    LOG_ERR("OPDS", "Book entry without acquisition links: %s", book.title.c_str());
+    state = BrowserState::ERROR;
+    errorMessage = tr(STR_DOWNLOAD_FAILED);
+    errorHint.clear();
+    requestUpdate();
+    return;
+  }
+
+  if (book.acquisitionLinks.size() == 1) {
+    downloadBook(book, book.acquisitionLinks.front());
+    return;
+  }
+
+  // Bounded by MAX_ACQUISITION_LINKS in OpdsParser.cpp; a stack array avoids a heap allocation for
+  // what is at most three short string literals.
+  std::array<const char*, 3> labels{};
+  const size_t linkCount = std::min(book.acquisitionLinks.size(), labels.size());
+  for (size_t i = 0; i < linkCount; i++) {
+    labels[i] = opdsAcquisitionLabel(book.acquisitionLinks[i].format);
+  }
+
+  // Capture the index rather than a reference: the callback runs on a later loop() iteration and
+  // `entries` must be re-read (and re-bounds-checked) at that point.
+  const int bookIndex = selectorIndex;
+  formatPopup.show(book.title.c_str(), labels.data(), static_cast<int>(linkCount), 0,
+                   [this, bookIndex](const int formatIndex) {
+                     // Swallow the release of the Confirm press that dismissed the popup.
+                     consumeConfirm = true;
+                     if (bookIndex < 0 || bookIndex >= static_cast<int>(entries.size())) return;
+                     const auto& selectedBook = entries[bookIndex];
+                     if (formatIndex < 0 || formatIndex >= static_cast<int>(selectedBook.acquisitionLinks.size())) {
+                       return;
+                     }
+                     downloadBook(selectedBook, selectedBook.acquisitionLinks[formatIndex]);
+                   });
+  requestUpdate();
+}
+
+void OpdsBookBrowserActivity::downloadBook(const OpdsEntry& book, const OpdsAcquisitionLink& acquisition) {
   state = BrowserState::DOWNLOADING;
   statusMessage = book.title;
   downloadProgress = downloadTotal = 0;
@@ -374,7 +433,7 @@ void OpdsBookBrowserActivity::downloadBook(const OpdsEntry& book) {
 
   // Build full download URL relative to the current feed, not the root server URL
   const std::string feedUrl = UrlUtils::buildUrl(server.url, currentPath);
-  std::string downloadUrl = UrlUtils::buildUrl(feedUrl, book.href);
+  std::string downloadUrl = UrlUtils::buildUrl(feedUrl, acquisition.href);
   LOG_DBG("OPDS", "Downloading: %s -> %s", downloadUrl.c_str(), kTempDownloadPath);
 
   // Clean up a stale temp file left behind by a previous interrupted download.
@@ -418,14 +477,6 @@ void OpdsBookBrowserActivity::downloadBook(const OpdsEntry& book) {
     if (result == HttpDownloader::TLS_ERROR) {
       errorMessage = tr(STR_ERROR_TLS_VERIFICATION_FAILED);
       errorHint = tr(STR_ERROR_TLS_CHECK_HINT);
-    } else if (server.verifyTls && HttpDownloader::lastHttpCode == 401) {
-      // See the matching comment in fetchFeed(): html2xtc always returns 401 for auth failures.
-      errorMessage = tr(STR_XTC_AUTH_FAILED);
-      errorHint = tr(STR_XTC_REPAIR_HINT);
-    } else if (server.verifyTls && HttpDownloader::lastHttpCode == 403) {
-      // Defensive only; see the matching comment in fetchFeed().
-      errorMessage = tr(STR_XTC_DEVICE_REVOKED);
-      errorHint = tr(STR_XTC_REPAIR_HINT);
     } else {
       errorMessage = tr(STR_DOWNLOAD_FAILED);
       errorHint.clear();
@@ -435,18 +486,18 @@ void OpdsBookBrowserActivity::downloadBook(const OpdsEntry& book) {
   }
 
   // Format is decided only after the download completes: Content-Disposition filename extension
-  // (preferred), then the response Content-Type, then (if that's inconclusive, e.g. a generic
-  // application/octet-stream) the OPDS entry's own media type, then the href extension.
+  // (preferred), then the response Content-Type, then the href extension, and only as a last
+  // resort what the feed itself declared. The response is trusted over the feed because a feed's
+  // `type` attribute is frequently a generic application/octet-stream placeholder.
   const std::string dispositionFilename =
       DownloadFormatUtils::parseContentDispositionFilename(metadata.contentDisposition);
-  DownloadFormat format = DownloadFormatUtils::detectFormat(dispositionFilename, metadata.contentType, book.href);
-  if (format == DownloadFormat::UNKNOWN) {
-    format = DownloadFormatUtils::detectFormat(dispositionFilename, book.mediaType, book.href);
-  }
+  DownloadFormat format =
+      DownloadFormatUtils::detectFormat(dispositionFilename, metadata.contentType, acquisition.href);
+  if (format == DownloadFormat::UNKNOWN) format = toDownloadFormat(acquisition.format);
 
   if (format == DownloadFormat::UNKNOWN) {
-    LOG_ERR("OPDS", "Unrecognized download format (contentType=%s, entryMediaType=%s, href=%s)",
-            metadata.contentType.c_str(), book.mediaType.c_str(), book.href.c_str());
+    LOG_ERR("OPDS", "Unrecognized download format (contentType=%s, feedFormat=%s, href=%s)",
+            metadata.contentType.c_str(), opdsAcquisitionLabel(acquisition.format), acquisition.href.c_str());
     Storage.remove(kTempDownloadPath);
     state = BrowserState::ERROR;
     errorMessage = tr(STR_UNSUPPORTED_DOWNLOAD_FORMAT);

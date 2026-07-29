@@ -56,6 +56,26 @@ struct ThemeMetrics {
   int buttonHintsHeight;
   int sideButtonHintsWidth;
 
+  // Popup chrome, shared by drawPopup() and drawOptionPopup().
+  int popupFrameThickness;
+  int popupCornerRadius;
+
+  // Option popup (drawOptionPopup): a centred modal list the user moves through with Up/Down.
+  int optionPopupItemSpacing;
+  int optionPopupInnerPadding;
+  int optionPopupSelectionHPadding;
+  int optionPopupSelectionVPadding;
+  int optionPopupTitleGap;
+  bool optionPopupUseSmallFont;
+  bool optionPopupOptionFontBold;
+  int optionPopupSelectionRadius;
+  // When true the selected row is filled light gray and keeps dark text; when false it is filled
+  // black and the text is drawn white.
+  bool optionPopupSelectionLight;
+  bool optionPopupDrawAllRows;
+  int optionPopupDialogSideMargin;
+  bool optionPopupTitleSeparator;
+
   int progressBarHeight;
   int progressBarMarginTop;
   int statusBarHorizontalMargin;
@@ -120,6 +140,20 @@ constexpr ThemeMetrics values = {.batteryWidth = 15,
                                  .homeMenuTopOffset = 10,
                                  .buttonHintsHeight = 40,
                                  .sideButtonHintsWidth = 30,
+                                 .popupFrameThickness = 2,
+                                 .popupCornerRadius = 0,
+                                 .optionPopupItemSpacing = 6,
+                                 .optionPopupInnerPadding = 16,
+                                 .optionPopupSelectionHPadding = 8,
+                                 .optionPopupSelectionVPadding = 4,
+                                 .optionPopupTitleGap = 10,
+                                 .optionPopupUseSmallFont = true,
+                                 .optionPopupOptionFontBold = true,
+                                 .optionPopupSelectionRadius = 0,
+                                 .optionPopupSelectionLight = false,
+                                 .optionPopupDrawAllRows = false,
+                                 .optionPopupDialogSideMargin = 20,
+                                 .optionPopupTitleSeparator = true,
                                  .progressBarHeight = 16,
                                  .progressBarMarginTop = 1,
                                  .statusBarHorizontalMargin = 5,
@@ -170,6 +204,11 @@ class BaseTheme {
                               const std::function<std::string(int index)>& buttonLabel,
                               const std::function<UIIcon(int index)>& rowIcon) const;
   virtual Rect drawPopup(const GfxRenderer& renderer, const char* message) const;
+  /// Draws a centred modal option list with `title` above it and `selectedIndex` highlighted.
+  /// Does not clear the screen or push the framebuffer: it is drawn over whatever is already
+  /// there (see OptionPopup in src/components/).
+  virtual void drawOptionPopup(const GfxRenderer& renderer, const char* title, const std::vector<std::string>& options,
+                               int selectedIndex) const;
   virtual void fillPopupProgress(const GfxRenderer& renderer, const Rect& layout, const int progress) const;
   virtual void drawStatusBar(GfxRenderer& renderer, const float bookProgress, const int currentPage,
                              const int pageCount, std::string title, const int paddingBottom = 0,

@@ -13,9 +13,11 @@
 #include "fontIds.h"
 
 namespace {
-// Editable fields: Name, URL, Username, Password.
+// Editable fields: Name, URL, Username, Password, Verify TLS.
 // Existing servers also show a Delete option (BASE_ITEMS + 1).
-constexpr int BASE_ITEMS = 4;
+constexpr int BASE_ITEMS = 5;
+constexpr int VERIFY_TLS_INDEX = 4;
+constexpr int DELETE_INDEX = BASE_ITEMS;
 }  // namespace
 
 int OpdsSettingsActivity::getMenuItemCount() const {
@@ -40,6 +42,14 @@ void OpdsSettingsActivity::onEnter() {
       isNewServer = true;
       serverIndex = -1;
     }
+  }
+
+  if (isNewServer) {
+    // Secure by default: a server being typed in here is usually a hosted HTTPS catalog whose
+    // username/password are a long-lived credential, so verify the certificate unless the user
+    // explicitly turns it off for a self-signed server. Servers loaded from an existing
+    // opds.json keep whatever they were saved with (see OpdsServer::verifyTls).
+    editServer.verifyTls = true;
   }
 
   requestUpdate();
@@ -156,7 +166,12 @@ void OpdsSettingsActivity::handleSelection() {
     startActivityForResult(std::make_unique<KeyboardEntryActivity>(renderer, mappedInput, tr(STR_PASSWORD),
                                                                    editServer.password, 63, InputType::Password),
                            handler);
-  } else if (selectedIndex == 4 && !isNewServer) {
+  } else if (selectedIndex == VERIFY_TLS_INDEX) {
+    // Plain toggle -- no keyboard entry needed, so flip and persist in place.
+    editServer.verifyTls = !editServer.verifyTls;
+    saveServer();
+    requestUpdate();
+  } else if (selectedIndex == DELETE_INDEX && !isNewServer) {
     // Delete flow is only available for existing servers.
     if (!OPDS_STORE.removeServer(static_cast<size_t>(serverIndex))) {
       LOG_ERR("OPS", "Failed to remove OPDS server at index %d", serverIndex);
@@ -186,7 +201,7 @@ void OpdsSettingsActivity::render(RenderLock&&) {
   const int menuItems = getMenuItemCount();
 
   const StrId fieldNames[] = {StrId::STR_SERVER_NAME, StrId::STR_OPDS_SERVER_URL, StrId::STR_USERNAME,
-                              StrId::STR_PASSWORD};
+                              StrId::STR_PASSWORD, StrId::STR_VERIFY_TLS};
 
   GUI.drawList(
       renderer, Rect{0, contentTop, pageWidth, contentHeight}, menuItems, static_cast<int>(selectedIndex),
@@ -206,6 +221,8 @@ void OpdsSettingsActivity::render(RenderLock&&) {
           return editServer.username.empty() ? std::string(tr(STR_NOT_SET)) : editServer.username;
         } else if (index == 3) {
           return editServer.password.empty() ? std::string(tr(STR_NOT_SET)) : std::string("******");
+        } else if (index == VERIFY_TLS_INDEX) {
+          return std::string(editServer.verifyTls ? tr(STR_STATE_ON) : tr(STR_STATE_OFF));
         }
         return std::string("");
       },
