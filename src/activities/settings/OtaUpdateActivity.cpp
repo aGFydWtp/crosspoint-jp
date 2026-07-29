@@ -139,11 +139,6 @@ void OtaUpdateActivity::render(RenderLock&&) {
 }
 
 void OtaUpdateActivity::loop() {
-  // TODO @ngxson : refactor this logic later
-  if (updater.getRender()) {
-    requestUpdate();
-  }
-
   if (state == WAITING_CONFIRMATION) {
     if (mappedInput.wasPressed(MappedInputManager::Button::Confirm)) {
       LOG_DBG("OTA", "New update available, starting download...");
@@ -152,7 +147,14 @@ void OtaUpdateActivity::loop() {
         state = UPDATE_IN_PROGRESS;
       }
       requestUpdateAndWait();
-      const auto res = updater.installUpdate();
+      const auto res = updater.installUpdate(
+          [](void* ctx) {
+            // immediate=true notifies the render task directly. The default deferred path only
+            // sets a flag consumed at the end of ActivityManager::loop(), which never runs while
+            // installUpdate() blocks this task.
+            static_cast<OtaUpdateActivity*>(ctx)->requestUpdate(true);
+          },
+          this);
 
       if (res != OtaUpdater::OK) {
         LOG_DBG("OTA", "Update failed: %d", res);

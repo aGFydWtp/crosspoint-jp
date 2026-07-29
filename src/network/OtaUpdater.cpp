@@ -2,64 +2,29 @@
 
 // clang-format off
 // HttpDownloader.h pulls Arduino/SdFat, whose macros collide with lwip's
-// ip4_addr.h unless seen before esp_http_client (which includes lwip). Pin this
-// order; clang-format would otherwise sort the local header last and break the
-// build.
+// ip4_addr.h unless seen first. Pin this order; clang-format would otherwise sort
+// the local header last and break the build.
 #include "HttpDownloader.h"
 #include <Logging.h>
 #include <ReleaseJsonParser.h>
-#include <esp_http_client.h>
-#include <esp_https_ota.h>
+#include <esp_ota_ops.h>
 #include <esp_wifi.h>
 // clang-format on
 
-#include <cstring>
 #include <string>
 
 namespace {
-constexpr char latestReleaseUrl[] = "https://api.github.com/repos/zrn-ns/crosspoint-jp/releases/latest";
-
-/*
- * When esp_crt_bundle.h included, it is pointing wrong header file
- * which is something under WifiClientSecure because of our framework based on arduno platform.
- * To manage this obstacle, don't include anything, just extern and it will point correct one.
- */
-extern "C" {
-extern esp_err_t esp_crt_bundle_attach(void* conf);
-}
-
-bool parseSemver3(const char* version, int* major, int* minor, int* patch) {
-  if (!version || !major || !minor || !patch) {
-    return false;
-  }
-  const char* p = version;
-  if (*p == 'v' || *p == 'V') {
-    p++;
-  }
-  return sscanf(p, "%d.%d.%d", major, minor, patch) == 3;
-}
-
-esp_err_t http_client_set_header_cb(esp_http_client_handle_t http_client) {
-  return esp_http_client_set_header(http_client, "User-Agent", "CrossPoint-ESP32-" CROSSPOINT_VERSION);
-}
-} /* namespace */
+constexpr char latestReleaseUrl[] = "https://api.github.com/repos/crosspoint-reader/crosspoint-reader/releases/latest";
+}  // namespace
 
 OtaUpdater::OtaUpdaterError OtaUpdater::checkForUpdate() {
   LOG_DBG("OTA", "Checking for update (current: %s)", CROSSPOINT_VERSION);
 
-  updateAvailable = false;
-  latestVersion.clear();
-  otaUrl.clear();
-  otaSize = 0;
-  processedSize = 0;
-  totalSize = 0;
-
-  // Stream the release JSON straight into the parser as it arrives.
+  // Stream the ~32KB release JSON straight into the parser as it arrives.
   // Buffering the whole body in a std::string would add a growing allocation
   // on top of the TLS session's heap during the fetch; with -fno-exceptions an
-  // OOM there aborts. The old ArduinoJson + esp_http_client event_handler path
-  // also silently dropped chunked-transfer responses. HttpDownloader::fetchUrl
-  // handles verified-https GET, redirects, and User-Agent for us.
+  // OOM there aborts. fetchUrl handles the verified-https GET, redirects, and
+  // User-Agent (see HttpDownloader).
   ReleaseJsonParser releaseParser;
   const bool ok = HttpDownloader::fetchUrl(latestReleaseUrl, [&releaseParser](const uint8_t* data, size_t len) {
     releaseParser.feed(reinterpret_cast<const char*>(data), len);
@@ -89,7 +54,8 @@ OtaUpdater::OtaUpdaterError OtaUpdater::checkForUpdate() {
   totalSize = otaSize;
   updateAvailable = true;
 
-  LOG_DBG("OTA", "Found update: %s, asset size=%u", latestVersion.c_str(), static_cast<unsigned int>(otaSize));
+  LOG_DBG("OTA", "Found update: tag=%s size=%zu", latestVersion.c_str(), otaSize);
+  LOG_DBG("OTA", "Firmware URL: %s", otaUrl.c_str());
   return OK;
 }
 
@@ -104,11 +70,8 @@ bool OtaUpdater::isUpdateNewer() const {
   const auto currentVersion = CROSSPOINT_VERSION;
 
   // semantic version check (only match on 3 segments)
-  if (!parseSemver3(latestVersion.c_str(), &latestMajor, &latestMinor, &latestPatch) ||
-      !parseSemver3(currentVersion, &currentMajor, &currentMinor, &currentPatch)) {
-    LOG_ERR("OTA", "Version parse failed: current=%s, latest=%s", currentVersion, latestVersion.c_str());
-    return false;
-  }
+  sscanf(latestVersion.c_str(), "%d.%d.%d", &latestMajor, &latestMinor, &latestPatch);
+  sscanf(currentVersion, "%d.%d.%d", &currentMajor, &currentMinor, &currentPatch);
 
   /*
    * Compare major versions.
@@ -141,79 +104,72 @@ bool OtaUpdater::isUpdateNewer() const {
 
 const std::string& OtaUpdater::getLatestVersion() const { return latestVersion; }
 
-OtaUpdater::OtaUpdaterError OtaUpdater::installUpdate() {
+OtaUpdater::OtaUpdaterError OtaUpdater::installUpdate(ProgressCallback onProgress, void* ctx) {
   if (!isUpdateNewer()) {
     return UPDATE_OLDER_ERROR;
   }
 
-  esp_https_ota_handle_t ota_handle = NULL;
-  esp_err_t esp_err;
-  /* Signal for OtaUpdateActivity */
-  render = false;
+  // esp_https_ota is hardwired to esp-tls/mbedTLS, whose precompiled build on this
+  // package can't negotiate TLS 1.3 (see SecureClient.h). Drive the OTA partition
+  // ourselves and stream the firmware through HttpDownloader, which runs over
+  // wolfSSL when FREEINK_NET_WOLFSSL is set, reusing its redirect handling for the
+  // GitHub -> CDN hop.
+  const esp_partition_t* updatePartition = esp_ota_get_next_update_partition(nullptr);
+  if (!updatePartition) {
+    LOG_ERR("OTA", "No OTA partition available");
+    return INTERNAL_UPDATE_ERROR;
+  }
 
-  esp_http_client_config_t client_config = {
-      .url = otaUrl.c_str(),
-      .timeout_ms = 15000,
-      // 4096 holds the github->CDN redirect headers (the 512 default truncates
-      // them); TX only carries our GET. Both are contiguous blocks contending
-      // with the TLS handshake on a tight internal arena, so keep them minimal.
-      .buffer_size = 4096,
-      .buffer_size_tx = 1024,
-      .skip_cert_common_name_check = true,
-      .crt_bundle_attach = esp_crt_bundle_attach,
-      .keep_alive_enable = true,
-  };
-
-  esp_https_ota_config_t ota_config = {
-      .http_config = &client_config,
-      .http_client_init_cb = http_client_set_header_cb,
-  };
+  esp_ota_handle_t otaHandle = 0;
+  esp_err_t esp_err = esp_ota_begin(updatePartition, OTA_SIZE_UNKNOWN, &otaHandle);
+  if (esp_err != ESP_OK) {
+    LOG_ERR("OTA", "esp_ota_begin failed: %s", esp_err_to_name(esp_err));
+    return INTERNAL_UPDATE_ERROR;
+  }
 
   /* For better timing and connectivity, we disable power saving for WiFi */
   esp_wifi_set_ps(WIFI_PS_NONE);
 
-  esp_err = esp_https_ota_begin(&ota_config, &ota_handle);
-  if (esp_err != ESP_OK) {
-    LOG_DBG("OTA", "HTTP OTA Begin Failed: %s", esp_err_to_name(esp_err));
-    return INTERNAL_UPDATE_ERROR;
-  }
-
+  processedSize = 0;
   int lastReportedPct = -1;
-  do {
-    esp_err = esp_https_ota_perform(ota_handle);
-    processedSize = esp_https_ota_get_image_len_read(ota_handle);
-    // OtaUpdateActivity への render 要求を 1% 変化時のみに throttle する。
-    // 従来は毎 ~100ms perform iteration 毎に render を立てていて、render task の
-    // framebuffer 描画が TLS session と同じ内部 arena を奪い合い OOM を助長していた。
-    // E-ink は 1% tick より速く再描画できないのでこれで十分。
-    if (totalSize > 0) {
+  bool flashOk = true;
+  const bool fetchOk = HttpDownloader::fetchUrl(otaUrl, [&](const uint8_t* data, size_t len) {
+    if (esp_ota_write(otaHandle, data, len) != ESP_OK) {
+      flashOk = false;
+      return false;  // abort the transfer
+    }
+    processedSize += len;
+    // Fire the callback only on whole-percent change. Per-chunk updates wake the
+    // render task, whose framebuffer work contends with TLS on the internal arena,
+    // and e-ink can't repaint faster than a percent tick anyway.
+    if (onProgress && totalSize > 0) {
       const int pct = static_cast<int>(static_cast<uint64_t>(processedSize) * 100 / totalSize);
       if (pct != lastReportedPct) {
         lastReportedPct = pct;
-        render = true;
+        onProgress(ctx);
       }
     }
-    delay(100);  // TODO: should we replace this with something better?
-  } while (esp_err == ESP_ERR_HTTPS_OTA_IN_PROGRESS);
+    return true;
+  });
 
   /* Return back to default power saving for WiFi in case of failing */
   esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
 
-  if (esp_err != ESP_OK) {
-    LOG_ERR("OTA", "esp_https_ota_perform Failed: %s", esp_err_to_name(esp_err));
-    esp_https_ota_finish(ota_handle);
-    return HTTP_ERROR;
+  if (!fetchOk || !flashOk) {
+    LOG_ERR("OTA", "Firmware install failed (%s)", flashOk ? "download" : "flash write");
+    esp_ota_abort(otaHandle);
+    return flashOk ? HTTP_ERROR : INTERNAL_UPDATE_ERROR;
   }
 
-  if (!esp_https_ota_is_complete_data_received(ota_handle)) {
-    LOG_ERR("OTA", "esp_https_ota_is_complete_data_received Failed: %s", esp_err_to_name(esp_err));
-    esp_https_ota_finish(ota_handle);
+  esp_err = esp_ota_end(otaHandle);  // verifies the written image
+  if (esp_err != ESP_OK) {
+    LOG_ERR("OTA", "esp_ota_end failed: %s", esp_err_to_name(esp_err));
     return INTERNAL_UPDATE_ERROR;
   }
 
-  esp_err = esp_https_ota_finish(ota_handle);
+  esp_err = esp_ota_set_boot_partition(updatePartition);
   if (esp_err != ESP_OK) {
-    LOG_ERR("OTA", "esp_https_ota_finish Failed: %s", esp_err_to_name(esp_err));
+    LOG_ERR("OTA", "esp_ota_set_boot_partition failed: %s", esp_err_to_name(esp_err));
     return INTERNAL_UPDATE_ERROR;
   }
 
