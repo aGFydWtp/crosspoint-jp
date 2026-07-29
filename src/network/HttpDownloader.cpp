@@ -31,11 +31,16 @@ int HttpDownloader::lastHttpCode = 0;
 
 namespace {
 #if !defined(FREEINK_NET_WOLFSSL)
-// RX holds the response headers. Smaller buffers leave enough contiguous heap
-// for mbedTLS on redirect-heavy OPDS feeds while still preserving the headers
-// we read directly (Location, Content-Length).
-constexpr int HTTP_RX_BUF = 2048;
-constexpr int HTTP_TX_BUF = 512;
+// RX holds the response headers; TX must fit the whole request line.
+// fork: upstream shrank these to 2048/512, but upstream routes OTA/large
+// downloads through wolfSSL (runGetWolf) — here runGet carries them too.
+// GitHub's release CDN redirect target (objects.githubusercontent.com) is a
+// signed URL whose path+query runs 700-900 bytes, so the redirected GET's
+// request line overflows a 512-byte TX buffer and the reopen fails before any
+// byte arrives. 4096/1024 is the configuration that fully downloaded the 6MB
+// image on this device (see #2074 cherry-pick 0d40ec1a).
+constexpr int HTTP_RX_BUF = 4096;
+constexpr int HTTP_TX_BUF = 1024;
 #endif
 // Per-socket-op timeout. Some OPDS download endpoints are slow to send headers
 // (>15s) and chunked catalogs stall mid-body, so 15s killed them. 60s gives
@@ -164,17 +169,20 @@ HttpDownloader::DownloadError runGet(const std::string& url, const std::string& 
   esp_err_t err = esp_http_client_open(client, 0);
   if (err != ESP_OK) {
     LOG_ERR("HTTP", "open failed: %s", esp_err_to_name(err));
+    HttpDownloader::lastHttpCode = -static_cast<int>(err);  // fork: 負値=esp_err で診断表示
     esp_http_client_cleanup(client);
     return HttpDownloader::HTTP_ERROR;
   }
   int64_t contentLength = esp_http_client_fetch_headers(client);
   int status = esp_http_client_get_status_code(client);
   for (int hop = 0; isRedirect(status) && hop < MAX_REDIRECTS; ++hop) {
+    HttpDownloader::lastHttpCode = status;  // fork: redirect 中の失敗でも直前の status を残す
     if (esp_http_client_set_redirection(client) != ESP_OK) break;
     esp_http_client_close(client);
     err = esp_http_client_open(client, 0);
     if (err != ESP_OK) {
       LOG_ERR("HTTP", "redirect open failed: %s", esp_err_to_name(err));
+      HttpDownloader::lastHttpCode = -static_cast<int>(err);  // fork: 負値=esp_err で診断表示
       esp_http_client_cleanup(client);
       return HttpDownloader::HTTP_ERROR;
     }
