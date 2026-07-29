@@ -128,6 +128,19 @@ void OtaUpdateActivity::render(RenderLock&&) {
     GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
   } else if (state == FAILED) {
     renderer.drawCenteredText(UI_10_FONT_ID, top, tr(STR_UPDATE_FAILED), true, EpdFontFamily::BOLD);
+    // シリアルが取れない環境向け診断: '|' 区切りで2行に分割して描画 (画面幅に収まるよう)
+    const auto& detail = updater.getLastErrorDetail();
+    if (!detail.empty()) {
+      const auto pipe = detail.find('|');
+      const int row1 = top + height + metrics.verticalSpacing;
+      if (pipe == std::string::npos) {
+        renderer.drawCenteredText(UI_10_FONT_ID, row1, detail.c_str());
+      } else {
+        renderer.drawCenteredText(UI_10_FONT_ID, row1, detail.substr(0, pipe).c_str());
+        renderer.drawCenteredText(UI_10_FONT_ID, row1 + height + metrics.verticalSpacing,
+                                  detail.substr(pipe + 1).c_str());
+      }
+    }
     const auto labels = mappedInput.mapLabels(tr(STR_BACK), "", "", "");
     GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
   } else if (state == FINISHED) {
@@ -139,11 +152,6 @@ void OtaUpdateActivity::render(RenderLock&&) {
 }
 
 void OtaUpdateActivity::loop() {
-  // TODO @ngxson : refactor this logic later
-  if (updater.getRender()) {
-    requestUpdate();
-  }
-
   if (state == WAITING_CONFIRMATION) {
     if (mappedInput.wasPressed(MappedInputManager::Button::Confirm)) {
       LOG_DBG("OTA", "New update available, starting download...");
@@ -152,7 +160,14 @@ void OtaUpdateActivity::loop() {
         state = UPDATE_IN_PROGRESS;
       }
       requestUpdateAndWait();
-      const auto res = updater.installUpdate();
+      const auto res = updater.installUpdate(
+          [](void* ctx) {
+            // immediate=true notifies the render task directly. The default deferred path only
+            // sets a flag consumed at the end of ActivityManager::loop(), which never runs while
+            // installUpdate() blocks this task.
+            static_cast<OtaUpdateActivity*>(ctx)->requestUpdate(true);
+          },
+          this);
 
       if (res != OtaUpdater::OK) {
         LOG_DBG("OTA", "Update failed: %d", res);

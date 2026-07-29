@@ -79,6 +79,11 @@ def get_version_from_git_tag(project_dir):
 
 
 def get_base_version(project_dir):
+    # Env var override (OTA test / debug): highest priority
+    override = os.environ.get('OTA_TEST_VERSION')
+    if override:
+        return override
+
     # Prefer version from latest git tag (single source of truth)
     git_version = get_version_from_git_tag(project_dir)
     if git_version:
