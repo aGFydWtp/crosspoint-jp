@@ -317,12 +317,12 @@ bool AozoraActivity::downloadBook() {
     return false;
   }
 
-  auto result = HttpDownloader::downloadToFile(std::string(url), std::string(destPath),
-                                               [this](size_t downloaded, size_t total) {
-                                                 downloadProgress_ = downloaded;
-                                                 downloadTotal_ = total;
-                                                 requestUpdate(true);
-                                               });
+  auto result =
+      HttpDownloader::downloadToFile(std::string(url), std::string(destPath), [this](size_t downloaded, size_t total) {
+        downloadProgress_ = downloaded;
+        downloadTotal_ = total;
+        requestUpdate(true);
+      });
 
   if (result != HttpDownloader::OK) {
     LOG_ERR("AOZORA", "Download failed: err=%d http=%d", static_cast<int>(result), HttpDownloader::lastHttpCode);
@@ -372,12 +372,12 @@ bool AozoraActivity::updateBook() {
   Storage.remove(tmpPath);
 
   // 一時ファイルにダウンロード（既存ファイルはこの時点では無傷）
-  auto result = HttpDownloader::downloadToFile(std::string(url), std::string(tmpPath),
-                                               [this](size_t downloaded, size_t total) {
-                                                 downloadProgress_ = downloaded;
-                                                 downloadTotal_ = total;
-                                                 requestUpdate(true);
-                                               });
+  auto result =
+      HttpDownloader::downloadToFile(std::string(url), std::string(tmpPath), [this](size_t downloaded, size_t total) {
+        downloadProgress_ = downloaded;
+        downloadTotal_ = total;
+        requestUpdate(true);
+      });
 
   if (result != HttpDownloader::OK) {
     LOG_ERR("AOZORA", "Update download failed: err=%d http=%d", static_cast<int>(result), HttpDownloader::lastHttpCode);
