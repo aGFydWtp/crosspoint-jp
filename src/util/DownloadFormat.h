@@ -32,9 +32,11 @@ std::string parseContentDispositionFilename(const std::string& contentDispositio
 /**
  * Determines the download format using, in priority order:
  *   1. The extension of `dispositionFilename` (from parseContentDispositionFilename()).
- *   2. `mediaType` (application/epub+zip -> EPUB, application/vnd.xteink.xtc -> XTC；
+ *   2. `mediaType`, compared case-insensitively and ignoring any parameters: application/epub+zip
+ *      -> EPUB, application/vnd.xteink.xtc and application/x-xtc+zip -> XTC,
+ *      application/vnd.xteink.xtch and application/x-xtch+zip -> XTCH.
  *      application/octet-stream is deliberately not treated as a signal here, since html2xtc uses it
- *      as a generic fallback content type for both EPUB and XTC).
+ *      as a generic fallback content type for both EPUB and XTC.
  *   3. The extension of `href` (query string stripped first).
  * Returns UNKNOWN if none of the above yields a recognized extension.
  */

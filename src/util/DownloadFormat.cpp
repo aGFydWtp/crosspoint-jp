@@ -155,16 +155,28 @@ DownloadFormat detectFormat(const std::string& dispositionFilename, const std::s
   if (format != DownloadFormat::UNKNOWN) return format;
 
   // Compare only the media type itself, ignoring any trailing parameters (e.g.
-  // "application/epub+zip; charset=binary").
+  // "application/epub+zip; charset=binary") and surrounding whitespace.
   std::string mediaTypeMain = mediaType;
   const size_t paramPos = mediaTypeMain.find(';');
   if (paramPos != std::string::npos) mediaTypeMain.resize(paramPos);
+  while (!mediaTypeMain.empty() && (mediaTypeMain.front() == ' ' || mediaTypeMain.front() == '\t')) {
+    mediaTypeMain.erase(mediaTypeMain.begin());
+  }
   while (!mediaTypeMain.empty() && (mediaTypeMain.back() == ' ' || mediaTypeMain.back() == '\t')) {
     mediaTypeMain.pop_back();
   }
 
-  if (mediaTypeMain == "application/epub+zip") return DownloadFormat::EPUB;
-  if (mediaTypeMain == "application/vnd.xteink.xtc") return DownloadFormat::XTC;
+  // Compared case-insensitively: MIME types are case-insensitive per RFC 2045, and both the
+  // XTEink vendor tree and the experimental "+zip" spelling are in use for XTC/XTCH. Keep this
+  // table in sync with formatFromMimeType() in lib/OpdsParser/OpdsParser.cpp, which applies the
+  // same set to the feed's own `type` attribute.
+  if (ciEquals(mediaTypeMain, "application/epub+zip")) return DownloadFormat::EPUB;
+  if (ciEquals(mediaTypeMain, "application/vnd.xteink.xtc") || ciEquals(mediaTypeMain, "application/x-xtc+zip")) {
+    return DownloadFormat::XTC;
+  }
+  if (ciEquals(mediaTypeMain, "application/vnd.xteink.xtch") || ciEquals(mediaTypeMain, "application/x-xtch+zip")) {
+    return DownloadFormat::XTCH;
+  }
   // application/octet-stream is intentionally not used as a signal here.
 
   std::string path = href;

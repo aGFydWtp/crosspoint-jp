@@ -2,6 +2,7 @@
 #include <Print.h>
 #include <expat.h>
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -14,15 +15,38 @@ enum class OpdsEntryType {
 };
 
 /**
+ * Acquisition format declared by an OPDS feed for a book's download link.
+ *
+ * This records only what the *feed* claims. The format a download is actually saved as is
+ * resolved from the HTTP response at download time (see DownloadFormat in src/util/), which is
+ * more reliable; this enum is the last-resort fallback and drives the format-selection UI when a
+ * single entry offers more than one format.
+ */
+enum class OpdsAcquisitionFormat : uint8_t { UNKNOWN, EPUB, XTC, XTCH };
+
+/**
+ * A single `rel="...opds-spec.org/acquisition"` link belonging to a book entry.
+ */
+struct OpdsAcquisitionLink {
+  std::string href;
+  OpdsAcquisitionFormat format = OpdsAcquisitionFormat::UNKNOWN;
+};
+
+/// Short label for a format ("EPUB", "XTC", "XTCH"), or "" for UNKNOWN. Deliberately not run
+/// through tr(): these are file format names and are identical in every language.
+const char* opdsAcquisitionLabel(OpdsAcquisitionFormat format);
+
+/**
  * Represents an entry from an OPDS feed (either a navigation link or a book).
  */
 struct OpdsEntry {
   OpdsEntryType type = OpdsEntryType::NAVIGATION;
   std::string title;
-  std::string author;     // Only for books
-  std::string href;       // Navigation URL or download URL
-  std::string mediaType;  // Acquisition link "type" attribute (e.g. application/epub+zip). Only for books.
+  std::string author;  // Only for books
+  std::string href;    // Navigation URL only; books carry their download URLs in acquisitionLinks
   std::string id;
+  // Books only: at most one link per supported format, in feed order.
+  std::vector<OpdsAcquisitionLink> acquisitionLinks;
 };
 
 // Legacy alias for backward compatibility
@@ -95,10 +119,17 @@ class OpdsParser final : public Print {
   // Helper to find attribute value
   static const char* findAttribute(const XML_Char** atts, const char* name);
 
+  // Records an acquisition link on currentEntry if its format is recognized, not already present,
+  // and still within the link-count and aggregate href budgets. Silently ignored otherwise.
+  void addAcquisitionLink(const char* type, const char* href);
+
   XML_Parser parser = nullptr;
   std::vector<OpdsEntry> entries;
   OpdsEntry currentEntry;
   std::string currentText;
+  // Total href bytes held across every stored acquisition link, used to bound the parser's peak
+  // DRAM footprint now that one entry can hold several links.
+  size_t acquisitionHrefChars = 0;
 
   // Parser state
   bool inEntry = false;

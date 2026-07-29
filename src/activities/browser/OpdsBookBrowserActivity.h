@@ -8,11 +8,12 @@
 
 #include "../Activity.h"
 #include "OpdsServerStore.h"
+#include "components/OptionPopup.h"
 #include "util/ButtonNavigator.h"
 
 /**
  * Activity for browsing and downloading books from an OPDS server.
- * Supports navigation through catalog hierarchy and downloading EPUBs.
+ * Supports navigation through catalog hierarchy and downloading books (EPUB, XTC, XTCH).
  */
 class OpdsBookBrowserActivity final : public Activity {
  public:
@@ -28,6 +29,8 @@ class OpdsBookBrowserActivity final : public Activity {
 
  private:
   ButtonNavigator buttonNavigator;
+  // Shown only when the selected entry offers more than one supported acquisition format.
+  OptionPopup formatPopup;
   BrowserState state = BrowserState::LOADING;
   std::vector<OpdsEntry> entries;
   std::vector<std::string> navigationHistory;
@@ -69,7 +72,10 @@ class OpdsBookBrowserActivity final : public Activity {
   void fetchFeed(const std::string& path);
   void navigateToEntry(const OpdsEntry& entry);
   void navigateBack();
-  void downloadBook(const OpdsEntry& book);
+  // Entry point for the Confirm action on a book: downloads straight away when the entry offers a
+  // single format, otherwise raises formatPopup and defers downloadBook() to its callback.
+  void chooseBookFormat(const OpdsEntry& book);
+  void downloadBook(const OpdsEntry& book, const OpdsAcquisitionLink& acquisition);
   void launchSearch();
   void performSearch(const std::string& query);
   // Populates downloadedByHash from a single listing of /XTCFiles. Only called when
