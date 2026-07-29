@@ -2,6 +2,7 @@
 
 #include <ArduinoJson.h>
 #include <GfxRenderer.h>
+#include <HalGPIO.h>
 #include <I18n.h>
 #include <Logging.h>
 #include <WiFi.h>
@@ -97,12 +98,32 @@ void Html2XtcPairingActivity::beginCreating() {
 }
 
 void Html2XtcPairingActivity::createPairing() {
-  // No on-device API distinguishes X3 vs X4 hardware; a fixed generic name is an accepted
-  // fallback for the pairing request per the integration spec.
-  requestedName = "Xteink";
+  // Report the hardware identity so the server can warn when a book converted for one panel is
+  // about to be sent to a device with a different geometry. Two independent facts are sent: the
+  // model label (gpio.deviceIsX3(), the same detection main.cpp logs at boot) and the panel's
+  // native resolution, which is what the warning actually compares.
+  //
+  // The resolution is normalized to portrait (short edge = width) to match the axis order of
+  // xtctool's [output] config on the server. getDisplayWidth()/getDisplayHeight() report the
+  // panel in landscape (X3 792x528, X4 800x480) and are already correct here: HalDisplay::begin()
+  // applies the X3 geometry at boot, long before any activity runs.
+  const bool isX3 = gpio.deviceIsX3();
+  const uint16_t displayW = renderer.getDisplayWidth();
+  const uint16_t displayH = renderer.getDisplayHeight();
+  const uint16_t shortEdge = (displayW < displayH) ? displayW : displayH;
+  const uint16_t longEdge = (displayW < displayH) ? displayH : displayW;
+
+  requestedName = isX3 ? "Xteink X3" : "Xteink X4";
 
   const std::string url = buildApiUrl(kPairingsPath);
-  const std::string body = std::string("{\"requestedName\":\"") + requestedName + "\"}";
+  // Fixed stack buffer instead of string concatenation: every field is a literal or a uint16_t,
+  // so the maximum length is known at compile time. Servers that predate the extra fields ignore
+  // them -- the create endpoint only validates requestedName.
+  char bodyBuf[128];
+  snprintf(bodyBuf, sizeof(bodyBuf), "{\"requestedName\":\"%s\",\"deviceModel\":\"%s\",\"width\":%u,\"height\":%u}",
+           requestedName.c_str(), isX3 ? "x3" : "x4", static_cast<unsigned>(shortEdge),
+           static_cast<unsigned>(longEdge));
+  const std::string body(bodyBuf);
   std::string response;
   int retryAfterSeconds = 0;
 
@@ -137,7 +158,8 @@ void Html2XtcPairingActivity::createPairing() {
       return;
     }
 
-    LOG_DBG("XTC", "Pairing created: id=%s pollIntervalSeconds=%d", pairingId.c_str(), pollIntervalSeconds);
+    LOG_DBG("XTC", "Pairing created: id=%s model=%s %ux%u pollIntervalSeconds=%d", pairingId.c_str(),
+            isX3 ? "x3" : "x4", static_cast<unsigned>(shortEdge), static_cast<unsigned>(longEdge), pollIntervalSeconds);
     state = WAITING_APPROVAL;
     lastPollMs = millis();
     consecutiveFailures = 0;
