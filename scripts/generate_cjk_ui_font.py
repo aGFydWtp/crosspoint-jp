@@ -9,6 +9,7 @@ Usage:
 
 import argparse
 import glob
+import re
 import sys
 from pathlib import Path
 
@@ -56,16 +57,19 @@ def extract_chars_from_translations(translations_dir):
 
 
 # Extract unique characters
-def get_unique_chars(base_text, translations_dir=None, codepoints_file=None):
+def get_unique_chars(base_text, translations_dir=None, codepoints_files=None):
     chars = set()
     for c in base_text:
+        # NOTE: c.strip() drops whitespace, so U+3000 (ideographic space) can
+        # never be added through BASE_UI_CHARS. Put such characters in a
+        # --codepoints-file instead.
         if c.strip() and ord(c) >= 0x20:
             chars.add(c)
     if translations_dir:
         i18n_chars = extract_chars_from_translations(translations_dir)
         chars.update(i18n_chars)
         print(f"  Extracted {len(i18n_chars)} characters from translations")
-    if codepoints_file:
+    for codepoints_file in codepoints_files or []:
         cp_chars = set()
         with open(codepoints_file, "r") as f:
             for line in f:
@@ -79,16 +83,72 @@ def get_unique_chars(base_text, translations_dir=None, codepoints_file=None):
                 except ValueError:
                     pass
         chars.update(cp_chars)
-        print(f"  Added {len(cp_chars)} characters from codepoints file")
+        print(f"  Added {len(cp_chars)} characters from {codepoints_file}")
     return sorted(chars, key=ord)
 
-def load_font_fitting_cell(font_path, pixel_size):
+
+def get_font_cmap(font_path):
+    """Return the set of codepoints the font actually covers, or None if unavailable.
+
+    Pillow silently renders .notdef (a tofu box) for uncovered codepoints, which
+    is indistinguishable from a real glyph by looking at the bitmap. fontTools is
+    the only reliable way to tell the two apart.
+    """
+    try:
+        from fontTools.ttLib import TTFont
+    except ImportError:
+        print("Warning: fontTools not installed, cannot detect uncovered codepoints")
+        return None
+    cmap = set()
+    tt = TTFont(font_path, fontNumber=0)
+    for table in tt["cmap"].tables:
+        cmap |= set(table.cmap.keys())
+    return cmap
+
+
+def load_inherited_glyphs(header_path, bytes_per_char):
+    """Load codepoint -> bitmap bytes from a previously generated header.
+
+    Used to keep glyphs that the new source font cannot render (e.g. Latin
+    Extended / Cyrillic characters missing from a region-specific subset OTF).
+    """
+    content = Path(header_path).read_text(encoding="utf-8")
+    cp_match = re.search(r"CJK_UI_CODEPOINTS\[\] PROGMEM = \{(.*?)\};", content, re.S)
+    glyph_match = re.search(r"CJK_UI_GLYPHS\[\] PROGMEM = \{(.*?)\n\};", content, re.S)
+    if not cp_match or not glyph_match:
+        print(f"Warning: could not parse {header_path}, inheritance disabled")
+        return {}
+    codepoints = [int(x, 16) for x in re.findall(r"0x([0-9A-Fa-f]{4})", cp_match.group(1))]
+    data = [int(x, 16) for x in re.findall(r"0x([0-9A-Fa-f]{2}),", glyph_match.group(1))]
+    if len(data) != len(codepoints) * bytes_per_char:
+        print(f"Warning: {header_path} has incompatible glyph size, inheritance disabled")
+        return {}
+    return {cp: data[i * bytes_per_char : (i + 1) * bytes_per_char] for i, cp in enumerate(codepoints)}
+
+
+def load_font_fitting_cell(font_path, pixel_size, force_pt=None, force_descent=None):
     """Load a font and shrink it until ascent fits the cell height.
 
     Only ascent is required to fit; descent may be clipped at the bottom.
     CJK glyphs rarely use descender space, so this keeps the visual size
     consistent across font weights (e.g. Medium vs Bold).
+
+    force_pt / force_descent override the automatic fit. Different releases of
+    Source Han Sans report very different hhea metrics (880/-120 vs 1160/-288),
+    which would otherwise change the glyph size and baseline for the whole UI.
+    Pin them to reproduce the metrics of an already shipped header.
     """
+    if force_pt is not None:
+        try:
+            font = ImageFont.truetype(font_path, force_pt)
+        except Exception as e:
+            print(f"Error loading font: {e}")
+            return None, None, None, None
+        ascent, descent = font.getmetrics()
+        if force_descent is not None:
+            descent = force_descent
+        return font, force_pt, ascent, descent
+
     pt_size = max(1, int(pixel_size))
     while pt_size > 0:
         try:
@@ -102,25 +162,37 @@ def load_font_fitting_cell(font_path, pixel_size):
         pt_size -= 1
     return None, None, None, None
 
-def generate_font_header(font_path, pixel_size, output_path, translations_dir=None, codepoints_file=None):
+def generate_font_header(font_path, pixel_size, output_path, translations_dir=None, codepoints_files=None,
+                         force_pt=None, force_descent=None, inherit_header=None):
     """Generate CJK UI font header file."""
 
-    font, pt_size, ascent, descent = load_font_fitting_cell(font_path, pixel_size)
+    font, pt_size, ascent, descent = load_font_fitting_cell(font_path, pixel_size, force_pt, force_descent)
     if font is None:
         return False
 
-    chars = get_unique_chars(BASE_UI_CHARS, translations_dir, codepoints_file)
+    chars = get_unique_chars(BASE_UI_CHARS, translations_dir, codepoints_files)
     print(f"Generating {pixel_size}x{pixel_size} font with {len(chars)} characters...")
+
+    bytes_per_row = (pixel_size + 7) // 8
+    bytes_per_char = bytes_per_row * pixel_size
+
+    inherited = {}
+    font_cmap = None
+    if inherit_header and Path(inherit_header).exists():
+        inherited = load_inherited_glyphs(inherit_header, bytes_per_char)
+        font_cmap = get_font_cmap(font_path)
+        print(f"  Loaded {len(inherited)} glyphs from {inherit_header} for inheritance")
 
     # Collect glyph data
     codepoints = []
     widths = []
     bitmaps = []
+    inherited_cps = []
+    uncovered_cps = []
 
-    # Get font metrics for consistent vertical alignment
-    font_height = ascent + descent
     # Fixed baseline (from top): align all glyphs to the same baseline to avoid jitter
     baseline = pixel_size - descent
+    print(f"  Metrics: pt={pt_size} ascent={ascent} descent={descent} baseline={baseline}")
 
     for char in chars:
         cp = ord(char)
@@ -156,7 +228,6 @@ def generate_font_header(font_path, pixel_size, output_path, translations_dir=No
             draw.text((x, y - ascent), char, font=font, fill=1)
 
         # Convert to bytes
-        bytes_per_row = (pixel_size + 7) // 8
         bitmap_bytes = []
         for row in range(pixel_size):
             for byte_idx in range(bytes_per_row):
@@ -169,6 +240,18 @@ def generate_font_header(font_path, pixel_size, output_path, translations_dir=No
                             byte_val |= (1 << (7 - bit))
                 bitmap_bytes.append(byte_val)
 
+        # The source font may not cover this character (region-specific subset
+        # OTFs drop Latin Extended / Cyrillic), in which case Pillow draws
+        # .notdef - a tofu box. Reuse the previously shipped glyph instead.
+        # Characters that are legitimately blank (U+3000 ideographic space) are
+        # absent from the inherit map and stay blank.
+        uncovered = (font_cmap is not None and cp not in font_cmap) or not any(bitmap_bytes)
+        if uncovered and cp in inherited:
+            bitmap_bytes = inherited[cp]
+            inherited_cps.append(cp)
+        elif uncovered and font_cmap is not None and cp not in font_cmap:
+            uncovered_cps.append(cp)
+
         codepoints.append(cp)
         # Calculate advance width
         if cp < 0x80:
@@ -179,18 +262,27 @@ def generate_font_header(font_path, pixel_size, output_path, translations_dir=No
             widths.append(pixel_size)
         bitmaps.append(bitmap_bytes)
 
-    # Generate header file
-    bytes_per_row = (pixel_size + 7) // 8
-    bytes_per_char = bytes_per_row * pixel_size
+    if inherited_cps:
+        print(f"  Inherited {len(inherited_cps)} glyphs missing from the source font: "
+              + " ".join(f"U+{c:04X}" for c in inherited_cps[:20])
+              + (" ..." if len(inherited_cps) > 20 else ""))
+    if uncovered_cps:
+        print(f"  WARNING: {len(uncovered_cps)} codepoints are missing from the source font and "
+              f"could not be inherited (they render as .notdef): "
+              + " ".join(f"U+{c:04X}" for c in uncovered_cps[:20])
+              + (" ..." if len(uncovered_cps) > 20 else ""))
 
     with open(output_path, 'w') as f:
         f.write(f'''/**
  * Auto-generated CJK UI font data (optimized - UI characters only)
- * Font: (see --font argument)
- * Size: {pt_size}pt
+ * Font: {Path(font_path).name}
+ * Size: {pt_size}pt (ascent={ascent} descent={descent} baseline={baseline})
  * Dimensions: {pixel_size}x{pixel_size}
  * Characters: {len(chars)}
  * Total size: {len(chars) * bytes_per_char} bytes ({len(chars) * bytes_per_char / 1024:.1f} KB)
+ *
+ * Regenerate with scripts/generate_cjk_ui_font.py - see docs/cjk-fonts.md for
+ * the exact command line (the metrics above must be reproduced).
  *
  * This is a sparse font containing only UI-required CJK characters.
  * Uses a lookup table for codepoint -> glyph index mapping.
@@ -297,8 +389,16 @@ def main():
     parser.add_argument('--output', type=str, help='Output path (default: lib/GfxRenderer/cjk_ui_font_SIZE.h)')
     parser.add_argument('--translations', type=str,
                         help='Path to translations directory (default: auto-detect from project root)')
-    parser.add_argument('--codepoints-file', type=str,
-                        help='Additional codepoints file (hex, one per line) to include in the font')
+    parser.add_argument('--codepoints-file', type=str, action='append', dest='codepoints_files',
+                        help='Additional codepoints file (hex, one per line). May be repeated.')
+    parser.add_argument('--force-pt', type=int,
+                        help='Pin the point size instead of shrinking until ascent fits the cell. '
+                             'Use to reproduce the metrics of an already shipped header.')
+    parser.add_argument('--force-descent', type=int,
+                        help='Pin the descent used for baseline placement (baseline = size - descent).')
+    parser.add_argument('--inherit-header', type=str,
+                        help='Previously generated header. Glyphs the source font cannot render are '
+                             'copied from it instead of being emitted blank.')
     args = parser.parse_args()
 
     script_dir = Path(__file__).parent
@@ -321,7 +421,8 @@ def main():
             translations_dir = str(default_dir)
             print(f"Auto-detected translations: {translations_dir}")
 
-    if generate_font_header(args.font, args.size, output_path, translations_dir, args.codepoints_file):
+    if generate_font_header(args.font, args.size, output_path, translations_dir, args.codepoints_files,
+                            args.force_pt, args.force_descent, args.inherit_header):
         print("Success!")
     else:
         print("Failed!")
