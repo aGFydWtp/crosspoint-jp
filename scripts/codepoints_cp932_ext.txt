@@ -1,4 +1,4 @@
-# CP932 (Windows-31J) vendor extensions not covered by JIS X 0208 (457 characters)
+# CP932 (Windows-31J) vendor extensions not covered by JIS X 0208 (454 characters)
 # Auto-generated from CP932 ranges 0x8740-0x879C (NEC special characters),
 # 0xED40-0xEEFC (NEC-selected IBM extensions) and 0xFA40-0xFC4B (IBM extensions),
 # minus everything already in codepoints_jis_level1.txt / codepoints_jis_level2.txt.
@@ -25,13 +25,10 @@
 2177
 2178
 2179
-2211
-221A
 221F
 2220
 2229
 222A
-222B
 222E
 2235
 2252

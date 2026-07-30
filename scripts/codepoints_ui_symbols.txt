@@ -1,5 +1,5 @@
-# Symbols and punctuation required by the UI (227 characters)
-# Hand-curated. 25 of 252 candidates were already covered by the
+# Symbols and punctuation required by the UI (225 characters)
+# Hand-curated. 25 of 250 candidates were already covered by the
 # baseline / JIS / CP932 lists and are omitted here.
 # 
 # Contents:
@@ -7,13 +7,15 @@
 #   U+30FB etc.  ・ ヮ ヰ ヱ ゐ ゑ
 #   U+FF01-FF5E  fullwidth alphanumerics and symbols
 #   U+FF61-FF9F  halfwidth katakana
-#   misc         – ‥ ′ ″ ※ ■ □ ▲ △ ▼ ▽ ◆ ◇ ○ ◎ ● ★ ☆ ← ↑ → ↓ × ÷
+#   misc         – ‥ ′ ″ ※ ■ □ ▲ △ ▼ ▽ ◆ ◇ ○ ◎ ● ★ ☆ ← ↑ → ↓
+# 
+# Non-CJK code points already covered by ubuntu_10/12 are deliberately excluded:
+# renderChar() prefers the 20x20 builtin glyph over the EPD font, which would
+# blow them up from 10/12pt to 20px.
 #   U+9DD7       鷗 (JIS X 0213 level 3; common in Japanese book titles)
 # 
 # NOTE: these must live in a codepoints file, not in BASE_UI_CHARS - the
 # generator drops whitespace via c.strip(), which would silently discard U+3000.
-00D7
-00F7
 2013
 2025
 2032

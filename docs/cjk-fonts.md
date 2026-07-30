@@ -95,7 +95,7 @@ SD card fonts.
 ## Built-in CJK UI Font
 
 The firmware embeds a pre-rendered 20×20 bitmap subset of **Source Han Sans JP
-Medium** in `lib/GfxRenderer/cjk_ui_font_20.h` (7,493 glyphs, ~440 KB of flash).
+Medium** in `lib/GfxRenderer/cjk_ui_font_20.h` (7,488 glyphs, ~440 KB of flash).
 It is the only source of CJK glyphs for UI text — the built-in UI fonts
 (`ubuntu_10/12`) contain no CJK at all, so anything missing from this header is
 drawn as `?`.
@@ -111,8 +111,8 @@ The built-in font is used when:
 | `scripts/codepoints_baseline.txt` | 3,420 — snapshot of the glyph set shipped before the JIS level 2 expansion |
 | `scripts/codepoints_jis_level1.txt` | 2,965 — JIS X 0208 level 1 kanji |
 | `scripts/codepoints_jis_level2.txt` | 3,390 — JIS X 0208 level 2 kanji |
-| `scripts/codepoints_cp932_ext.txt` | 457 — CP932 NEC/IBM extensions (髙 﨑 彅 ① № Ⅰ ㈱ …) |
-| `scripts/codepoints_ui_symbols.txt` | 227 — CJK punctuation, fullwidth alphanumerics, halfwidth katakana, ・ 〜 ※ ○ ★ ← … |
+| `scripts/codepoints_cp932_ext.txt` | 454 — CP932 NEC/IBM extensions (髙 﨑 彅 ① № Ⅰ ㈱ …) |
+| `scripts/codepoints_ui_symbols.txt` | 225 — CJK punctuation, fullwidth alphanumerics, halfwidth katakana, ・ 〜 ※ ○ ★ ← … |
 | `lib/I18n/translations/*.yaml` | every non-ASCII character used by UI strings (extracted automatically) |
 | `BASE_UI_CHARS` in the generator | ASCII, kana, common punctuation |
 
@@ -120,6 +120,13 @@ The built-in font is used when:
 build if any code point from these lists is absent from the header. Add new
 requirements to a `codepoints_*.txt` file so the check can catch regressions —
 book titles and file names are dynamic and can never be validated automatically.
+
+**Do not add non-CJK code points that `ubuntu_10/12` already covers.**
+`renderChar()` checks `hasCjkUiGlyph()` before falling back to the EPD font even
+for non-CJK characters (`GfxRenderer.cpp:2499-2504`), so such a character would
+jump from its correct 10/12pt size to a fixed 20px. `× ÷ ∑ √ ∫` are excluded for
+exactly this reason. Symbols the ubuntu fonts lack (`№ ← ○ ★ ■ …`) are fine —
+they were rendering as `?` before.
 
 ### Regenerating
 
