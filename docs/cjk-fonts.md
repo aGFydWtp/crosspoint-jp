@@ -54,33 +54,12 @@ The binary font file contains:
 
 ---
 
-## Generating Font Files
+## Generating SD Card Font Files
 
-Use the provided Python script to convert TrueType fonts:
-
-```bash
-python scripts/generate_cjk_ui_font.py \
-    --font /path/to/font.ttf \
-    --size 20 \
-    --output /path/to/output.bin
-```
-
-### Script Options
-
-| Option | Description |
-|--------|-------------|
-| `--font` | Path to TrueType font file (.ttf) |
-| `--size` | Font size in points |
-| `--output` | Output binary file path |
-| `--chars` | (Optional) Custom character set file |
-
-### Character Set
-
-By default, the script generates fonts for:
-- Basic ASCII characters (0x20-0x7E)
-- Common CJK characters (GB2312 subset)
-- Japanese Hiragana and Katakana
-- Common punctuation marks
+SD card fonts (`/fonts/*.bin`) are produced by the scripts under
+`lib/EpdFont/scripts/` — see `lib/EpdFont/README`. The script described below
+(`scripts/generate_cjk_ui_font.py`) generates the **built-in** font header, not
+SD card fonts.
 
 ---
 
@@ -115,16 +94,80 @@ By default, the script generates fonts for:
 
 ## Built-in CJK UI Font
 
-The firmware includes a pre-rendered subset of Source Han Sans (思源黑体) for UI rendering. This font covers:
+The firmware embeds a pre-rendered 20×20 bitmap subset of **Source Han Sans JP
+Medium** in `lib/GfxRenderer/cjk_ui_font_20.h` (7,493 glyphs, ~440 KB of flash).
+It is the only source of CJK glyphs for UI text — the built-in UI fonts
+(`ubuntu_10/12`) contain no CJK at all, so anything missing from this header is
+drawn as `?`.
 
-- All ASCII characters
-- Common Chinese characters used in the UI
-- Japanese Hiragana and Katakana
-- Common punctuation marks
-
-The built-in font is automatically used when:
+The built-in font is used when:
 - No external UI font is selected
 - The external font file is missing or corrupted
+
+### Coverage
+
+| Source | Characters |
+|--------|-----------|
+| `scripts/codepoints_baseline.txt` | 3,420 — snapshot of the glyph set shipped before the JIS level 2 expansion |
+| `scripts/codepoints_jis_level1.txt` | 2,965 — JIS X 0208 level 1 kanji |
+| `scripts/codepoints_jis_level2.txt` | 3,390 — JIS X 0208 level 2 kanji |
+| `scripts/codepoints_cp932_ext.txt` | 457 — CP932 NEC/IBM extensions (髙 﨑 彅 ① № Ⅰ ㈱ …) |
+| `scripts/codepoints_ui_symbols.txt` | 227 — CJK punctuation, fullwidth alphanumerics, halfwidth katakana, ・ 〜 ※ ○ ★ ← … |
+| `lib/I18n/translations/*.yaml` | every non-ASCII character used by UI strings (extracted automatically) |
+| `BASE_UI_CHARS` in the generator | ASCII, kana, common punctuation |
+
+`scripts/check_cjk_ui_font.py` runs as a PlatformIO pre-build step and fails the
+build if any code point from these lists is absent from the header. Add new
+requirements to a `codepoints_*.txt` file so the check can catch regressions —
+book titles and file names are dynamic and can never be validated automatically.
+
+### Regenerating
+
+Requires **Source Han Sans JP Medium** (OFL) from
+[adobe-fonts/source-han-sans](https://github.com/adobe-fonts/source-han-sans/releases)
+(`17_SourceHanSansJP.zip` → `SubsetOTF/JP/SourceHanSansJP-Medium.otf`). The OTF
+is not committed.
+
+```bash
+python3 scripts/generate_cjk_ui_font.py \
+  --size 20 \
+  --font /path/to/SourceHanSansJP-Medium.otf \
+  --force-pt 20 --force-descent 3 \
+  --inherit-header lib/GfxRenderer/cjk_ui_font_20.h \
+  --codepoints-file scripts/codepoints_baseline.txt \
+  --codepoints-file scripts/codepoints_jis_level1.txt \
+  --codepoints-file scripts/codepoints_jis_level2.txt \
+  --codepoints-file scripts/codepoints_cp932_ext.txt \
+  --codepoints-file scripts/codepoints_ui_symbols.txt
+```
+
+`--force-pt 20 --force-descent 3` is **required**. Different Source Han Sans
+releases report very different hhea metrics (880/-120 vs 1160/-288); without the
+override the automatic fit would pick `pt=17, baseline=15` and shrink every UI
+glyph by 15% while shifting it 2px up. The header comment records the metrics
+that must be reproduced.
+
+`--inherit-header` copies glyphs the source font does not cover from the previous
+header instead of emitting `.notdef` tofu. The JP subset OTF is missing 54 Latin
+Extended / Cyrillic characters (`Ł` `İ` `Š` `І` `Ә` …) plus `↺` `↻` that the UI
+translations use.
+
+After regenerating, verify:
+
+```bash
+python3 scripts/check_cjk_ui_font.py    # coverage
+pio run                                  # flash usage
+```
+
+### Known limitations
+
+- Halfwidth katakana (U+FF61–FF9F) render at full width — `generate_cjk_ui_font.py`
+  treats everything above U+007F as full width
+- `＾` (U+FF3E) and `｀` (U+FF40) come out blank: they sit above the 20px cell at
+  baseline 17 and get clipped
+- `hasCjkUiGlyph()` returns false above U+FFFF (the lookup table is `uint16_t`),
+  so emoji and CJK Extension B are still drawn as `?`
+- JIS X 0213 level 3/4 is not included, apart from `鷗` (U+9DD7)
 
 ---
 
