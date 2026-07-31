@@ -25,3 +25,12 @@ docs/plans/
 lib/EpdFont/scripts/downloaded_fonts/
 lib/EpdFont/scripts/instanced_fonts/
 lib/EpdFont/scripts/output/
+
+# Generated when custom_sdkconfig makes pioarduino build ESP-IDF from source
+/sdkconfig
+/sdkconfig.default
+/sdkconfig.defaults
+/sdkconfig.*
+/managed_components/
+/dependencies.lock
+/.dummy/

@@ -163,14 +163,21 @@ static bool fetchApiJson(const char* url, JsonDocument& doc) {
     // 従来 fork にあった 30000 ms タイムアウト引数は不要 (本家 API に合わせて除去)。
     result = HttpDownloader::downloadToFile(url, API_TMP_FILE);
     if (result == HttpDownloader::OK) break;
-    LOG_ERR("AOZORA", "API fetch attempt %d failed: err=%d http=%d", attempt + 1, result, HttpDownloader::lastHttpCode);
+    LOG_ERR("AOZORA", "API fetch attempt %d failed: err=%d http=%d heap=%d blk=%d", attempt + 1, result,
+            HttpDownloader::lastHttpCode, static_cast<int>(ESP.getFreeHeap()), static_cast<int>(ESP.getMaxAllocHeap()));
     Storage.remove(API_TMP_FILE);
   }
 
   if (result != HttpDownloader::OK) {
     char buf[128];
-    snprintf(buf, sizeof(buf), "err=%d http=%d heap=%dKB", static_cast<int>(result), HttpDownloader::lastHttpCode,
-             ESP.getFreeHeap() / 1024);
+    // blk = largest contiguous block. A TLS handshake needs ~45-55KB of it
+    // (MBEDTLS_SSL_IN/OUT_CONTENT_LEN are 16KB each on this build), so free
+    // heap alone cannot tell an out-of-memory failure from a fragmentation
+    // one. http is negative when it carries an esp_err_t: -28674 is
+    // ESP_ERR_HTTP_CONNECT, i.e. the connection never opened.
+    snprintf(buf, sizeof(buf), "err=%d http=%d heap=%dKB blk=%dKB", static_cast<int>(result),
+             HttpDownloader::lastHttpCode, static_cast<int>(ESP.getFreeHeap() / 1024),
+             static_cast<int>(ESP.getMaxAllocHeap() / 1024));
     lastApiError_ = buf;
     return false;
   }
@@ -259,7 +266,8 @@ bool AozoraActivity::parseAuthorsJson(JsonDocument& doc) {
     return false;
   }
 
-  authors_.reserve(arr.size());
+  // No reserve(): deque grows one 512-byte node at a time, so there is no
+  // reallocate-and-copy to pre-empt.
   for (JsonObject obj : arr) {
     AuthorEntry entry;
     entry.id = obj["id"] | 0;
@@ -282,7 +290,7 @@ bool AozoraActivity::parseWorksJson(JsonDocument& doc) {
     return false;
   }
 
-  works_.reserve(arr.size());
+  // No reserve(): see parseAuthorsJson.
   for (JsonObject obj : arr) {
     WorkEntry entry;
     entry.id = obj["id"] | 0;
