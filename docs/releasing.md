@@ -10,7 +10,7 @@ GitHub の **Actions → Release (dispatch) → Run workflow** から実行す�
 | `prerelease` | RC としてリリースする。`v0.1.13-rc1` のような連番になる |
 | `dry_run` | 算出結果をサマリに出すだけで、タグは打たない |
 
-タグが push されると `release.yml` が発火し、ビルドと GitHub Release の作成まで自動で進む。
+タグを push したあと `release-dispatch.yml` が `release.yml` を起動し、ビルドと GitHub Release の作成まで自動で進む。
 
 実行前に対象コミットが `master` にマージ済みであること。`master` 以外のブランチからの実行はワークフロー側で拒否される。
 
@@ -45,13 +45,15 @@ custom_i18n_languages = ENGLISH, JAPANESE
 
 **CI のチェックアウトには `fetch-depth: 0` が必要。** バージョンは `git describe` で求めるので、浅いクローンではタグに到達できず `0.0.0` になる。ビルドを行うワークフローには設定済み。
 
+**`GITHUB_TOKEN` で push したタグは `on: push: tags` を発火させない。** ワークフローの無限ループを防ぐための GitHub の仕様。このため `release-dispatch.yml` はタグを push したあと `gh workflow run release.yml --ref <タグ>` で `release.yml` を明示的に起動している（`workflow_dispatch` はこの制限の例外）。`release.yml` 側にも `workflow_dispatch` トリガーと、タグ以外の ref を弾く `if: startsWith(github.ref, 'refs/tags/')` ガードが必要。
+
 **fork 由来のタグを持ち込まない。** `--match 'v[0-9]*'` で絞ったうえで、`git describe` は HEAD の祖先しか見ないため通常は問題にならない。過去に cjk-fork 由来の `v0.2.x` / `v0.3.0` が混入していたが削除済み。
 
 ## 関連ワークフロー
 
 | ファイル | 契機 | 用途 |
 |----------|------|------|
-| `release-dispatch.yml` | 手動 | バージョン算出とタグ作成 |
-| `release.yml` | タグ push | ビルドと Release 作成 |
+| `release-dispatch.yml` | 手動 | バージョン算出、タグ作成、`release.yml` の起動 |
+| `release.yml` | タグ push または `release-dispatch.yml` からの起動 | ビルドと Release 作成 |
 | `release_candidate.yml` | 手動（`release/*` ブランチ） | RC ビルド |
 | `dev-build.yml` | master への push | Dev Build のプレリリース |
