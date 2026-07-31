@@ -23,6 +23,28 @@ class HttpDownloader {
     ABORTED,
   };
 
+  /**
+   * Size class for the esp_http_client RX/TX buffers, which are allocated up
+   * front and held for the whole connection.
+   *
+   * COMPACT is the default. LARGE exists only for GitHub's release CDN: the
+   * redirect target (objects.githubusercontent.com) is a signed URL whose
+   * path+query runs 700-900 bytes, so the redirected GET's request line
+   * overflows a 512-byte TX buffer and the reopen fails before any byte
+   * arrives.
+   *
+   * The distinction matters because a TLS handshake needs ~45-55KB of
+   * contiguous heap on this device (MBEDTLS_SSL_IN/OUT_CONTENT_LEN are 16KB
+   * each and CONFIG_MBEDTLS_ASYMMETRIC_CONTENT_LEN is off). Spending an extra
+   * 2.5KB of pre-handshake heap on every request pushes the fragmented cases
+   * over the edge — see the Aozora author listing, which failed with
+   * ESP_ERR_HTTP_CONNECT at ~56KB free.
+   */
+  enum class BufferProfile {
+    COMPACT,  // 2048 / 512 - everything except the GitHub release CDN
+    LARGE,    // 4096 / 1024 - long signed redirect URLs
+  };
+
   // Last HTTP status code observed by runGet(). Fork-only: activities
   // (Aozora / FontDownload) surface this in their error messages for
   // diagnostics. Positive value = HTTP response code, 0 = never set / no
@@ -42,7 +64,7 @@ class HttpDownloader {
    * Stream the response body to onData as it arrives, without buffering it.
    */
   static bool fetchUrl(const std::string& url, const DataCallback& onData, const std::string& username = "",
-                       const std::string& password = "");
+                       const std::string& password = "", BufferProfile buffers = BufferProfile::COMPACT);
 
   /**
    * Download a file to the SD card with optional credentials.

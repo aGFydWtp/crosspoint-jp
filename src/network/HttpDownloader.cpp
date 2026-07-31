@@ -34,13 +34,14 @@ namespace {
 // RX holds the response headers; TX must fit the whole request line.
 // fork: upstream shrank these to 2048/512, but upstream routes OTA/large
 // downloads through wolfSSL (runGetWolf) — here runGet carries them too.
-// GitHub's release CDN redirect target (objects.githubusercontent.com) is a
-// signed URL whose path+query runs 700-900 bytes, so the redirected GET's
-// request line overflows a 512-byte TX buffer and the reopen fails before any
-// byte arrives. 4096/1024 is the configuration that fully downloaded the 6MB
-// image on this device (see #2074 cherry-pick 0d40ec1a).
-constexpr int HTTP_RX_BUF = 4096;
-constexpr int HTTP_TX_BUF = 1024;
+// 4096/1024 is the configuration that fully downloaded the 6MB image on this
+// device (see #2074 cherry-pick 0d40ec1a), but it is only needed for GitHub's
+// release CDN — see BufferProfile in the header for why the rest of the
+// callers must stay on the smaller buffers.
+constexpr int HTTP_RX_BUF_COMPACT = 2048;
+constexpr int HTTP_TX_BUF_COMPACT = 512;
+constexpr int HTTP_RX_BUF_LARGE = 4096;
+constexpr int HTTP_TX_BUF_LARGE = 1024;
 #endif
 // Per-socket-op timeout. Some OPDS download endpoints are slow to send headers
 // (>15s) and chunked catalogs stall mid-body, so 15s killed them. 60s gives
@@ -133,12 +134,13 @@ HttpDownloader::DownloadError runGetWolf(const std::string& startUrl, const std:
 // that ends early as ESP_ERR_HTTP_INCOMPLETE_DATA, whereas the read loop streams
 // large/slow files and surfaces a short read directly.
 HttpDownloader::DownloadError runGet(const std::string& url, const std::string& username, const std::string& password,
-                                     Sink& sink) {
+                                     Sink& sink, HttpDownloader::BufferProfile buffers) {
+  const bool large = buffers == HttpDownloader::BufferProfile::LARGE;
   HttpDownloader::lastHttpCode = 0;  // reset before each attempt so activities' diagnostics reflect this call only
   esp_http_client_config_t config = {};
   config.url = url.c_str();
-  config.buffer_size = HTTP_RX_BUF;
-  config.buffer_size_tx = HTTP_TX_BUF;
+  config.buffer_size = large ? HTTP_RX_BUF_LARGE : HTTP_RX_BUF_COMPACT;
+  config.buffer_size_tx = large ? HTTP_TX_BUF_LARGE : HTTP_TX_BUF_COMPACT;
   config.timeout_ms = HTTP_TIMEOUT_MS;
   // Verify HTTPS against the bundled CA roots. This build has esp-tls
   // CONFIG_ESP_TLS_INSECURE off, so an unverified TLS handshake can't be set
@@ -243,11 +245,14 @@ HttpDownloader::DownloadError runGet(const std::string& url, const std::string& 
 // mbedTLS path fails to connect or stalls mid-stream. Plain-http URLs still use a
 // WiFiClient inside runGetWolf, so this is safe for non-TLS targets too.
 HttpDownloader::DownloadError runGetSecure(const std::string& url, const std::string& username,
-                                           const std::string& password, Sink& sink) {
+                                           const std::string& password, Sink& sink,
+                                           HttpDownloader::BufferProfile buffers) {
 #if defined(FREEINK_NET_WOLFSSL)
+  // wolfSSL sizes its own buffers; the profile only applies to esp_http_client.
+  (void)buffers;
   return runGetWolf(url, username, password, sink);
 #else
-  return runGet(url, username, password, sink);
+  return runGet(url, username, password, sink, buffers);
 #endif
 }
 }  // namespace
@@ -257,7 +262,7 @@ bool HttpDownloader::fetchUrl(const std::string& url, Stream& outContent, const 
   LOG_DBG("HTTP", "Fetching: %s", url.c_str());
   Sink sink;
   sink.write = [&outContent](const uint8_t* data, size_t len) { return outContent.write(data, len) == len; };
-  return runGetSecure(url, username, password, sink) == OK;
+  return runGetSecure(url, username, password, sink, BufferProfile::COMPACT) == OK;
 }
 
 bool HttpDownloader::fetchUrl(const std::string& url, std::string& outContent, const std::string& username,
@@ -269,15 +274,15 @@ bool HttpDownloader::fetchUrl(const std::string& url, std::string& outContent, c
     outContent.append(reinterpret_cast<const char*>(data), len);
     return true;
   };
-  return runGetSecure(url, username, password, sink) == OK;
+  return runGetSecure(url, username, password, sink, BufferProfile::COMPACT) == OK;
 }
 
 bool HttpDownloader::fetchUrl(const std::string& url, const DataCallback& onData, const std::string& username,
-                              const std::string& password) {
+                              const std::string& password, BufferProfile buffers) {
   LOG_DBG("HTTP", "Fetching: %s", url.c_str());
   Sink sink;
   sink.write = onData;
-  return runGetSecure(url, username, password, sink) == OK;
+  return runGetSecure(url, username, password, sink, buffers) == OK;
 }
 
 HttpDownloader::DownloadError HttpDownloader::downloadToFile(const std::string& url, const std::string& destPath,
@@ -299,7 +304,7 @@ HttpDownloader::DownloadError HttpDownloader::downloadToFile(const std::string& 
   sink.cancelFlag = cancelFlag;
   sink.write = [&file](const uint8_t* data, size_t len) { return file.write(data, len) == len; };
 
-  const DownloadError result = runGetSecure(url, username, password, sink);
+  const DownloadError result = runGetSecure(url, username, password, sink, BufferProfile::COMPACT);
   // Close before any remove() on the same path; DESTRUCTOR_CLOSES_FILE would
   // otherwise close only after the remove.
   file.close();

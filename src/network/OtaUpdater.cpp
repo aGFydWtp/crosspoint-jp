@@ -174,25 +174,32 @@ OtaUpdater::OtaUpdaterError OtaUpdater::installUpdate(ProgressCallback onProgres
   int lastReportedPct = -1;
   bool flashOk = true;
   esp_err_t writeErr = ESP_OK;
-  const bool fetchOk = HttpDownloader::fetchUrl(otaUrl, [&](const uint8_t* data, size_t len) {
-    writeErr = esp_ota_write(otaHandle, data, len);
-    if (writeErr != ESP_OK) {
-      flashOk = false;
-      return false;  // abort the transfer
-    }
-    processedSize += len;
-    // Fire the callback only on whole-percent change. Per-chunk updates wake the
-    // render task, whose framebuffer work contends with TLS on the internal arena,
-    // and e-ink can't repaint faster than a percent tick anyway.
-    if (onProgress && totalSize > 0) {
-      const int pct = static_cast<int>(static_cast<uint64_t>(processedSize) * 100 / totalSize);
-      if (pct != lastReportedPct) {
-        lastReportedPct = pct;
-        onProgress(ctx);
-      }
-    }
-    return true;
-  });
+  // LARGE buffers: otaUrl points at the release asset, which redirects to a
+  // signed objects.githubusercontent.com URL whose request line does not fit
+  // the default 512-byte TX buffer. This is the only caller that needs them —
+  // see HttpDownloader::BufferProfile.
+  const bool fetchOk = HttpDownloader::fetchUrl(
+      otaUrl,
+      [&](const uint8_t* data, size_t len) {
+        writeErr = esp_ota_write(otaHandle, data, len);
+        if (writeErr != ESP_OK) {
+          flashOk = false;
+          return false;  // abort the transfer
+        }
+        processedSize += len;
+        // Fire the callback only on whole-percent change. Per-chunk updates wake the
+        // render task, whose framebuffer work contends with TLS on the internal arena,
+        // and e-ink can't repaint faster than a percent tick anyway.
+        if (onProgress && totalSize > 0) {
+          const int pct = static_cast<int>(static_cast<uint64_t>(processedSize) * 100 / totalSize);
+          if (pct != lastReportedPct) {
+            lastReportedPct = pct;
+            onProgress(ctx);
+          }
+        }
+        return true;
+      },
+      "", "", HttpDownloader::BufferProfile::LARGE);
 
   /* Return back to default power saving for WiFi in case of failing */
   esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
