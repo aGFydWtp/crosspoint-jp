@@ -1,0 +1,117 @@
+name: Release (dispatch)
+
+# Actions 画面から patch / minor / major を選んで実行すると、直近の v0.x.y タグから
+# 次のバージョンを算出してタグを打つ。タグの push を release.yml が拾って
+# ビルドと GitHub Release 作成を行うので、このワークフロー自体はビルドしない。
+#
+# これによりリリース作業は「Actions でボタンを押す」だけになる。
+# ローカルでの `git tag` / `git push --tags` は不要。
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: 'どこを上げるか'
+        required: true
+        type: choice
+        default: patch
+        options: [patch, minor, major]
+      prerelease:
+        description: 'RC としてリリースする (v0.1.13-rc1 のような形式になる)'
+        required: false
+        type: boolean
+        default: false
+      dry_run:
+        description: '算出結果を表示するだけでタグは打たない'
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # タグ計算に全履歴が要る
+          fetch-depth: 0
+
+      - name: Refuse to release from a non-default branch
+        if: github.ref_name != github.event.repository.default_branch
+        run: |
+          echo "::error::リリースは ${{ github.event.repository.default_branch }} からのみ実行できます (今回: ${{ github.ref_name }})"
+          exit 1
+
+      - name: Compute next version
+        id: version
+        run: |
+          set -euo pipefail
+
+          # このブランチの祖先にあるタグだけを見る。fork 元由来のタグ (v0.2.x /
+          # v0.3.0 など) は master の祖先ではないので自然に除外される。
+          latest="$(git describe --tags --match 'v[0-9]*.[0-9]*.[0-9]*' --abbrev=0 2>/dev/null || echo '')"
+          if [ -z "${latest}" ]; then
+            echo "::error::v*.*.* 形式のタグが見つかりません。最初のタグは手動で作成してください。"
+            exit 1
+          fi
+
+          base="${latest#v}"
+          # RC サフィックスを落として素の x.y.z にする
+          base="${base%%-*}"
+          IFS='.' read -r major minor patch <<< "${base}"
+
+          case "${{ inputs.bump }}" in
+            major) major=$((major + 1)); minor=0; patch=0 ;;
+            minor) minor=$((minor + 1)); patch=0 ;;
+            patch) patch=$((patch + 1)) ;;
+          esac
+
+          next="v${major}.${minor}.${patch}"
+
+          if [ "${{ inputs.prerelease }}" = "true" ]; then
+            # 同じ x.y.z の既存 RC を数えて連番にする
+            n=1
+            while git rev-parse -q --verify "refs/tags/${next}-rc${n}" >/dev/null; do
+              n=$((n + 1))
+            done
+            next="${next}-rc${n}"
+          fi
+
+          if git rev-parse -q --verify "refs/tags/${next}" >/dev/null; then
+            echo "::error::タグ ${next} は既に存在します"
+            exit 1
+          fi
+
+          echo "latest=${latest}" >> "$GITHUB_OUTPUT"
+          echo "next=${next}" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### リリース"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| 直近のタグ | \`${latest}\` |"
+            echo "| 新しいタグ | \`${next}\` |"
+            echo "| bump | ${{ inputs.bump }} |"
+            echo "| commit | \`$(git rev-parse --short HEAD)\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Create and push tag
+        if: inputs.dry_run != true
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "${{ steps.version.outputs.next }}" \
+            -m "${{ steps.version.outputs.next }}"
+          git push origin "${{ steps.version.outputs.next }}"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "タグを push しました。release.yml がビルドと Release 作成を行います。" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Dry run notice
+        if: inputs.dry_run == true
+        run: |
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "**dry run のためタグは作成していません。**" >> "$GITHUB_STEP_SUMMARY"
