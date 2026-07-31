@@ -78,6 +78,24 @@ bool isCjkCodepoint(const uint32_t cp) {
   return false;
 }
 
+// Advance width of a code point rendered from a built-in EPD font, mirroring the
+// fallback chain in GfxRenderer::renderChar(): a code point with no glyph is drawn
+// as '?' and advances by the width of '?'. Width calculations must agree with what
+// is actually drawn, otherwise truncatedText() under-measures and the text overflows
+// its column.
+int builtinGlyphAdvanceX(const EpdFontFamily& fontFamily, const uint32_t cp, const EpdFontFamily::Style style,
+                         const bool isCjk) {
+  const EpdGlyph* glyph = fontFamily.getGlyph(cp, style);
+  if (!glyph) {
+    glyph = fontFamily.getGlyph('?', style);
+  }
+  if (glyph) {
+    return fp4::toPixel(glyph->advanceX);
+  }
+  // Same last-resort advances as renderChar()
+  return isCjk ? 20 : 10;
+}
+
 bool isAsciiDigit(const uint32_t cp) { return cp >= '0' && cp <= '9'; }
 
 bool isAsciiLetter(const uint32_t cp) { return (cp >= 'A' && cp <= 'Z') || (cp >= 'a' && cp <= 'z'); }
@@ -516,17 +534,11 @@ int GfxRenderer::getTextWidth(const int fontId, const char* text, const EpdFontF
             }
           } else {
             // No external font, use built-in font width
-            const EpdGlyph* glyph = fontFamily.getGlyph(cp, style);
-            if (glyph) {
-              width += fp4::toPixel(glyph->advanceX);
-            }
+            width += builtinGlyphAdvanceX(fontFamily, cp, style, true);
           }
         } else {
           // Character not in UI font: use built-in font width
-          const EpdGlyph* glyph = fontFamily.getGlyph(cp, style);
-          if (glyph) {
-            width += fp4::toPixel(glyph->advanceX);
-          }
+          width += builtinGlyphAdvanceX(fontFamily, cp, style, isCjkCodepoint(cp));
         }
       }
       return width;

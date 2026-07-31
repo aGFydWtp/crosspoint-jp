@@ -1,4 +1,5 @@
 pillow>=12.2.0
+fonttools>=4.62.1
 cairosvg>=2.9.0
 matplotlib>=3.10.9
 pyserial>=3.5
