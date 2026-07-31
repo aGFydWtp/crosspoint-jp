@@ -2,6 +2,7 @@
 
 #include <ArduinoJson.h>
 
+#include <deque>
 #include <string>
 #include <vector>
 
@@ -66,9 +67,17 @@ class AozoraActivity : public Activity {
   std::vector<State> stateStack_;
   std::vector<int> selectedIndexStack_;
 
-  // API result buffers
-  std::vector<AuthorEntry> authors_;
-  std::vector<WorkEntry> works_;
+  // API result buffers.
+  //
+  // std::deque, not std::vector: a vector holds its elements in one contiguous
+  // allocation, and the "ア" author row alone is 206 x 104B = 21.4KB of it. That
+  // single block is what fragments the heap out of the ~16.5KB contiguous chunk
+  // a TLS handshake needs, which is how the author listing ended up failing with
+  // ESP_ERR_HTTP_CONNECT at heap=61KB / blk=20KB. deque spreads the same data
+  // over 512-byte nodes, so it never needs a large contiguous region, and
+  // operator[] keeps every call site unchanged.
+  std::deque<AuthorEntry> authors_;
+  std::deque<WorkEntry> works_;
 
   // Works pagination
   int worksTotal_ = 0;

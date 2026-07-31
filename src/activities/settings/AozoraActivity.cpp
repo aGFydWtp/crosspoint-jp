@@ -266,7 +266,8 @@ bool AozoraActivity::parseAuthorsJson(JsonDocument& doc) {
     return false;
   }
 
-  authors_.reserve(arr.size());
+  // No reserve(): deque grows one 512-byte node at a time, so there is no
+  // reallocate-and-copy to pre-empt.
   for (JsonObject obj : arr) {
     AuthorEntry entry;
     entry.id = obj["id"] | 0;
@@ -289,7 +290,7 @@ bool AozoraActivity::parseWorksJson(JsonDocument& doc) {
     return false;
   }
 
-  works_.reserve(arr.size());
+  // No reserve(): see parseAuthorsJson.
   for (JsonObject obj : arr) {
     WorkEntry entry;
     entry.id = obj["id"] | 0;
