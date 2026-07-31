@@ -86,8 +86,10 @@ bool FontDownloadActivity::fetchAndParseManifest() {
     LOG_ERR("FONT", "Manifest fetch failed (err=%d, http=%d, heap=%zu)", result, HttpDownloader::lastHttpCode,
             heapBefore);
     char buf[80];
-    snprintf(buf, sizeof(buf), "err=%d http=%d heap=%zuKB", static_cast<int>(result), HttpDownloader::lastHttpCode,
-             heapBefore / 1024);
+    // blk = largest contiguous block; a TLS handshake needs ~45-55KB of it, so
+    // free heap alone cannot distinguish exhaustion from fragmentation.
+    snprintf(buf, sizeof(buf), "err=%d http=%d heap=%zuKB blk=%dKB", static_cast<int>(result),
+             HttpDownloader::lastHttpCode, heapBefore / 1024, static_cast<int>(ESP.getMaxAllocHeap() / 1024));
     errorMessage_ = buf;
     Storage.remove(MANIFEST_TMP);
     return false;
