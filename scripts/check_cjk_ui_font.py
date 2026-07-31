@@ -1,7 +1,19 @@
 #!/usr/bin/env python3
 """
-Pre-build check: verify that all CJK characters used in translation YAML files
-are present in the built-in CJK UI font header (cjk_ui_font_20.h).
+Pre-build check: verify that the built-in CJK UI font header (cjk_ui_font_20.h)
+covers everything it is supposed to cover.
+
+Two sources are checked:
+
+1. lib/I18n/translations/*.yaml - every CJK character used by the UI strings.
+2. scripts/codepoints_*.txt     - the curated code point lists that were fed to
+   the generator (JIS levels, CP932 extensions, UI symbols, and the baseline
+   snapshot of previously shipped glyphs).
+
+(2) is what catches "a symbol silently went missing". Book titles, author names
+and file names are dynamic, so they can never be validated from the sources -
+pinning the intended coverage in the codepoints files is the only way to notice
+a regression at build time.
 
 If missing characters are found, the build fails with an actionable error message.
 
@@ -39,50 +51,87 @@ def extract_cjk_from_translations(translations_dir):
     return chars
 
 
+def extract_codepoints_from_lists(scripts_dir):
+    """Extract required code points from every scripts/codepoints_*.txt file."""
+    required = {}
+    for path in sorted(glob.glob(str(Path(scripts_dir) / "codepoints_*.txt"))):
+        name = Path(path).name
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                try:
+                    required.setdefault(int(line, 16), name)
+                except ValueError:
+                    pass
+    return required
+
+
 def extract_codepoints_from_header(header_path):
-    """Extract codepoints from CJK_UI_CODEPOINTS array in the header file."""
-    codepoints = set()
+    """Extract codepoints from the CJK_UI_CODEPOINTS array in the header file."""
     with open(header_path, "r", encoding="utf-8") as f:
         content = f.read()
-    for match in re.finditer(r"0x([0-9A-Fa-f]{4})", content):
-        codepoints.add(int(match.group(1), 16))
-    return codepoints
+    match = re.search(r"CJK_UI_CODEPOINTS\[\] PROGMEM = \{(.*?)\};", content, re.S)
+    if not match:
+        return set()
+    return {int(cp, 16) for cp in re.findall(r"0x([0-9A-Fa-f]{4})", match.group(1))}
+
+
+def _report(missing, source_label):
+    print(f"\n*** CJK UI Font Check Failed ***")
+    print(f"{len(missing)} characters required by {source_label} are missing from cjk_ui_font_20.h:\n")
+    preview = missing[:80]
+    print("  " + "".join(chr(cp) for cp in preview) + (" ..." if len(missing) > len(preview) else ""))
+    print("  " + " ".join(f"U+{cp:04X}" for cp in preview) + (" ..." if len(missing) > len(preview) else ""))
+    print("\nRegenerate the font - see docs/cjk-fonts.md for the full command line.")
+    print()
 
 
 def check(project_root):
     translations_dir = project_root / "lib" / "I18n" / "translations"
+    scripts_dir = project_root / "scripts"
     header_path = project_root / "lib" / "GfxRenderer" / "cjk_ui_font_20.h"
 
-    if not translations_dir.is_dir():
-        return True
     if not header_path.exists():
         return True
 
-    translation_chars = extract_cjk_from_translations(translations_dir)
     header_codepoints = extract_codepoints_from_header(header_path)
-
-    missing = []
-    for c in sorted(translation_chars, key=ord):
-        if ord(c) not in header_codepoints:
-            missing.append(c)
-
-    if missing:
-        print(f"\n*** CJK UI Font Check Failed ***")
-        print(f"{len(missing)} characters used in translations are missing from cjk_ui_font_20.h:\n")
-        print("  " + "".join(missing))
-        print(f"\nRun the following to regenerate:")
-        print(f"  python3 scripts/generate_cjk_ui_font.py --size 20 --font <path-to-font.otf>")
-        print()
+    if not header_codepoints:
+        print("*** CJK UI Font Check Failed ***")
+        print(f"Could not parse CJK_UI_CODEPOINTS from {header_path}")
         return False
 
-    return True
+    ok = True
+
+    required = extract_codepoints_from_lists(scripts_dir)
+    if required:
+        missing = sorted(cp for cp in required if cp not in header_codepoints)
+        if missing:
+            by_list = {}
+            for cp in missing:
+                by_list.setdefault(required[cp], []).append(cp)
+            _report(missing, "scripts/codepoints_*.txt")
+            for name, cps in sorted(by_list.items()):
+                print(f"  {name}: {len(cps)} missing")
+            print()
+            ok = False
+
+    if translations_dir.is_dir():
+        translation_chars = extract_cjk_from_translations(translations_dir)
+        missing = sorted(ord(c) for c in translation_chars if ord(c) not in header_codepoints)
+        if missing:
+            _report(missing, "lib/I18n/translations/*.yaml")
+            ok = False
+
+    if ok:
+        print(f"CJK UI font check: OK ({len(header_codepoints)} glyphs, {len(required)} pinned code points)")
+    return ok
 
 
 def main():
     project_root = Path(__file__).parent.parent
-    if check(project_root):
-        print("CJK UI font check: OK")
-    else:
+    if not check(project_root):
         sys.exit(1)
 
 
