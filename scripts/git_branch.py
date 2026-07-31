@@ -1,12 +1,18 @@
 """
-PlatformIO pre-build script: inject git branch and short SHA into
-CROSSPOINT_VERSION for the default (dev) environment.
+PlatformIO pre-build script: derive CROSSPOINT_VERSION from git tags.
 
-Results in a version string like:  1.1.0-dev-feat-kosync-xpath-05c6cf8
-Release environments are unaffected; they set CROSSPOINT_VERSION in the ini.
+Git tags are the single source of truth for the version — platformio.ini does
+not carry one. Releases are cut by tagging (see .github/workflows/
+release-dispatch.yml), so there is no version to keep in sync by hand.
+
+    release env, on a tag   1.2.3
+    release env, off-tag    1.2.3-4-gabc1234      (4 commits past v1.2.3)
+    dev env                 1.2.3-dev-my-branch-abc1234
+
+An environment that sets CROSSPOINT_VERSION in build_flags keeps its own value;
+platformio.local.ini uses that to pin a version for OTA testing.
 """
 
-import configparser
 import os
 import subprocess
 import sys
@@ -63,12 +69,26 @@ def get_git_short_sha(project_dir):
     )
 
 
-def get_version_from_git_tag(project_dir):
-    """Try to derive version from the latest v* git tag (e.g. v0.1.3 → 0.1.3)."""
+def get_version_from_git_tag(project_dir, exact=False, bare=False):
+    """Derive the version from git tags. Git tags are the single source of truth.
+
+    exact=True returns a version only when HEAD sits exactly on a release tag
+    (v1.2.3 -> 1.2.3), and None otherwise.
+    bare=True returns just the nearest tag (1.2.3); otherwise git describe
+    appends distance and commit (1.2.3-4-gabc1234), marking the build as "4
+    commits past v1.2.3" rather than letting it pass for the release itself.
+
+    Only v<digit>* is matched, so tags inherited from other forks cannot be
+    picked up (they are not ancestors of this branch either).
+    """
+    args = ['describe', '--tags', '--match', 'v[0-9]*']
+    if exact:
+        args.append('--exact-match')
+    elif bare:
+        args.append('--abbrev=0')
     try:
         tag = subprocess.check_output(
-            ['git', 'describe', '--tags', '--match', 'v*', '--abbrev=0'],
-            text=True, stderr=subprocess.PIPE, cwd=project_dir
+            ['git', *args], text=True, stderr=subprocess.PIPE, cwd=project_dir
         ).strip()
         version = tag.lstrip('v')
         if version:
@@ -78,41 +98,50 @@ def get_version_from_git_tag(project_dir):
     return None
 
 
-def get_base_version(project_dir):
+def get_base_version(project_dir, bare=False):
     # Env var override (OTA test / debug): highest priority
     override = os.environ.get('OTA_TEST_VERSION')
     if override:
         return override
 
-    # Prefer version from latest git tag (single source of truth)
-    git_version = get_version_from_git_tag(project_dir)
+    git_version = get_version_from_git_tag(project_dir, bare=bare)
     if git_version:
         return git_version
 
-    # Fall back to platformio.ini (for repos without tags)
-    ini_path = os.path.join(project_dir, 'platformio.ini')
-    if not os.path.isfile(ini_path):
-        warn(f'platformio.ini not found at {ini_path}; base version will be "0.0.0"')
-        return '0.0.0'
-    config = configparser.ConfigParser()
-    config.read(ini_path)
-    if not config.has_option('crosspoint', 'version'):
-        warn('No [crosspoint] version in platformio.ini; base version will be "0.0.0"')
-        return '0.0.0'
-    return config.get('crosspoint', 'version')
+    # No tags reachable (shallow clone, fresh fork). platformio.ini no longer
+    # carries a version, so there is nothing left to fall back to.
+    warn('No v* git tag reachable from HEAD; base version will be "0.0.0"')
+    return '0.0.0'
 
 
 def inject_version(env):
-    # Only applies to the dev (default) environment; release envs set the
-    # version via build_flags in platformio.ini and are unaffected.
-    if env['PIOENV'] != 'default':
-        return
+    # Every environment gets its version from here. An env that already defines
+    # CROSSPOINT_VERSION in build_flags (e.g. an OTA test build pinning
+    # "0.1.12-rc1") keeps that value.
+    for define in env.get('CPPDEFINES', []):
+        name = define[0] if isinstance(define, (list, tuple)) else define
+        if name == 'CROSSPOINT_VERSION':
+            return
 
     project_dir = env['PROJECT_DIR']
-    base_version = get_base_version(project_dir)
-    branch = get_git_branch(project_dir)
-    short_sha = get_git_short_sha(project_dir)
-    version_string = f'{base_version}-dev-{branch}-{short_sha}'
+
+    if env['PIOENV'] == 'default':
+        # Dev build: base version plus branch and commit, so a firmware built
+        # from a feature branch is never mistaken for a release. The branch and
+        # SHA already say where the build came from, so use the bare tag name
+        # rather than git describe's "-<distance>-g<sha>" suffix.
+        base_version = get_base_version(project_dir, bare=True)
+        branch = get_git_branch(project_dir)
+        short_sha = get_git_short_sha(project_dir)
+        version_string = f'{base_version}-dev-{branch}-{short_sha}'
+    else:
+        # Release build. On a release tag this is exactly "1.2.3"; off-tag,
+        # git describe appends the distance and commit ("1.2.3-4-gabc1234") so
+        # an ad-hoc release build is distinguishable from the real release.
+        version_string = (
+            get_version_from_git_tag(project_dir, exact=True)
+            or get_base_version(project_dir)
+        )
 
     env.Append(CPPDEFINES=[('CROSSPOINT_VERSION', f'\\"{version_string}\\"')])
     print(f'CrossPoint build version: {version_string}')
