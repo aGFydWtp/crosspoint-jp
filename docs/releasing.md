@@ -45,7 +45,14 @@ custom_i18n_languages = ENGLISH, JAPANESE
 
 **CI のチェックアウトには `fetch-depth: 0` が必要。** バージョンは `git describe` で求めるので、浅いクローンではタグに到達できず `0.0.0` になる。ビルドを行うワークフローには設定済み。
 
-**`GITHUB_TOKEN` で push したタグは `on: push: tags` を発火させない。** ワークフローの無限ループを防ぐための GitHub の仕様。このため `release-dispatch.yml` はタグを push したあと `gh workflow run release.yml --ref <タグ>` で `release.yml` を明示的に起動している（`workflow_dispatch` はこの制限の例外）。`release.yml` 側にも `workflow_dispatch` トリガーと、タグ以外の ref を弾く `if: startsWith(github.ref, 'refs/tags/')` ガードが必要。
+**`GITHUB_TOKEN` 由来のイベントはワークフローを起動しない。** ワークフローの無限ループを防ぐための GitHub の仕様で、`workflow_dispatch` と `repository_dispatch` だけが例外。リリースの連鎖はこれに二度引っかかるため、いずれも `gh workflow run` で明示的に起動している。
+
+| 連鎖 | 本来の契機 | 発火しない理由 | 対処 |
+|------|------------|----------------|------|
+| `release-dispatch.yml` → `release.yml` | タグ push | `GITHUB_TOKEN` で push したタグは push イベントを発生させない | `gh workflow run release.yml --ref <タグ>` |
+| `release.yml` → `deploy-flasher.yml` | `workflow_run` | `release.yml` の run 自体が `GITHUB_TOKEN` 由来なので完了時に `workflow_run` が発生しない | `gh workflow run deploy-flasher.yml --ref master` |
+
+そのため `release.yml` には `workflow_dispatch` トリガー、タグ以外の ref を弾く `if: startsWith(github.ref, 'refs/tags/')` ガード、`actions: write` 権限が必要。後者の連鎖は `github.event_name == 'workflow_dispatch'` のときだけ起動する（タグ push 経由なら `workflow_run` が通常どおり連鎖するため）。
 
 **fork 由来のタグを持ち込まない。** `--match 'v[0-9]*'` で絞ったうえで、`git describe` は HEAD の祖先しか見ないため通常は問題にならない。過去に cjk-fork 由来の `v0.2.x` / `v0.3.0` が混入していたが削除済み。
 
