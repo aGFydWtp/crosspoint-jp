@@ -3,9 +3,14 @@ on:
   push:
     tags:
       - '*'
+  # release-dispatch.yml がタグ ref を指定して起動する。GITHUB_TOKEN で push した
+  # タグは push イベントを発生させないため、上の push トリガーだけでは足りない。
+  workflow_dispatch:
 
 jobs:
   build-release:
+    # タグ以外の ref で誤って dispatch された場合に Release を作らないためのガード。
+    if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     permissions:
       contents: write
