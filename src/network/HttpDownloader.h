@@ -35,12 +35,12 @@ class HttpDownloader {
    * esp_http_client_request_send), which surfaces as http=1 in the activities'
    * diagnostics — not as a connect error.
    *
-   * The distinction matters because a TLS handshake needs ~45-55KB of
-   * contiguous heap on this device (MBEDTLS_SSL_IN/OUT_CONTENT_LEN are 16KB
-   * each and CONFIG_MBEDTLS_ASYMMETRIC_CONTENT_LEN is off). Spending an extra
-   * 2.5KB of pre-handshake heap on every request pushes the fragmented cases
-   * over the edge — see the Aozora author listing, which failed with
-   * ESP_ERR_HTTP_CONNECT at ~56KB free.
+   * The distinction matters because a TLS handshake still needs a ~16.5KB
+   * contiguous block for the inbound record buffer plus ~4KB for the outbound
+   * one (platformio.ini sets CONFIG_MBEDTLS_ASYMMETRIC_CONTENT_LEN with
+   * IN=16384 / OUT=4096). Spending an extra 2.5KB of pre-handshake heap on
+   * every request pushes the fragmented cases over the edge — see the Aozora
+   * author listing, which failed with ESP_ERR_HTTP_CONNECT at ~56KB free.
    */
   enum class BufferProfile {
     COMPACT,  // 2048 / 512 - everything except the GitHub release CDN
@@ -52,6 +52,28 @@ class HttpDownloader {
   // diagnostics. Positive value = HTTP response code, 0 = never set / no
   // response received. Not thread-safe (single-threaded HTTP path).
   static int lastHttpCode;
+
+  // Last TLS-layer failure behind an ESP_ERR_HTTP_CONNECT, captured with
+  // esp_http_client_get_and_clear_last_tls_error(). Fork-only diagnostics:
+  // ESP_ERR_HTTP_CONNECT alone cannot tell a name-resolution failure from a
+  // refused socket from a handshake that ran out of contiguous heap, and those
+  // need completely different fixes.
+  //
+  // Negative values are raw mbedtls errors, positive ones esp-tls errors; the
+  // ranges are disjoint, so a single int is unambiguous.
+  //
+  //   lastTlsError  0       = nothing was recorded at the TLS layer at all
+  //                 -32512  = MBEDTLS_ERR_SSL_ALLOC_FAILED (-0x7F00) -> out of
+  //                           contiguous heap for the 16.5KB/4KB SSL buffers
+  //                 32769   = ESP_ERR_ESP_TLS_CANNOT_RESOLVE_HOSTNAME (0x8001)
+  //                 32770   = ESP_ERR_ESP_TLS_CANNOT_CREATE_SOCKET (0x8002)
+  //                 32772   = ESP_ERR_ESP_TLS_FAILED_CONNECT_TO_HOST (0x8004)
+  //                 32774   = ESP_ERR_ESP_TLS_CONNECTION_TIMEOUT (0x8006)
+  //                 other   = see esp_tls_errors.h / mbedtls' ssl.h
+  //   lastTlsFlags  non-zero     = certificate verification failed; the bits are
+  //                                mbedtls' MBEDTLS_X509_BADCERT_* set
+  static int lastTlsError;
+  static int lastTlsFlags;
 
   /**
    * Fetch text content from a URL with optional credentials.

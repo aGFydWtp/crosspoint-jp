@@ -26,8 +26,10 @@ extern esp_err_t esp_crt_bundle_attach(void* conf);
 }
 #endif
 
-// fork-only: activities show this in error messages for diagnostics
+// fork-only: activities show these in error messages for diagnostics
 int HttpDownloader::lastHttpCode = 0;
+int HttpDownloader::lastTlsError = 0;
+int HttpDownloader::lastTlsFlags = 0;
 
 namespace {
 #if !defined(FREEINK_NET_WOLFSSL)
@@ -62,6 +64,32 @@ struct Sink {
 bool isRedirect(int status) {
   return status == 301 || status == 302 || status == 303 || status == 307 || status == 308;
 }
+
+#if !defined(FREEINK_NET_WOLFSSL)
+// Pull the TLS-layer reason out of the client after open() reported
+// ESP_ERR_HTTP_CONNECT. The transport clears it on read, so call this once, and
+// only on the failure path. Leaves the fields at 0 when the failure never
+// reached esp-tls (plain http, DNS, refused socket).
+void captureTlsError(esp_http_client_handle_t client) {
+  int mbedtlsCode = 0;
+  int flags = 0;
+  // The return value is esp-tls' own error (ESP_ERR_ESP_TLS_*, 0x8000-based),
+  // which is what separates "DNS never resolved" from "the socket was refused";
+  // the out-params carry the underlying mbedtls code. Both are meaningful, and
+  // the call wipes the handle, so read it exactly once and keep whichever is
+  // set. The two ranges are disjoint — mbedtls codes are negative, esp-tls ones
+  // positive — so one int can hold either without ambiguity.
+  const esp_err_t layerErr = esp_http_client_get_and_clear_last_tls_error(client, &mbedtlsCode, &flags);
+  if (layerErr == ESP_ERR_INVALID_STATE) return;  // plain http: no TLS handle to report on
+
+  HttpDownloader::lastTlsError = mbedtlsCode != 0 ? mbedtlsCode : static_cast<int>(layerErr);
+  HttpDownloader::lastTlsFlags = flags;
+  if (HttpDownloader::lastTlsError || flags) {
+    LOG_ERR("HTTP", "TLS error: esp_tls=0x%X mbedtls=%d (-0x%X) flags=0x%X", layerErr, mbedtlsCode, -mbedtlsCode,
+            flags);
+  }
+}
+#endif
 
 #if defined(FREEINK_NET_WOLFSSL)
 HttpDownloader::DownloadError runGetWolf(const std::string& startUrl, const std::string& username,
@@ -136,7 +164,10 @@ HttpDownloader::DownloadError runGetWolf(const std::string& startUrl, const std:
 HttpDownloader::DownloadError runGet(const std::string& url, const std::string& username, const std::string& password,
                                      Sink& sink, HttpDownloader::BufferProfile buffers) {
   const bool large = buffers == HttpDownloader::BufferProfile::LARGE;
-  HttpDownloader::lastHttpCode = 0;  // reset before each attempt so activities' diagnostics reflect this call only
+  // reset before each attempt so activities' diagnostics reflect this call only
+  HttpDownloader::lastHttpCode = 0;
+  HttpDownloader::lastTlsError = 0;
+  HttpDownloader::lastTlsFlags = 0;
   esp_http_client_config_t config = {};
   config.url = url.c_str();
   config.buffer_size = large ? HTTP_RX_BUF_LARGE : HTTP_RX_BUF_COMPACT;
@@ -172,6 +203,7 @@ HttpDownloader::DownloadError runGet(const std::string& url, const std::string& 
   if (err != ESP_OK) {
     LOG_ERR("HTTP", "open failed: %s", esp_err_to_name(err));
     HttpDownloader::lastHttpCode = -static_cast<int>(err);  // fork: 負値=esp_err で診断表示
+    captureTlsError(client);
     esp_http_client_cleanup(client);
     return HttpDownloader::HTTP_ERROR;
   }
@@ -185,6 +217,7 @@ HttpDownloader::DownloadError runGet(const std::string& url, const std::string& 
     if (err != ESP_OK) {
       LOG_ERR("HTTP", "redirect open failed: %s", esp_err_to_name(err));
       HttpDownloader::lastHttpCode = -static_cast<int>(err);  // fork: 負値=esp_err で診断表示
+      captureTlsError(client);
       esp_http_client_cleanup(client);
       return HttpDownloader::HTTP_ERROR;
     }

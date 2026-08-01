@@ -91,11 +91,14 @@ bool FontDownloadActivity::fetchAndParseManifest() {
   if (result != HttpDownloader::OK) {
     LOG_ERR("FONT", "Manifest fetch failed (err=%d, http=%d, heap=%zu)", result, HttpDownloader::lastHttpCode,
             heapBefore);
-    char buf[80];
-    // blk = largest contiguous block; a TLS handshake needs ~45-55KB of it, so
-    // free heap alone cannot distinguish exhaustion from fragmentation.
-    snprintf(buf, sizeof(buf), "err=%d http=%d heap=%zuKB blk=%dKB", static_cast<int>(result),
-             HttpDownloader::lastHttpCode, heapBefore / 1024, static_cast<int>(ESP.getMaxAllocHeap() / 1024));
+    char buf[96];
+    // blk = largest contiguous block; the TLS handshake needs a ~16.5KB one for
+    // the inbound record buffer, so free heap alone cannot distinguish
+    // exhaustion from fragmentation. tls is the mbedtls/esp-tls reason behind an
+    // ESP_ERR_HTTP_CONNECT (0 = never reached TLS, so DNS or the TCP connect).
+    snprintf(buf, sizeof(buf), "err=%d http=%d tls=%d/%X heap=%zuKB blk=%dKB", static_cast<int>(result),
+             HttpDownloader::lastHttpCode, HttpDownloader::lastTlsError, HttpDownloader::lastTlsFlags,
+             heapBefore / 1024, static_cast<int>(ESP.getMaxAllocHeap() / 1024));
     errorMessage_ = buf;
     Storage.remove(MANIFEST_TMP);
     return false;
@@ -278,14 +281,15 @@ void FontDownloadActivity::downloadFamily(ManifestFamily& family) {
       LOG_ERR("FONT", "Download failed: %s err=%d http=%d heap=%d blk=%d got=%zu", file.name, static_cast<int>(result),
               HttpDownloader::lastHttpCode, static_cast<int>(ESP.getFreeHeap()),
               static_cast<int>(ESP.getMaxAllocHeap()), fileProgress_);
-      char buf[80];
+      char buf[112];
       // Same diagnostics as the manifest fetch: err is DownloadError, http is
-      // either an HTTP status or a negated esp_err_t, and blk is the largest
-      // contiguous block (a TLS handshake needs ~45-55KB of it). got is how far
-      // the transfer got before it died, rounded to the last whole percent.
-      snprintf(buf, sizeof(buf), "err=%d http=%d heap=%dKB blk=%dKB got=%dKB", static_cast<int>(result),
-               HttpDownloader::lastHttpCode, static_cast<int>(ESP.getFreeHeap() / 1024),
-               static_cast<int>(ESP.getMaxAllocHeap() / 1024), static_cast<int>(fileProgress_ / 1024));
+      // either an HTTP status or a negated esp_err_t, tls is the TLS-layer
+      // reason behind it, and blk is the largest contiguous block. got is how
+      // far the transfer got before it died, rounded to the last whole percent.
+      snprintf(buf, sizeof(buf), "err=%d http=%d tls=%d/%X heap=%dKB blk=%dKB got=%dKB", static_cast<int>(result),
+               HttpDownloader::lastHttpCode, HttpDownloader::lastTlsError, HttpDownloader::lastTlsFlags,
+               static_cast<int>(ESP.getFreeHeap() / 1024), static_cast<int>(ESP.getMaxAllocHeap() / 1024),
+               static_cast<int>(fileProgress_ / 1024));
       RenderLock lock(*this);
       state_ = ERROR;
       errorMessage_ = std::string("Download failed: ") + file.name;
