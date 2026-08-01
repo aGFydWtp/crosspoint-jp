@@ -36,11 +36,12 @@ class HttpDownloader {
    * diagnostics — not as a connect error.
    *
    * The distinction matters because a TLS handshake still needs a ~16.5KB
-   * contiguous block for the inbound record buffer plus ~4KB for the outbound
+   * contiguous block for the inbound record buffer plus ~2KB for the outbound
    * one (platformio.ini sets CONFIG_MBEDTLS_ASYMMETRIC_CONTENT_LEN with
-   * IN=16384 / OUT=4096). Spending an extra 2.5KB of pre-handshake heap on
-   * every request pushes the fragmented cases over the edge — see the Aozora
-   * author listing, which failed with ESP_ERR_HTTP_CONNECT at ~56KB free.
+   * IN=16384 / OUT=2048 — and note that those values only reach the device
+   * because scripts/patch_espidf_libcopy.py fixes the archive copy-back).
+   * Every extra kilobyte held before the handshake counts, so keep the profiles
+   * as small as the measurements allow.
    */
   // Only the TX buffer differs; RX is 2048 either way. See the .cpp for the
   // measurements behind both numbers.
@@ -66,7 +67,7 @@ class HttpDownloader {
   //
   //   lastTlsError  0       = nothing was recorded at the TLS layer at all
   //                 -32512  = MBEDTLS_ERR_SSL_ALLOC_FAILED (-0x7F00) -> out of
-  //                           contiguous heap for the 16.5KB/4KB SSL buffers
+  //                           contiguous heap for the 16.5KB/2KB SSL buffers
   //                 32769   = ESP_ERR_ESP_TLS_CANNOT_RESOLVE_HOSTNAME (0x8001)
   //                 32770   = ESP_ERR_ESP_TLS_CANNOT_CREATE_SOCKET (0x8002)
   //                 32772   = ESP_ERR_ESP_TLS_FAILED_CONNECT_TO_HOST (0x8004)

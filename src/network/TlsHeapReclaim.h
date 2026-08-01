@@ -9,7 +9,7 @@ class GfxRenderer;
  * A TLS handshake on this device needs a ~16.5KB contiguous block for the
  * inbound record buffer (CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN cannot go lower:
  * release-assets.githubusercontent.com was measured sending full 16,408-byte
- * records) plus ~4KB for the outbound one, and then a few KB more in small
+ * records) plus ~2KB for the outbound one, and then a few KB more in small
  * chunks while mbedtls parses the peer chain and verifies the signature against
  * the CA bundle. Starving that last stage surfaces as tls=12288
  * (-MBEDTLS_ERR_X509_FATAL_ERROR), which reads like a certificate problem but

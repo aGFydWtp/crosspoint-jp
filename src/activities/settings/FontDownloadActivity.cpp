@@ -102,7 +102,7 @@ bool FontDownloadActivity::fetchAndParseManifest() {
   if (result != HttpDownloader::OK) {
     LOG_ERR("FONT", "Manifest fetch failed (err=%d, http=%d, heap=%zu)", result, HttpDownloader::lastHttpCode,
             heapBefore);
-    char buf[112];
+    char buf[160];
     // blk = largest contiguous block; the TLS handshake needs a ~16.5KB one for
     // the inbound record buffer, so free heap alone cannot distinguish
     // exhaustion from fragmentation. tls is the mbedtls/esp-tls reason behind an
@@ -261,12 +261,11 @@ void FontDownloadActivity::downloadFamily(ManifestFamily& family) {
     requestUpdateAndWait();
 
     // Reclaim before every file, not just once on entry: drawing the progress
-    // screen between files re-fills the glyph caches this frees, so by the
-    // second file the handshake is working with less than it had for the first.
-    // The margin is genuinely this thin — a failure here surfaces as
-    // MBEDTLS_ERR_RSA_PUBLIC_FAILED + MBEDTLS_ERR_MPI_ALLOC_FAILED while
-    // verifying the root's signature, i.e. a ~2.5KB allocation that could not
-    // be satisfied.
+    // screen between files re-fills the glyph caches this frees, so without it
+    // each successive file starts from a more fragmented arena than the last.
+    // Cheap insurance rather than a fix — the failures that motivated it were
+    // caused by the record buffers being twice their configured size, which
+    // scripts/patch_espidf_libcopy.py resolved.
     reclaimHeapForTls(renderer, "FONT");
 
     char destPath[128];
@@ -322,7 +321,7 @@ void FontDownloadActivity::downloadFamily(ManifestFamily& family) {
       LOG_ERR("FONT", "Download failed: %s err=%d http=%d heap=%d blk=%d got=%zu", file.name, static_cast<int>(result),
               HttpDownloader::lastHttpCode, static_cast<int>(ESP.getFreeHeap()),
               static_cast<int>(ESP.getMaxAllocHeap()), fileProgress_);
-      char buf[128];
+      char buf[160];
       // Same diagnostics as the manifest fetch: err is DownloadError, http is
       // either an HTTP status or a negated esp_err_t, tls is the TLS-layer
       // reason behind it, and blk is the largest contiguous block. got is how
@@ -550,12 +549,10 @@ void FontDownloadActivity::render(RenderLock&&) {
     GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
   }
 
-  // Live heap readout, so the reproduction can be measured instead of guessed:
-  // a download started right after boot succeeds, while the same download after
-  // opening and closing a book fails at the certificate check with only 11KB
-  // free inside the handshake. Reading this line in both states shows exactly
-  // how much the reading session never gave back — and every failure so far has
-  // been that shortfall, not anything about the certificate itself.
+  // Live heap readout. Added to measure a reproduction that had resisted
+  // guesswork — downloads succeeded right after boot and failed after a reading
+  // session — and kept because comparing this number across states is the
+  // fastest way to tell a heap regression from a network one.
   if (SETTINGS.debugDisplay) {
     char dbg[48];
     snprintf(dbg, sizeof(dbg), "heap=%dK blk=%dK", static_cast<int>(ESP.getFreeHeap() / 1024),

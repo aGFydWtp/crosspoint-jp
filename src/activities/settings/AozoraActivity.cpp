@@ -180,7 +180,7 @@ static bool fetchApiJson(const char* url, JsonDocument& doc) {
   }
 
   if (result != HttpDownloader::OK) {
-    char buf[128];
+    char buf[160];
     formatNetworkError(buf, sizeof(buf), static_cast<int>(result));
     lastApiError_ = buf;
     return false;
@@ -336,7 +336,7 @@ bool AozoraActivity::downloadWithRetry(const char* url, const char* destPath) {
             static_cast<int>(ESP.getFreeHeap()), static_cast<int>(ESP.getMaxAllocHeap()));
   }
 
-  char buf[128];
+  char buf[160];
   formatNetworkError(buf, sizeof(buf), static_cast<int>(result));
   errorMessage_ = buf;
   return false;

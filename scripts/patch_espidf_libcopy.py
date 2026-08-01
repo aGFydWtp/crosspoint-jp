@@ -49,6 +49,11 @@ Applied idempotently — safe to run on every build. Rewrites espidf.py only whe
 the marker is absent, and does nothing at all on a platform that already copies
 nested archives itself (detected via copy_idf_component_archives), so bumping
 the platform later needs no change here.
+
+Note that espidf.py lives in the shared PlatformIO platform directory, so this
+also changes idf_lib_copy for every other project on the machine. That is a
+strict improvement — those projects were losing the same archives — but it is a
+side effect worth knowing about.
 """
 
 Import("env")
@@ -69,9 +74,15 @@ INSERT = """
         # upstream mbedTLS builds into esp-idf/mbedtls/mbedtls/library/ and
         # .../3rdparty/. Without these, every mbedTLS setting in
         # custom_sdkconfig is compiled and then discarded.
-        for nested in Path(lib_src).rglob("*.a"):
-            if nested.parent.parent == Path(lib_src):
-                continue  # already handled one level up
+        # Scoped to mbedtls on purpose. A blanket rglob over lib_src would also
+        # pick up any other component's nested archives, and since only
+        # libmbedtls.a gets renamed here, a basename colliding with a top-level
+        # archive would be overwritten without a word. Upstream's fix renames
+        # collisions generically (_2/_3/...); this one only claims to fix the
+        # case it was written for.
+        for nested in (Path(lib_src) / "mbedtls").rglob("*.a"):
+            if nested.parent == Path(lib_src) / "mbedtls":
+                continue  # the component wrapper, already handled one level up
             # ld_libs expects -lmbedtls for the component wrapper and
             # -lmbedtls_2 for the upstream core; both are named libmbedtls.a.
             name = "libmbedtls_2.a" if nested.name == "libmbedtls.a" else nested.name
