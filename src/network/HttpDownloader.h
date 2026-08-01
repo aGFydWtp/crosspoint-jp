@@ -28,10 +28,12 @@ class HttpDownloader {
    * front and held for the whole connection.
    *
    * COMPACT is the default. LARGE exists only for GitHub's release CDN: the
-   * redirect target (objects.githubusercontent.com) is a signed URL whose
-   * path+query runs 700-900 bytes, so the redirected GET's request line
+   * redirect target (release-assets.githubusercontent.com) is a signed URL
+   * whose path+query runs 700-900 bytes, so the redirected GET's request line
    * overflows a 512-byte TX buffer and the reopen fails before any byte
-   * arrives.
+   * arrives. esp_http_client reports that as ESP_FAIL ("Out of buffer" in
+   * esp_http_client_request_send), which surfaces as http=1 in the activities'
+   * diagnostics — not as a connect error.
    *
    * The distinction matters because a TLS handshake needs ~45-55KB of
    * contiguous heap on this device (MBEDTLS_SSL_IN/OUT_CONTENT_LEN are 16KB
@@ -71,5 +73,6 @@ class HttpDownloader {
    */
   static DownloadError downloadToFile(const std::string& url, const std::string& destPath,
                                       ProgressCallback progress = nullptr, bool* cancelFlag = nullptr,
-                                      const std::string& username = "", const std::string& password = "");
+                                      const std::string& username = "", const std::string& password = "",
+                                      BufferProfile buffers = BufferProfile::COMPACT);
 };

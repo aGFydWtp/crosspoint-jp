@@ -80,8 +80,14 @@ bool FontDownloadActivity::fetchAndParseManifest() {
   // This avoids holding both TLS buffers and manifest data in RAM.
   static constexpr const char* MANIFEST_TMP = "/fonts_manifest.tmp";
 
+  errorDetail_.clear();  // don't let a previous failure's diagnostics linger
   const size_t heapBefore = ESP.getFreeHeap();
-  auto result = HttpDownloader::downloadToFile(FONT_MANIFEST_URL, MANIFEST_TMP, nullptr);
+  // LARGE buffers: the manifest lives on a GitHub release, which redirects to a
+  // signed release-assets.githubusercontent.com URL ~860 bytes long. That request
+  // line does not fit the default 512-byte TX buffer, so the reopen after the 302
+  // fails with ESP_FAIL before any byte arrives — see HttpDownloader::BufferProfile.
+  auto result = HttpDownloader::downloadToFile(FONT_MANIFEST_URL, MANIFEST_TMP, nullptr, nullptr, "", "",
+                                               HttpDownloader::BufferProfile::LARGE);
   if (result != HttpDownloader::OK) {
     LOG_ERR("FONT", "Manifest fetch failed (err=%d, http=%d, heap=%zu)", result, HttpDownloader::lastHttpCode,
             heapBefore);
@@ -116,38 +122,52 @@ bool FontDownloadActivity::fetchAndParseManifest() {
     return false;
   }
 
-  baseUrl_ = doc["baseUrl"] | "";
+  snprintf(baseUrl_, sizeof(baseUrl_), "%s", doc["baseUrl"] | "");
   families_.clear();
+  allFiles_.clear();
 
   JsonArray familiesArr = doc["families"].as<JsonArray>();
   families_.reserve(familiesArr.size());
 
+  // Count the files up front so allFiles_ is reserved exactly. Walking the
+  // JsonArray twice is far cheaper than the reallocate-copy-free cycles a
+  // growing vector would inflict on an already tight arena. The manifest's
+  // "styles" array is deliberately ignored: it is empty for every family and
+  // nothing reads it.
+  size_t fileCountTotal = 0;
+  for (JsonObject fObj : familiesArr) fileCountTotal += fObj["files"].as<JsonArray>().size();
+  allFiles_.reserve(fileCountTotal);
+
   for (JsonObject fObj : familiesArr) {
     ManifestFamily family;
-    family.name = fObj["name"] | "";
-    family.description = fObj["description"] | "";
+    snprintf(family.name, sizeof(family.name), "%s", fObj["name"] | "");
+    snprintf(family.description, sizeof(family.description), "%s", fObj["description"] | "");
 
-    for (JsonVariant s : fObj["styles"].as<JsonArray>()) {
-      family.styles.push_back(s.as<std::string>());
-    }
-
+    family.fileStart = static_cast<uint16_t>(allFiles_.size());
+    family.fileCount = 0;
     family.totalSize = 0;
     for (JsonObject fileObj : fObj["files"].as<JsonArray>()) {
+      if (family.fileCount == UINT8_MAX) {
+        LOG_ERR("FONT", "Too many files in family %s; ignoring the rest", family.name);
+        break;
+      }
       ManifestFile file;
-      file.name = fileObj["name"] | "";
-      file.size = fileObj["size"] | 0;
+      snprintf(file.name, sizeof(file.name), "%s", fileObj["name"] | "");
+      file.size = fileObj["size"] | 0u;
       family.totalSize += file.size;
-      family.files.push_back(std::move(file));
+      allFiles_.push_back(file);
+      family.fileCount++;
     }
 
-    family.installed = fontInstaller_.isFamilyInstalled(family.name.c_str());
+    family.installed = fontInstaller_.isFamilyInstalled(family.name);
 
     // Detect updates by comparing manifest file sizes with files on disk.
     // Not a checksum, but a size mismatch reliably indicates a rebuild in practice.
     if (family.installed) {
-      for (const auto& file : family.files) {
+      for (uint8_t i = 0; i < family.fileCount; i++) {
+        const auto& file = allFiles_[family.fileStart + i];
         char path[128];
-        FontInstaller::buildFontPath(family.name.c_str(), file.name.c_str(), path, sizeof(path));
+        FontInstaller::buildFontPath(family.name, file.name, path, sizeof(path));
         FsFile f;
         if (Storage.openFileForRead("FONT", path, f)) {
           size_t actual = f.fileSize();
@@ -197,24 +217,25 @@ size_t FontDownloadActivity::totalUninstalledSize() const {
 void FontDownloadActivity::downloadFamily(ManifestFamily& family) {
   {
     RenderLock lock(*this);
+    errorDetail_.clear();  // don't let a previous failure's diagnostics linger
     state_ = DOWNLOADING;
     downloadingFamilyIndex_ = static_cast<int>(&family - families_.data());
     currentFileIndex_ = 0;
-    currentFileTotal_ = family.files.size();
+    currentFileTotal_ = family.fileCount;
     fileProgress_ = 0;
     fileTotal_ = 0;
   }
   requestUpdateAndWait();
 
-  if (!fontInstaller_.ensureFamilyDir(family.name.c_str())) {
+  if (!fontInstaller_.ensureFamilyDir(family.name)) {
     RenderLock lock(*this);
     state_ = ERROR;
     errorMessage_ = "Failed to create font directory";
     return;
   }
 
-  for (size_t i = 0; i < family.files.size(); i++) {
-    const auto& file = family.files[i];
+  for (uint8_t i = 0; i < family.fileCount; i++) {
+    const auto& file = allFiles_[family.fileStart + i];
 
     {
       RenderLock lock(*this);
@@ -225,21 +246,50 @@ void FontDownloadActivity::downloadFamily(ManifestFamily& family) {
     requestUpdateAndWait();
 
     char destPath[128];
-    FontInstaller::buildFontPath(family.name.c_str(), file.name.c_str(), destPath, sizeof(destPath));
+    FontInstaller::buildFontPath(family.name, file.name, destPath, sizeof(destPath));
 
-    std::string url = baseUrl_ + file.name;
+    // Stack buffer, not std::string concatenation: this runs immediately before
+    // the TLS handshake, where a transient heap allocation is exactly what the
+    // contiguous-block budget cannot afford. baseUrl_ is 67 bytes, names reach 30.
+    char url[192];
+    snprintf(url, sizeof(url), "%s%s", baseUrl_, file.name);
 
-    auto result = HttpDownloader::downloadToFile(url, destPath, [this](size_t downloaded, size_t total) {
-      fileProgress_ = downloaded;
-      fileTotal_ = total;
-      requestUpdate(true);
-    });
+    // Fire the render task only on whole-percent change. HttpDownloader reads in
+    // 1KB chunks, so a per-chunk update would wake the render task ~400 times for
+    // a single font file; that framebuffer work contends with TLS on the internal
+    // arena and e-ink cannot repaint faster than a percent tick anyway. Same
+    // reasoning as the OTA download — see OtaUpdater::installUpdate.
+    int lastReportedPct = -1;
+    // LARGE buffers for the same reason as the manifest fetch: the signed
+    // redirect target runs ~900 bytes for the longest font file name.
+    auto result = HttpDownloader::downloadToFile(
+        url, destPath,
+        [this, &lastReportedPct](size_t downloaded, size_t total) {
+          const int pct = total > 0 ? static_cast<int>(static_cast<uint64_t>(downloaded) * 100 / total) : 0;
+          if (pct == lastReportedPct) return;
+          lastReportedPct = pct;
+          fileProgress_ = downloaded;
+          fileTotal_ = total;
+          requestUpdate(true);
+        },
+        nullptr, "", "", HttpDownloader::BufferProfile::LARGE);
 
     if (result != HttpDownloader::OK) {
-      LOG_ERR("FONT", "Download failed: %s (%d)", file.name.c_str(), result);
+      LOG_ERR("FONT", "Download failed: %s err=%d http=%d heap=%d blk=%d got=%zu", file.name, static_cast<int>(result),
+              HttpDownloader::lastHttpCode, static_cast<int>(ESP.getFreeHeap()),
+              static_cast<int>(ESP.getMaxAllocHeap()), fileProgress_);
+      char buf[80];
+      // Same diagnostics as the manifest fetch: err is DownloadError, http is
+      // either an HTTP status or a negated esp_err_t, and blk is the largest
+      // contiguous block (a TLS handshake needs ~45-55KB of it). got is how far
+      // the transfer got before it died, rounded to the last whole percent.
+      snprintf(buf, sizeof(buf), "err=%d http=%d heap=%dKB blk=%dKB got=%dKB", static_cast<int>(result),
+               HttpDownloader::lastHttpCode, static_cast<int>(ESP.getFreeHeap() / 1024),
+               static_cast<int>(ESP.getMaxAllocHeap() / 1024), static_cast<int>(fileProgress_ / 1024));
       RenderLock lock(*this);
       state_ = ERROR;
-      errorMessage_ = "Download failed: " + file.name;
+      errorMessage_ = std::string("Download failed: ") + file.name;
+      errorDetail_ = buf;
       return;
     }
 
@@ -248,7 +298,7 @@ void FontDownloadActivity::downloadFamily(ManifestFamily& family) {
       Storage.remove(destPath);
       RenderLock lock(*this);
       state_ = ERROR;
-      errorMessage_ = "Invalid font file: " + file.name;
+      errorMessage_ = std::string("Invalid font file: ") + file.name;
       return;
     }
   }
@@ -395,7 +445,7 @@ void FontDownloadActivity::render(RenderLock&&) {
 
       size_t totalFiles = 0;
       for (const auto& f : families_) {
-        if (!f.installed) totalFiles += f.files.size();
+        if (!f.installed) totalFiles += f.fileCount;
       }
       renderer.drawText(UI_10_FONT_ID, metrics.contentSidePadding, y,
                         (std::string(tr(STR_FILES_LABEL)) + std::to_string(totalFiles)).c_str());
@@ -409,7 +459,7 @@ void FontDownloadActivity::render(RenderLock&&) {
       renderer.drawCenteredText(UI_10_FONT_ID, y, confirmText.c_str());
       y += lineHeight + metrics.verticalSpacing;
       renderer.drawText(UI_10_FONT_ID, metrics.contentSidePadding, y,
-                        (std::string(tr(STR_FILES_LABEL)) + std::to_string(family.files.size())).c_str());
+                        (std::string(tr(STR_FILES_LABEL)) + std::to_string(family.fileCount)).c_str());
       y += lineHeight + metrics.verticalSpacing;
       renderer.drawText(UI_10_FONT_ID, metrics.contentSidePadding, y,
                         (std::string(tr(STR_SIZE_LABEL)) + formatSize(family.totalSize)).c_str());
@@ -447,6 +497,9 @@ void FontDownloadActivity::render(RenderLock&&) {
                               EpdFontFamily::BOLD);
     if (!errorMessage_.empty()) {
       renderer.drawCenteredText(UI_10_FONT_ID, centerY + metrics.verticalSpacing, errorMessage_.c_str());
+    }
+    if (!errorDetail_.empty()) {
+      renderer.drawCenteredText(UI_10_FONT_ID, centerY + metrics.verticalSpacing + lineHeight, errorDetail_.c_str());
     }
     const auto labels = mappedInput.mapLabels(tr(STR_BACK), "", "", "");
     GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
