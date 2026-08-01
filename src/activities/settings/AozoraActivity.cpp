@@ -15,6 +15,7 @@
 #include "components/UITheme.h"
 #include "fontIds.h"
 #include "network/HttpDownloader.h"
+#include "network/TlsHeapReclaim.h"
 
 // --- 50音行定義 ---
 
@@ -87,13 +88,7 @@ void AozoraActivity::onWifiSelectionComplete(const bool success) {
     return;
   }
 
-  // Free ExternalFont LRU caches (~34KB each) to make room for TLS buffers.
-  FontManager& fm = FontManager::getInstance();
-  ExternalFont* uiFont = fm.getActiveUiFont();
-  ExternalFont* readerFont = fm.getActiveFont();
-  if (uiFont) uiFont->unload();
-  if (readerFont) readerFont->unload();
-  LOG_DBG("AOZORA", "Freed font caches, heap=%d", ESP.getFreeHeap());
+  reclaimHeapForTls(renderer, "AOZORA");
 
   // Load download index
   indexManager_.loadAndPurge();
@@ -160,9 +155,10 @@ static constexpr int API_MAX_RETRIES = 3;
 // that (0 = the failure never reached TLS, so it was DNS or the TCP connect);
 // -32512 is MBEDTLS_ERR_SSL_ALLOC_FAILED, which pins it on the heap.
 static void formatNetworkError(char* buf, size_t bufSize, int result) {
-  snprintf(buf, bufSize, "err=%d http=%d tls=%d/%X heap=%dKB blk=%dKB", result, HttpDownloader::lastHttpCode,
-           HttpDownloader::lastTlsError, HttpDownloader::lastTlsFlags, static_cast<int>(ESP.getFreeHeap() / 1024),
-           static_cast<int>(ESP.getMaxAllocHeap() / 1024));
+  snprintf(buf, bufSize, "err=%d http=%d tls=%d/%X crt=%d/%X p=%d/%d f=%d/%d", result, HttpDownloader::lastHttpCode,
+           HttpDownloader::lastTlsError, HttpDownloader::lastTlsFlags, HttpDownloader::lastCrtDiag,
+           HttpDownloader::lastCrtErr, HttpDownloader::lastPreHeapKb, HttpDownloader::lastPreBlkKb,
+           HttpDownloader::lastCrtHeapKb, HttpDownloader::lastCrtBlkKb);
 }
 
 static bool fetchApiJson(const char* url, JsonDocument& doc) {
