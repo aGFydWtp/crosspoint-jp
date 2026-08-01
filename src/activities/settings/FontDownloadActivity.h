@@ -70,6 +70,9 @@ class FontDownloadActivity : public Activity {
   size_t fileTotal_ = 0;
   int downloadingFamilyIndex_ = 0;
   std::string errorMessage_;
+  // Second error line: err/http/heap diagnostics. Kept separate from
+  // errorMessage_ so the failing file name stays readable on its own line.
+  std::string errorDetail_;
 
   void onWifiSelectionComplete(bool success);
   bool fetchAndParseManifest();

@@ -80,6 +80,7 @@ bool FontDownloadActivity::fetchAndParseManifest() {
   // This avoids holding both TLS buffers and manifest data in RAM.
   static constexpr const char* MANIFEST_TMP = "/fonts_manifest.tmp";
 
+  errorDetail_.clear();  // don't let a previous failure's diagnostics linger
   const size_t heapBefore = ESP.getFreeHeap();
   // LARGE buffers: the manifest lives on a GitHub release, which redirects to a
   // signed release-assets.githubusercontent.com URL ~860 bytes long. That request
@@ -202,6 +203,7 @@ size_t FontDownloadActivity::totalUninstalledSize() const {
 void FontDownloadActivity::downloadFamily(ManifestFamily& family) {
   {
     RenderLock lock(*this);
+    errorDetail_.clear();  // don't let a previous failure's diagnostics linger
     state_ = DOWNLOADING;
     downloadingFamilyIndex_ = static_cast<int>(&family - families_.data());
     currentFileIndex_ = 0;
@@ -234,11 +236,20 @@ void FontDownloadActivity::downloadFamily(ManifestFamily& family) {
 
     std::string url = baseUrl_ + file.name;
 
+    // Fire the render task only on whole-percent change. HttpDownloader reads in
+    // 1KB chunks, so a per-chunk update would wake the render task ~400 times for
+    // a single font file; that framebuffer work contends with TLS on the internal
+    // arena and e-ink cannot repaint faster than a percent tick anyway. Same
+    // reasoning as the OTA download — see OtaUpdater::installUpdate.
+    int lastReportedPct = -1;
     // LARGE buffers for the same reason as the manifest fetch: the signed
     // redirect target runs ~900 bytes for the longest font file name.
     auto result = HttpDownloader::downloadToFile(
         url, destPath,
-        [this](size_t downloaded, size_t total) {
+        [this, &lastReportedPct](size_t downloaded, size_t total) {
+          const int pct = total > 0 ? static_cast<int>(static_cast<uint64_t>(downloaded) * 100 / total) : 0;
+          if (pct == lastReportedPct) return;
+          lastReportedPct = pct;
           fileProgress_ = downloaded;
           fileTotal_ = total;
           requestUpdate(true);
@@ -246,10 +257,21 @@ void FontDownloadActivity::downloadFamily(ManifestFamily& family) {
         nullptr, "", "", HttpDownloader::BufferProfile::LARGE);
 
     if (result != HttpDownloader::OK) {
-      LOG_ERR("FONT", "Download failed: %s (%d)", file.name.c_str(), result);
+      LOG_ERR("FONT", "Download failed: %s err=%d http=%d heap=%d blk=%d got=%zu", file.name.c_str(),
+              static_cast<int>(result), HttpDownloader::lastHttpCode, static_cast<int>(ESP.getFreeHeap()),
+              static_cast<int>(ESP.getMaxAllocHeap()), fileProgress_);
+      char buf[80];
+      // Same diagnostics as the manifest fetch: err is DownloadError, http is
+      // either an HTTP status or a negated esp_err_t, and blk is the largest
+      // contiguous block (a TLS handshake needs ~45-55KB of it). got is how far
+      // the transfer got before it died, rounded to the last whole percent.
+      snprintf(buf, sizeof(buf), "err=%d http=%d heap=%dKB blk=%dKB got=%dKB", static_cast<int>(result),
+               HttpDownloader::lastHttpCode, static_cast<int>(ESP.getFreeHeap() / 1024),
+               static_cast<int>(ESP.getMaxAllocHeap() / 1024), static_cast<int>(fileProgress_ / 1024));
       RenderLock lock(*this);
       state_ = ERROR;
       errorMessage_ = "Download failed: " + file.name;
+      errorDetail_ = buf;
       return;
     }
 
@@ -457,6 +479,9 @@ void FontDownloadActivity::render(RenderLock&&) {
                               EpdFontFamily::BOLD);
     if (!errorMessage_.empty()) {
       renderer.drawCenteredText(UI_10_FONT_ID, centerY + metrics.verticalSpacing, errorMessage_.c_str());
+    }
+    if (!errorDetail_.empty()) {
+      renderer.drawCenteredText(UI_10_FONT_ID, centerY + metrics.verticalSpacing + lineHeight, errorDetail_.c_str());
     }
     const auto labels = mappedInput.mapLabels(tr(STR_BACK), "", "", "");
     GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
