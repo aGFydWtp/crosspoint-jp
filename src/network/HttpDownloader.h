@@ -43,8 +43,9 @@ class HttpDownloader {
    * author listing, which failed with ESP_ERR_HTTP_CONNECT at ~56KB free.
    */
   enum class BufferProfile {
-    COMPACT,  // 2048 / 512 - everything except the GitHub release CDN
-    LARGE,    // 4096 / 1024 - long signed redirect URLs
+    COMPACT,  // 2048 / 512  - everything except the GitHub release CDN
+    LARGE,    // 2048 / 1536 - long signed redirect URLs; see the .cpp for the
+              //               measurements behind both numbers
   };
 
   // Last HTTP status code observed by runGet(). Fork-only: activities
@@ -74,6 +75,46 @@ class HttpDownloader {
   //                                mbedtls' MBEDTLS_X509_BADCERT_* set
   static int lastTlsError;
   static int lastTlsFlags;
+
+  // Which esp_crt_bundle failure produced a tls=12288. mbedtls collapses every
+  // certificate rejection into MBEDTLS_ERR_X509_FATAL_ERROR, so this is the
+  // only way to tell them apart without a serial console:
+  //   0 = no certificate failure recorded
+  //   1 = bundle never attached
+  //   2 = parsing the root's public key failed  -> out of memory
+  //   3 = key type / signature algorithm mismatch
+  //   4 = hash algorithm unsupported in this build
+  //   5 = hashing the certificate body failed
+  //   6 = signature rejected, or an MPI allocation failed inside the verify
+  //   7 = only the generic wrapper was seen (should not happen; 2-6 precede it)
+  //   8 = no matching trusted root in the bundle
+  static int lastCrtDiag;
+
+  // The mbedtls error code carried by the "PK parse/verify failed with error
+  // 0x%x" log line, positive (as logged). 0x4300 is
+  // MBEDTLS_ERR_RSA_VERIFY_FAILED — the signature was genuinely rejected;
+  // 0x0010 is MBEDTLS_ERR_MPI_ALLOC_FAILED — it ran out of memory instead.
+  static int lastCrtErr;
+
+  // Free heap and largest free block, in KB, sampled *inside* the failing
+  // handshake rather than after it unwinds. This is the only view of the state
+  // the failed allocation actually faced.
+  static int lastCrtHeapKb;
+  static int lastCrtBlkKb;
+
+  // Free heap / largest block at the start of the request, before any
+  // esp_http_client or mbedtls allocation. The gap to lastCrtHeapKb is what the
+  // connection cost.
+  static int lastPreHeapKb;
+  static int lastPreBlkKb;
+
+  // Captured by a heap_caps failed-allocation callback, i.e. at the instant the
+  // allocator gave up rather than after the caller unwound. lastFailSize is the
+  // requested byte count, lastFailBlk the largest block that existed then (in
+  // bytes — at these sizes kilobytes hide the answer).
+  static int lastFailSize;
+  static int lastFailFreeKb;
+  static int lastFailBlk;
 
   /**
    * Fetch text content from a URL with optional credentials.
