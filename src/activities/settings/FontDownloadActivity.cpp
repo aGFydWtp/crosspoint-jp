@@ -81,7 +81,12 @@ bool FontDownloadActivity::fetchAndParseManifest() {
   static constexpr const char* MANIFEST_TMP = "/fonts_manifest.tmp";
 
   const size_t heapBefore = ESP.getFreeHeap();
-  auto result = HttpDownloader::downloadToFile(FONT_MANIFEST_URL, MANIFEST_TMP, nullptr);
+  // LARGE buffers: the manifest lives on a GitHub release, which redirects to a
+  // signed release-assets.githubusercontent.com URL ~860 bytes long. That request
+  // line does not fit the default 512-byte TX buffer, so the reopen after the 302
+  // fails with ESP_FAIL before any byte arrives — see HttpDownloader::BufferProfile.
+  auto result = HttpDownloader::downloadToFile(FONT_MANIFEST_URL, MANIFEST_TMP, nullptr, nullptr, "", "",
+                                               HttpDownloader::BufferProfile::LARGE);
   if (result != HttpDownloader::OK) {
     LOG_ERR("FONT", "Manifest fetch failed (err=%d, http=%d, heap=%zu)", result, HttpDownloader::lastHttpCode,
             heapBefore);
@@ -229,11 +234,16 @@ void FontDownloadActivity::downloadFamily(ManifestFamily& family) {
 
     std::string url = baseUrl_ + file.name;
 
-    auto result = HttpDownloader::downloadToFile(url, destPath, [this](size_t downloaded, size_t total) {
-      fileProgress_ = downloaded;
-      fileTotal_ = total;
-      requestUpdate(true);
-    });
+    // LARGE buffers for the same reason as the manifest fetch: the signed
+    // redirect target runs ~900 bytes for the longest font file name.
+    auto result = HttpDownloader::downloadToFile(
+        url, destPath,
+        [this](size_t downloaded, size_t total) {
+          fileProgress_ = downloaded;
+          fileTotal_ = total;
+          requestUpdate(true);
+        },
+        nullptr, "", "", HttpDownloader::BufferProfile::LARGE);
 
     if (result != HttpDownloader::OK) {
       LOG_ERR("FONT", "Download failed: %s (%d)", file.name.c_str(), result);

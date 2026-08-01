@@ -175,9 +175,9 @@ OtaUpdater::OtaUpdaterError OtaUpdater::installUpdate(ProgressCallback onProgres
   bool flashOk = true;
   esp_err_t writeErr = ESP_OK;
   // LARGE buffers: otaUrl points at the release asset, which redirects to a
-  // signed objects.githubusercontent.com URL whose request line does not fit
-  // the default 512-byte TX buffer. This is the only caller that needs them —
-  // see HttpDownloader::BufferProfile.
+  // signed release-assets.githubusercontent.com URL whose request line does not
+  // fit the default 512-byte TX buffer. FontDownloadActivity needs them for the
+  // same reason — see HttpDownloader::BufferProfile.
   const bool fetchOk = HttpDownloader::fetchUrl(
       otaUrl,
       [&](const uint8_t* data, size_t len) {
