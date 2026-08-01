@@ -156,25 +156,22 @@ namespace {
 // COMPACT keeps upstream's sizes and LARGE exists for GitHub's release CDN
 // alone. See BufferProfile in the header for why the other callers must stay on
 // the smaller buffers.
-constexpr int HTTP_RX_BUF_COMPACT = 2048;
+// RX is profile-independent: the response header block from the GitHub release
+// CDN measures 840 bytes with a 65-byte longest line, and runGet() streams the
+// body in READ_CHUNK pieces, so a bigger RX buys nothing on either profile.
+constexpr int HTTP_RX_BUF = 2048;
 constexpr int HTTP_TX_BUF_COMPACT = 512;
 // LARGE is a TX problem, not an RX one, and both sides are now sized from
 // measurements against release-assets.githubusercontent.com rather than the
 // round numbers inherited from the OTA work:
 //
-//   RX: the response header block is 840 bytes, longest single line 65. 2048
-//       leaves 2.4x headroom, and RX size does not affect body throughput —
-//       runGet() streams the body in READ_CHUNK pieces. Dropping 4096 to 2048
-//       hands 2KB back to the handshake, which is the whole point of keeping
-//       pre-connection allocations small.
-//   TX: the signed redirect's request line alone measures 892 bytes. Add Host
-//       (44) and a User-Agent that carries CROSSPOINT_VERSION — 81 bytes on a
-//       dev build, where the version string is
-//       "0.1.14-dev-<branch>-<sha>" — plus esp_http_client's own headers, and
-//       the worst case lands just over 1024. Overflowing it fails the request
-//       with ESP_FAIL before any byte is sent (http=1), so 1536 buys real
-//       margin for long branch names.
-constexpr int HTTP_RX_BUF_LARGE = 2048;
+// LARGE is a TX-only distinction, sized from measurement: the signed redirect's
+// request line alone is 892 bytes. Add Host (44) and a User-Agent carrying
+// CROSSPOINT_VERSION — 81 bytes on a dev build, where the version string is
+// "0.1.14-dev-<branch>-<sha>" — plus esp_http_client's own headers, and the
+// worst case lands just over 1024. Overflowing it fails the request with
+// ESP_FAIL before a byte is sent (http=1), so 1536 leaves margin for long
+// branch names.
 constexpr int HTTP_TX_BUF_LARGE = 1536;
 #endif
 // Per-socket-op timeout. Some OPDS download endpoints are slow to send headers
@@ -317,7 +314,7 @@ HttpDownloader::DownloadError runGet(const std::string& url, const std::string& 
   HttpDownloader::lastCrtBlkKb = 0;
   esp_http_client_config_t config = {};
   config.url = url.c_str();
-  config.buffer_size = large ? HTTP_RX_BUF_LARGE : HTTP_RX_BUF_COMPACT;
+  config.buffer_size = HTTP_RX_BUF;
   config.buffer_size_tx = large ? HTTP_TX_BUF_LARGE : HTTP_TX_BUF_COMPACT;
   config.timeout_ms = HTTP_TIMEOUT_MS;
   // Verify HTTPS against the bundled CA roots. This build has esp-tls

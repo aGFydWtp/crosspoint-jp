@@ -42,10 +42,11 @@ class HttpDownloader {
    * every request pushes the fragmented cases over the edge — see the Aozora
    * author listing, which failed with ESP_ERR_HTTP_CONNECT at ~56KB free.
    */
+  // Only the TX buffer differs; RX is 2048 either way. See the .cpp for the
+  // measurements behind both numbers.
   enum class BufferProfile {
-    COMPACT,  // 2048 / 512  - everything except the GitHub release CDN
-    LARGE,    // 2048 / 1536 - long signed redirect URLs; see the .cpp for the
-              //               measurements behind both numbers
+    COMPACT,  // TX 512  - everything except the GitHub release CDN
+    LARGE,    // TX 1536 - long signed redirect URLs
   };
 
   // Last HTTP status code observed by runGet(). Fork-only: activities
