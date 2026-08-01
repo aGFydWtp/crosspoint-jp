@@ -150,6 +150,21 @@ static std::string lastApiError_;
 
 static constexpr int API_MAX_RETRIES = 3;
 
+// Build the one-line diagnostic shown on the error screen.
+//
+// blk = largest contiguous block. A TLS handshake needs a ~16.5KB contiguous
+// block for the inbound record buffer plus ~4KB for the outbound one, so free
+// heap alone cannot tell an out-of-memory failure from a fragmentation one.
+// http is negative when it carries an esp_err_t: -28674 is ESP_ERR_HTTP_CONNECT,
+// i.e. the connection never opened. tls is the mbedtls/esp-tls reason behind
+// that (0 = the failure never reached TLS, so it was DNS or the TCP connect);
+// -32512 is MBEDTLS_ERR_SSL_ALLOC_FAILED, which pins it on the heap.
+static void formatNetworkError(char* buf, size_t bufSize, int result) {
+  snprintf(buf, bufSize, "err=%d http=%d tls=%d/%X heap=%dKB blk=%dKB", result, HttpDownloader::lastHttpCode,
+           HttpDownloader::lastTlsError, HttpDownloader::lastTlsFlags, static_cast<int>(ESP.getFreeHeap() / 1024),
+           static_cast<int>(ESP.getMaxAllocHeap() / 1024));
+}
+
 static bool fetchApiJson(const char* url, JsonDocument& doc) {
   LOG_DBG("AOZORA", "API call: %s (heap=%d)", url, ESP.getFreeHeap());
 
@@ -170,14 +185,7 @@ static bool fetchApiJson(const char* url, JsonDocument& doc) {
 
   if (result != HttpDownloader::OK) {
     char buf[128];
-    // blk = largest contiguous block. A TLS handshake needs ~45-55KB of it
-    // (MBEDTLS_SSL_IN/OUT_CONTENT_LEN are 16KB each on this build), so free
-    // heap alone cannot tell an out-of-memory failure from a fragmentation
-    // one. http is negative when it carries an esp_err_t: -28674 is
-    // ESP_ERR_HTTP_CONNECT, i.e. the connection never opened.
-    snprintf(buf, sizeof(buf), "err=%d http=%d heap=%dKB blk=%dKB", static_cast<int>(result),
-             HttpDownloader::lastHttpCode, static_cast<int>(ESP.getFreeHeap() / 1024),
-             static_cast<int>(ESP.getMaxAllocHeap() / 1024));
+    formatNetworkError(buf, sizeof(buf), static_cast<int>(result));
     lastApiError_ = buf;
     return false;
   }
@@ -305,6 +313,39 @@ bool AozoraActivity::parseWorksJson(JsonDocument& doc) {
   return true;
 }
 
+bool AozoraActivity::downloadWithRetry(const char* url, const char* destPath) {
+  // Same retry policy as fetchApiJson(): a TLS handshake needs a large
+  // contiguous block, so on a fragmented heap esp_http_client_open() fails with
+  // ESP_ERR_HTTP_CONNECT before a single byte moves — and the next attempt, a
+  // second later, often succeeds. The listing calls have always retried; the
+  // book download did not, which is why downloads failed far more visibly than
+  // listings even though both hit the same endpoint.
+  HttpDownloader::DownloadError result = HttpDownloader::HTTP_ERROR;
+  for (int attempt = 0; attempt < API_MAX_RETRIES; attempt++) {
+    if (attempt > 0) {
+      LOG_DBG("AOZORA", "Download retry %d/%d", attempt + 1, API_MAX_RETRIES);
+      delay(1000);
+    }
+    downloadProgress_ = 0;
+    downloadTotal_ = 0;
+    // downloadToFile() removes the partial file itself on failure.
+    result = HttpDownloader::downloadToFile(url, destPath, [this](size_t downloaded, size_t total) {
+      downloadProgress_ = downloaded;
+      downloadTotal_ = total;
+      requestUpdate(true);
+    });
+    if (result == HttpDownloader::OK) return true;
+    LOG_ERR("AOZORA", "Download attempt %d failed: err=%d http=%d tls=%d/%X heap=%d blk=%d", attempt + 1, result,
+            HttpDownloader::lastHttpCode, HttpDownloader::lastTlsError, HttpDownloader::lastTlsFlags,
+            static_cast<int>(ESP.getFreeHeap()), static_cast<int>(ESP.getMaxAllocHeap()));
+  }
+
+  char buf[128];
+  formatNetworkError(buf, sizeof(buf), static_cast<int>(result));
+  errorMessage_ = buf;
+  return false;
+}
+
 bool AozoraActivity::downloadBook() {
   char url[256];
   snprintf(url, sizeof(url), "%s/api/convert?work_id=%d", API_BASE, selectedWorkId_);
@@ -325,20 +366,8 @@ bool AozoraActivity::downloadBook() {
     return false;
   }
 
-  auto result =
-      HttpDownloader::downloadToFile(std::string(url), std::string(destPath), [this](size_t downloaded, size_t total) {
-        downloadProgress_ = downloaded;
-        downloadTotal_ = total;
-        requestUpdate(true);
-      });
-
-  if (result != HttpDownloader::OK) {
-    LOG_ERR("AOZORA", "Download failed: err=%d http=%d", static_cast<int>(result), HttpDownloader::lastHttpCode);
-    // Remove incomplete file
-    Storage.remove(destPath);
-    char buf[80];
-    snprintf(buf, sizeof(buf), "err=%d http=%d", static_cast<int>(result), HttpDownloader::lastHttpCode);
-    errorMessage_ = buf;
+  if (!downloadWithRetry(url, destPath)) {
+    Storage.remove(destPath);  // 念のため取り残しを掃除
     return false;
   }
 
@@ -380,19 +409,8 @@ bool AozoraActivity::updateBook() {
   Storage.remove(tmpPath);
 
   // 一時ファイルにダウンロード（既存ファイルはこの時点では無傷）
-  auto result =
-      HttpDownloader::downloadToFile(std::string(url), std::string(tmpPath), [this](size_t downloaded, size_t total) {
-        downloadProgress_ = downloaded;
-        downloadTotal_ = total;
-        requestUpdate(true);
-      });
-
-  if (result != HttpDownloader::OK) {
-    LOG_ERR("AOZORA", "Update download failed: err=%d http=%d", static_cast<int>(result), HttpDownloader::lastHttpCode);
+  if (!downloadWithRetry(url, tmpPath)) {
     Storage.remove(tmpPath);  // 不完全な一時ファイルを削除、旧ファイルは保持
-    char buf[80];
-    snprintf(buf, sizeof(buf), "err=%d http=%d", static_cast<int>(result), HttpDownloader::lastHttpCode);
-    errorMessage_ = buf;
     return false;
   }
 

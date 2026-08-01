@@ -138,6 +138,9 @@ class AozoraActivity : public Activity {
   bool fetchWorks(const char* queryParam);
   bool downloadBook();
   bool updateBook();
+  // Download destPath from url with the same retry policy as the listing calls.
+  // Sets errorMessage_ and returns false once every attempt has failed.
+  bool downloadWithRetry(const char* url, const char* destPath);
 
   // JSON parsing
   bool parseAuthorsJson(JsonDocument& doc);
