@@ -14,6 +14,11 @@
 #include "components/UITheme.h"
 #include "fontIds.h"
 #include "network/HttpDownloader.h"
+#include "network/TlsHeapReclaim.h"
+
+// Retries per HTTPS request. Matches the Aozora endpoints; see the download
+// loop for why a handshake can fail once and succeed a second later.
+static constexpr int DOWNLOAD_MAX_RETRIES = 3;
 
 FontDownloadActivity::FontDownloadActivity(GfxRenderer& renderer, MappedInputManager& mappedInput)
     : Activity("FontDownload", renderer, mappedInput), fontInstaller_(sdFontSystem.registry()) {}
@@ -50,13 +55,7 @@ void FontDownloadActivity::onWifiSelectionComplete(const bool success) {
   }
   requestUpdateAndWait();
 
-  // Free ExternalFont LRU caches (~34KB each) to make room for TLS buffers.
-  FontManager& fm = FontManager::getInstance();
-  ExternalFont* uiFont = fm.getActiveUiFont();
-  ExternalFont* readerFont = fm.getActiveFont();
-  if (uiFont) uiFont->unload();
-  if (readerFont) readerFont->unload();
-  LOG_DBG("FONT", "Freed font caches, heap=%d", ESP.getFreeHeap());
+  reclaimHeapForTls(renderer, "FONT");
 
   if (!fetchAndParseManifest()) {
     {
@@ -86,16 +85,32 @@ bool FontDownloadActivity::fetchAndParseManifest() {
   // signed release-assets.githubusercontent.com URL ~860 bytes long. That request
   // line does not fit the default 512-byte TX buffer, so the reopen after the 302
   // fails with ESP_FAIL before any byte arrives — see HttpDownloader::BufferProfile.
-  auto result = HttpDownloader::downloadToFile(FONT_MANIFEST_URL, MANIFEST_TMP, nullptr, nullptr, "", "",
-                                               HttpDownloader::BufferProfile::LARGE);
+  HttpDownloader::DownloadError result = HttpDownloader::HTTP_ERROR;
+  for (int attempt = 0; attempt < DOWNLOAD_MAX_RETRIES; attempt++) {
+    if (attempt > 0) {
+      LOG_DBG("FONT", "Manifest retry %d/%d", attempt + 1, DOWNLOAD_MAX_RETRIES);
+      delay(1000);
+    }
+    result = HttpDownloader::downloadToFile(FONT_MANIFEST_URL, MANIFEST_TMP, nullptr, nullptr, "", "",
+                                            HttpDownloader::BufferProfile::LARGE);
+    if (result == HttpDownloader::OK) break;
+    LOG_ERR("FONT", "Manifest attempt %d failed: err=%d http=%d tls=%d/%X blk=%d", attempt + 1,
+            static_cast<int>(result), HttpDownloader::lastHttpCode, HttpDownloader::lastTlsError,
+            HttpDownloader::lastTlsFlags, static_cast<int>(ESP.getMaxAllocHeap()));
+    Storage.remove(MANIFEST_TMP);
+  }
   if (result != HttpDownloader::OK) {
     LOG_ERR("FONT", "Manifest fetch failed (err=%d, http=%d, heap=%zu)", result, HttpDownloader::lastHttpCode,
             heapBefore);
-    char buf[80];
-    // blk = largest contiguous block; a TLS handshake needs ~45-55KB of it, so
-    // free heap alone cannot distinguish exhaustion from fragmentation.
-    snprintf(buf, sizeof(buf), "err=%d http=%d heap=%zuKB blk=%dKB", static_cast<int>(result),
-             HttpDownloader::lastHttpCode, heapBefore / 1024, static_cast<int>(ESP.getMaxAllocHeap() / 1024));
+    char buf[160];
+    // blk = largest contiguous block; the TLS handshake needs a ~16.5KB one for
+    // the inbound record buffer, so free heap alone cannot distinguish
+    // exhaustion from fragmentation. tls is the mbedtls/esp-tls reason behind an
+    // ESP_ERR_HTTP_CONNECT (0 = never reached TLS, so DNS or the TCP connect).
+    snprintf(buf, sizeof(buf), "err=%d http=%d tls=%d/%X crt=%d/%X p=%d/%d f=%d/%d", static_cast<int>(result),
+             HttpDownloader::lastHttpCode, HttpDownloader::lastTlsError, HttpDownloader::lastTlsFlags,
+             HttpDownloader::lastCrtDiag, HttpDownloader::lastCrtErr, HttpDownloader::lastPreHeapKb,
+             HttpDownloader::lastPreBlkKb, HttpDownloader::lastCrtHeapKb, HttpDownloader::lastCrtBlkKb);
     errorMessage_ = buf;
     Storage.remove(MANIFEST_TMP);
     return false;
@@ -245,6 +260,14 @@ void FontDownloadActivity::downloadFamily(ManifestFamily& family) {
     }
     requestUpdateAndWait();
 
+    // Reclaim before every file, not just once on entry: drawing the progress
+    // screen between files re-fills the glyph caches this frees, so without it
+    // each successive file starts from a more fragmented arena than the last.
+    // Cheap insurance rather than a fix — the failures that motivated it were
+    // caused by the record buffers being twice their configured size, which
+    // scripts/patch_espidf_libcopy.py resolved.
+    reclaimHeapForTls(renderer, "FONT");
+
     char destPath[128];
     FontInstaller::buildFontPath(family.name, file.name, destPath, sizeof(destPath));
 
@@ -259,33 +282,54 @@ void FontDownloadActivity::downloadFamily(ManifestFamily& family) {
     // a single font file; that framebuffer work contends with TLS on the internal
     // arena and e-ink cannot repaint faster than a percent tick anyway. Same
     // reasoning as the OTA download — see OtaUpdater::installUpdate.
-    int lastReportedPct = -1;
-    // LARGE buffers for the same reason as the manifest fetch: the signed
-    // redirect target runs ~900 bytes for the longest font file name.
-    auto result = HttpDownloader::downloadToFile(
-        url, destPath,
-        [this, &lastReportedPct](size_t downloaded, size_t total) {
-          const int pct = total > 0 ? static_cast<int>(static_cast<uint64_t>(downloaded) * 100 / total) : 0;
-          if (pct == lastReportedPct) return;
-          lastReportedPct = pct;
-          fileProgress_ = downloaded;
-          fileTotal_ = total;
-          requestUpdate(true);
-        },
-        nullptr, "", "", HttpDownloader::BufferProfile::LARGE);
+    // Retry like the Aozora endpoints do. Each file is a fresh TLS handshake,
+    // and on a heap this tight a handshake can fail on contiguous space alone —
+    // either on the 16.5KB record buffer or, later, on the small allocations
+    // mbedtls needs to verify the chain (tls=12288). A second later, after the
+    // previous connection's buffers have been returned, the same request
+    // usually goes through. Without this, one unlucky file aborts the whole
+    // run and the user has to start over.
+    HttpDownloader::DownloadError result = HttpDownloader::HTTP_ERROR;
+    for (int attempt = 0; attempt < DOWNLOAD_MAX_RETRIES; attempt++) {
+      if (attempt > 0) {
+        LOG_DBG("FONT", "Retry %d/%d for %s (heap=%d blk=%d)", attempt + 1, DOWNLOAD_MAX_RETRIES, file.name,
+                static_cast<int>(ESP.getFreeHeap()), static_cast<int>(ESP.getMaxAllocHeap()));
+        delay(1000);
+      }
+      int lastReportedPct = -1;
+      // LARGE buffers for the same reason as the manifest fetch: the signed
+      // redirect target runs ~900 bytes for the longest font file name.
+      result = HttpDownloader::downloadToFile(
+          url, destPath,
+          [this, &lastReportedPct](size_t downloaded, size_t total) {
+            const int pct = total > 0 ? static_cast<int>(static_cast<uint64_t>(downloaded) * 100 / total) : 0;
+            if (pct == lastReportedPct) return;
+            lastReportedPct = pct;
+            fileProgress_ = downloaded;
+            fileTotal_ = total;
+            requestUpdate(true);
+          },
+          nullptr, "", "", HttpDownloader::BufferProfile::LARGE);
+      if (result == HttpDownloader::OK) break;
+      LOG_ERR("FONT", "Attempt %d failed: %s err=%d http=%d tls=%d/%X heap=%d blk=%d got=%zu", attempt + 1, file.name,
+              static_cast<int>(result), HttpDownloader::lastHttpCode, HttpDownloader::lastTlsError,
+              HttpDownloader::lastTlsFlags, static_cast<int>(ESP.getFreeHeap()),
+              static_cast<int>(ESP.getMaxAllocHeap()), fileProgress_);
+    }
 
     if (result != HttpDownloader::OK) {
       LOG_ERR("FONT", "Download failed: %s err=%d http=%d heap=%d blk=%d got=%zu", file.name, static_cast<int>(result),
               HttpDownloader::lastHttpCode, static_cast<int>(ESP.getFreeHeap()),
               static_cast<int>(ESP.getMaxAllocHeap()), fileProgress_);
-      char buf[80];
+      char buf[160];
       // Same diagnostics as the manifest fetch: err is DownloadError, http is
-      // either an HTTP status or a negated esp_err_t, and blk is the largest
-      // contiguous block (a TLS handshake needs ~45-55KB of it). got is how far
-      // the transfer got before it died, rounded to the last whole percent.
-      snprintf(buf, sizeof(buf), "err=%d http=%d heap=%dKB blk=%dKB got=%dKB", static_cast<int>(result),
-               HttpDownloader::lastHttpCode, static_cast<int>(ESP.getFreeHeap() / 1024),
-               static_cast<int>(ESP.getMaxAllocHeap() / 1024), static_cast<int>(fileProgress_ / 1024));
+      // either an HTTP status or a negated esp_err_t, tls is the TLS-layer
+      // reason behind it, and blk is the largest contiguous block. got is how
+      // far the transfer got before it died, rounded to the last whole percent.
+      snprintf(buf, sizeof(buf), "err=%d http=%d crt=%d/%X a=%d@%dK/%d p=%d/%d got=%dKB", static_cast<int>(result),
+               HttpDownloader::lastHttpCode, HttpDownloader::lastCrtDiag, HttpDownloader::lastCrtErr,
+               HttpDownloader::lastFailSize, HttpDownloader::lastFailFreeKb, HttpDownloader::lastFailBlk,
+               HttpDownloader::lastPreHeapKb, HttpDownloader::lastPreBlkKb, static_cast<int>(fileProgress_ / 1024));
       RenderLock lock(*this);
       state_ = ERROR;
       errorMessage_ = std::string("Download failed: ") + file.name;
@@ -503,6 +547,17 @@ void FontDownloadActivity::render(RenderLock&&) {
     }
     const auto labels = mappedInput.mapLabels(tr(STR_BACK), "", "", "");
     GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
+  }
+
+  // Live heap readout. Added to measure a reproduction that had resisted
+  // guesswork — downloads succeeded right after boot and failed after a reading
+  // session — and kept because comparing this number across states is the
+  // fastest way to tell a heap regression from a network one.
+  if (SETTINGS.debugDisplay) {
+    char dbg[48];
+    snprintf(dbg, sizeof(dbg), "heap=%dK blk=%dK", static_cast<int>(ESP.getFreeHeap() / 1024),
+             static_cast<int>(ESP.getMaxAllocHeap() / 1024));
+    renderer.drawText(UI_10_FONT_ID, metrics.contentSidePadding, pageHeight - lineHeight * 2, dbg);
   }
 
   renderer.displayBuffer();

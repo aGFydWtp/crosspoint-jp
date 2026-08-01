@@ -13,7 +13,13 @@
 
 extern "C" void wolfSSL_Arduino_Serial_Print(const char* const msg) { LOG_DBG("WOLFSSL", "%s", msg); }
 #else
+#include <esp_heap_caps.h>
 #include <esp_http_client.h>
+#include <esp_log.h>
+
+#include <cstdarg>
+#include <cstdlib>
+#include <cstring>
 
 /*
  * When esp_crt_bundle.h is included, it points to the wrong header file
@@ -26,22 +32,147 @@ extern esp_err_t esp_crt_bundle_attach(void* conf);
 }
 #endif
 
-// fork-only: activities show this in error messages for diagnostics
+// fork-only: activities show these in error messages for diagnostics
 int HttpDownloader::lastHttpCode = 0;
+int HttpDownloader::lastTlsError = 0;
+int HttpDownloader::lastTlsFlags = 0;
+int HttpDownloader::lastCrtDiag = 0;
+int HttpDownloader::lastCrtErr = 0;
+int HttpDownloader::lastCrtHeapKb = 0;
+int HttpDownloader::lastCrtBlkKb = 0;
+int HttpDownloader::lastPreHeapKb = 0;
+int HttpDownloader::lastPreBlkKb = 0;
+int HttpDownloader::lastFailSize = 0;
+int HttpDownloader::lastFailFreeKb = 0;
+int HttpDownloader::lastFailBlk = 0;
+
+#if !defined(FREEINK_NET_WOLFSSL)
+namespace {
+/*
+ * tls=12288 is MBEDTLS_ERR_X509_FATAL_ERROR, but that value says almost
+ * nothing on its own: mbedtls rewrites the bundle callback's
+ * MBEDTLS_ERR_X509_CERT_VERIFY_FAILED into it (x509_crt.c, "prevent misuse of
+ * the vrfy callback"), so an empty bundle, an unknown root and a failed
+ * signature check all arrive as the same number. esp_crt_bundle does
+ * distinguish them — but only in its log output, and the USB Serial/JTAG link
+ * on this device drops out exactly when a failure is being reproduced.
+ *
+ * So tap the log stream instead. ESP_LOGx passes its *format string* to the
+ * vprintf hook with the arguments still unformatted, and every marker below is
+ * literal text in that format string, so the common case costs only a few
+ * strstr() calls before delegating to whatever handler was there before. Only
+ * the two markers that carry an error code render the line, and only on the
+ * failure path.
+ */
+/*
+ * Ordered inner-reason-first. esp_crt_check_signature() logs the specific cause
+ * and then its caller logs the generic "Certificate matched but signature
+ * verification failed", so the *first* marker seen in a run is always the
+ * informative one — hence first-write-wins below. An earlier version kept the
+ * lowest code instead, which let the generic message mask the specific one and
+ * made a bare crt=2 ambiguous.
+ */
+constexpr const char* CRT_MARKERS[] = {
+    "No certificates in bundle",  // 1: bundle never attached
+    "PK parse failed",            // 2: parsing the root's public key failed (OOM lands here)
+    "Unsuitable public key",      // 3: key type does not match the signature algorithm
+    "Unknown message digest",     // 4: hash algorithm unsupported in this build
+    "MD failed",                  // 5: hashing the cert body failed
+    "PK verify failed",           // 6: signature mathematically rejected (or MPI alloc failure)
+    "Certificate matched but signature verification failed",  // 7: generic wrapper for 2-6
+    "Failed to verify certificate",  // 8: generic tail; alone it means "no matching root in bundle"
+};
+constexpr int CRT_MARKER_COUNT = 8;
+
+vprintf_like_t g_prevLogHandler = nullptr;
+
+int crtLogHook(const char* fmt, va_list args) {
+  if (fmt) {
+    for (int i = 0; i < CRT_MARKER_COUNT; i++) {
+      if (strstr(fmt, CRT_MARKERS[i]) != nullptr) {
+        // First write wins: the specific reason is logged before the generic one.
+        if (HttpDownloader::lastCrtDiag == 0) HttpDownloader::lastCrtDiag = i + 1;
+        // "PK parse failed with error 0x%x" and "PK verify failed with error
+        // 0x%x" carry the mbedtls code, which is the difference between a
+        // genuine signature mismatch (0x4300 = MBEDTLS_ERR_RSA_VERIFY_FAILED)
+        // and an allocation that died mid-verify (0x0010 =
+        // MBEDTLS_ERR_MPI_ALLOC_FAILED). Format the line only on this rare
+        // failure path and scrape the number back out, rather than walking the
+        // va_list — the log macro's argument layout is an IDF implementation
+        // detail, but the rendered text is not.
+        if (strstr(fmt, "with error 0x") != nullptr && HttpDownloader::lastCrtErr == 0) {
+          char line[160];
+          va_list copy;
+          va_copy(copy, args);
+          const int written = vsnprintf(line, sizeof(line), fmt, copy);
+          va_end(copy);
+          if (written > 0) {
+            const char* at = strstr(line, "error 0x");
+            if (at) HttpDownloader::lastCrtErr = static_cast<int>(strtol(at + 8, nullptr, 16));
+          }
+          // Sample the heap here, not after the request unwinds. This hook runs
+          // synchronously from the failing mbedtls call, still inside the
+          // handshake, so these are the numbers the allocation actually saw —
+          // the post-mortem values an activity prints have already had ~40KB of
+          // TLS structures returned to the arena and look far healthier than
+          // reality.
+          HttpDownloader::lastCrtHeapKb = static_cast<int>(ESP.getFreeHeap() / 1024);
+          HttpDownloader::lastCrtBlkKb = static_cast<int>(ESP.getMaxAllocHeap() / 1024);
+        }
+        break;
+      }
+    }
+  }
+  return g_prevLogHandler ? g_prevLogHandler(fmt, args) : 0;
+}
+
+// Fires from inside the allocator at the moment a request cannot be satisfied —
+// unlike the log hook, which only runs once the failing call has unwound and its
+// siblings have already been freed. The requested size and the largest block
+// available right then are the two numbers that decide whether the problem is
+// the total, the layout, or a size nobody expected.
+void heapFailHook(size_t size, uint32_t /*caps*/, const char* /*fn*/) {
+  if (HttpDownloader::lastFailSize != 0) return;  // keep the first failure of the request
+  HttpDownloader::lastFailSize = static_cast<int>(size);
+  HttpDownloader::lastFailFreeKb = static_cast<int>(ESP.getFreeHeap() / 1024);
+  HttpDownloader::lastFailBlk = static_cast<int>(ESP.getMaxAllocHeap());
+}
+
+void ensureDiagnostics() {
+  static bool installed = false;
+  if (installed) return;
+  installed = true;
+  g_prevLogHandler = esp_log_set_vprintf(&crtLogHook);
+  heap_caps_register_failed_alloc_callback(&heapFailHook);
+}
+}  // namespace
+#endif
 
 namespace {
 #if !defined(FREEINK_NET_WOLFSSL)
 // RX holds the response headers; TX must fit the whole request line.
 // fork: upstream shrank these to 2048/512, but upstream routes OTA/large
-// downloads through wolfSSL (runGetWolf) — here runGet carries them too.
-// 4096/1024 is the configuration that fully downloaded the 6MB image on this
-// device (see #2074 cherry-pick 0d40ec1a), but it is only needed for GitHub's
-// release CDN — see BufferProfile in the header for why the rest of the
-// callers must stay on the smaller buffers.
-constexpr int HTTP_RX_BUF_COMPACT = 2048;
+// downloads through wolfSSL (runGetWolf) — here runGet carries them too, so
+// COMPACT keeps upstream's sizes and LARGE exists for GitHub's release CDN
+// alone. See BufferProfile in the header for why the other callers must stay on
+// the smaller buffers.
+// RX is profile-independent: the response header block from the GitHub release
+// CDN measures 840 bytes with a 65-byte longest line, and runGet() streams the
+// body in READ_CHUNK pieces, so a bigger RX buys nothing on either profile.
+constexpr int HTTP_RX_BUF = 2048;
 constexpr int HTTP_TX_BUF_COMPACT = 512;
-constexpr int HTTP_RX_BUF_LARGE = 4096;
-constexpr int HTTP_TX_BUF_LARGE = 1024;
+// LARGE is a TX problem, not an RX one, and both sides are now sized from
+// measurements against release-assets.githubusercontent.com rather than the
+// round numbers inherited from the OTA work:
+//
+// LARGE is a TX-only distinction, sized from measurement: the signed redirect's
+// request line alone is 892 bytes. Add Host (44) and a User-Agent carrying
+// CROSSPOINT_VERSION — 81 bytes on a dev build, where the version string is
+// "0.1.14-dev-<branch>-<sha>" — plus esp_http_client's own headers, and the
+// worst case lands just over 1024. Overflowing it fails the request with
+// ESP_FAIL before a byte is sent (http=1), so 1536 leaves margin for long
+// branch names.
+constexpr int HTTP_TX_BUF_LARGE = 1536;
 #endif
 // Per-socket-op timeout. Some OPDS download endpoints are slow to send headers
 // (>15s) and chunked catalogs stall mid-body, so 15s killed them. 60s gives
@@ -62,6 +193,32 @@ struct Sink {
 bool isRedirect(int status) {
   return status == 301 || status == 302 || status == 303 || status == 307 || status == 308;
 }
+
+#if !defined(FREEINK_NET_WOLFSSL)
+// Pull the TLS-layer reason out of the client after open() reported
+// ESP_ERR_HTTP_CONNECT. The transport clears it on read, so call this once, and
+// only on the failure path. Leaves the fields at 0 when the failure never
+// reached esp-tls (plain http, DNS, refused socket).
+void captureTlsError(esp_http_client_handle_t client) {
+  int mbedtlsCode = 0;
+  int flags = 0;
+  // The return value is esp-tls' own error (ESP_ERR_ESP_TLS_*, 0x8000-based),
+  // which is what separates "DNS never resolved" from "the socket was refused";
+  // the out-params carry the underlying mbedtls code. Both are meaningful, and
+  // the call wipes the handle, so read it exactly once and keep whichever is
+  // set. The two ranges are disjoint — mbedtls codes are negative, esp-tls ones
+  // positive — so one int can hold either without ambiguity.
+  const esp_err_t layerErr = esp_http_client_get_and_clear_last_tls_error(client, &mbedtlsCode, &flags);
+  if (layerErr == ESP_ERR_INVALID_STATE) return;  // plain http: no TLS handle to report on
+
+  HttpDownloader::lastTlsError = mbedtlsCode != 0 ? mbedtlsCode : static_cast<int>(layerErr);
+  HttpDownloader::lastTlsFlags = flags;
+  if (HttpDownloader::lastTlsError || flags) {
+    LOG_ERR("HTTP", "TLS error: esp_tls=0x%X mbedtls=%d (-0x%X) flags=0x%X", layerErr, mbedtlsCode, -mbedtlsCode,
+            flags);
+  }
+}
+#endif
 
 #if defined(FREEINK_NET_WOLFSSL)
 HttpDownloader::DownloadError runGetWolf(const std::string& startUrl, const std::string& username,
@@ -136,10 +293,28 @@ HttpDownloader::DownloadError runGetWolf(const std::string& startUrl, const std:
 HttpDownloader::DownloadError runGet(const std::string& url, const std::string& username, const std::string& password,
                                      Sink& sink, HttpDownloader::BufferProfile buffers) {
   const bool large = buffers == HttpDownloader::BufferProfile::LARGE;
-  HttpDownloader::lastHttpCode = 0;  // reset before each attempt so activities' diagnostics reflect this call only
+  ensureDiagnostics();
+  // Baseline for the diagnostics: the state going in, before esp_http_client or
+  // mbedtls have allocated anything for this request. Paired with lastCrtHeapKb
+  // (sampled inside a failing handshake) it says how much the connection itself
+  // consumed, which is the number that decides whether there is anything left
+  // to reclaim on our side.
+  HttpDownloader::lastPreHeapKb = static_cast<int>(ESP.getFreeHeap() / 1024);
+  HttpDownloader::lastPreBlkKb = static_cast<int>(ESP.getMaxAllocHeap() / 1024);
+  HttpDownloader::lastFailSize = 0;
+  HttpDownloader::lastFailFreeKb = 0;
+  HttpDownloader::lastFailBlk = 0;
+  // reset before each attempt so activities' diagnostics reflect this call only
+  HttpDownloader::lastHttpCode = 0;
+  HttpDownloader::lastTlsError = 0;
+  HttpDownloader::lastTlsFlags = 0;
+  HttpDownloader::lastCrtDiag = 0;
+  HttpDownloader::lastCrtErr = 0;
+  HttpDownloader::lastCrtHeapKb = 0;
+  HttpDownloader::lastCrtBlkKb = 0;
   esp_http_client_config_t config = {};
   config.url = url.c_str();
-  config.buffer_size = large ? HTTP_RX_BUF_LARGE : HTTP_RX_BUF_COMPACT;
+  config.buffer_size = HTTP_RX_BUF;
   config.buffer_size_tx = large ? HTTP_TX_BUF_LARGE : HTTP_TX_BUF_COMPACT;
   config.timeout_ms = HTTP_TIMEOUT_MS;
   // Verify HTTPS against the bundled CA roots. This build has esp-tls
@@ -172,6 +347,7 @@ HttpDownloader::DownloadError runGet(const std::string& url, const std::string& 
   if (err != ESP_OK) {
     LOG_ERR("HTTP", "open failed: %s", esp_err_to_name(err));
     HttpDownloader::lastHttpCode = -static_cast<int>(err);  // fork: 負値=esp_err で診断表示
+    captureTlsError(client);
     esp_http_client_cleanup(client);
     return HttpDownloader::HTTP_ERROR;
   }
@@ -185,6 +361,7 @@ HttpDownloader::DownloadError runGet(const std::string& url, const std::string& 
     if (err != ESP_OK) {
       LOG_ERR("HTTP", "redirect open failed: %s", esp_err_to_name(err));
       HttpDownloader::lastHttpCode = -static_cast<int>(err);  // fork: 負値=esp_err で診断表示
+      captureTlsError(client);
       esp_http_client_cleanup(client);
       return HttpDownloader::HTTP_ERROR;
     }

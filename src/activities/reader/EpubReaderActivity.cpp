@@ -258,6 +258,27 @@ void EpubReaderActivity::onExit() {
   APP_STATE.saveToFile();
   section.reset();
   epub.reset();
+
+  // Release the SD card font's lazy caches on the way out. Nothing outside the
+  // reader draws with an SD font ID (every getReaderFontId() caller loads the
+  // family first via ensureSdFontLoaded), so holding them costs memory for the
+  // rest of the session and buys nothing.
+  //
+  // The kern matrix is the expensive one: it is a single leftClassCount x
+  // rightClassCount block, 178x161 = 28KB per style for NotoSansJp, and the
+  // reader loads two .cpfont bases (body + heading) x two styles. Four 28KB
+  // blocks parked mid-arena is exactly what leaves the heap with 67KB free but
+  // only a 26KB largest block — too fragmented for the ~16.5KB contiguous
+  // inbound record buffer a TLS handshake needs, which is how the Aozora
+  // downloads ended up failing with ESP_ERR_HTTP_CONNECT.
+  //
+  // Both caches are lazy-loaded again on the next prewarm, and the font IDs
+  // stay registered, so section caches keyed on them remain valid.
+  auto* fcm = renderer.getFontCacheManager();
+  if (fcm) {
+    fcm->clearCache();
+    fcm->freeKernLigatureData();
+  }
 }
 
 void EpubReaderActivity::loop() {

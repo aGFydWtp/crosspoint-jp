@@ -35,16 +35,19 @@ class HttpDownloader {
    * esp_http_client_request_send), which surfaces as http=1 in the activities'
    * diagnostics — not as a connect error.
    *
-   * The distinction matters because a TLS handshake needs ~45-55KB of
-   * contiguous heap on this device (MBEDTLS_SSL_IN/OUT_CONTENT_LEN are 16KB
-   * each and CONFIG_MBEDTLS_ASYMMETRIC_CONTENT_LEN is off). Spending an extra
-   * 2.5KB of pre-handshake heap on every request pushes the fragmented cases
-   * over the edge — see the Aozora author listing, which failed with
-   * ESP_ERR_HTTP_CONNECT at ~56KB free.
+   * The distinction matters because a TLS handshake still needs a ~16.5KB
+   * contiguous block for the inbound record buffer plus ~2KB for the outbound
+   * one (platformio.ini sets CONFIG_MBEDTLS_ASYMMETRIC_CONTENT_LEN with
+   * IN=16384 / OUT=2048 — and note that those values only reach the device
+   * because scripts/patch_espidf_libcopy.py fixes the archive copy-back).
+   * Every extra kilobyte held before the handshake counts, so keep the profiles
+   * as small as the measurements allow.
    */
+  // Only the TX buffer differs; RX is 2048 either way. See the .cpp for the
+  // measurements behind both numbers.
   enum class BufferProfile {
-    COMPACT,  // 2048 / 512 - everything except the GitHub release CDN
-    LARGE,    // 4096 / 1024 - long signed redirect URLs
+    COMPACT,  // TX 512  - everything except the GitHub release CDN
+    LARGE,    // TX 1536 - long signed redirect URLs
   };
 
   // Last HTTP status code observed by runGet(). Fork-only: activities
@@ -52,6 +55,68 @@ class HttpDownloader {
   // diagnostics. Positive value = HTTP response code, 0 = never set / no
   // response received. Not thread-safe (single-threaded HTTP path).
   static int lastHttpCode;
+
+  // Last TLS-layer failure behind an ESP_ERR_HTTP_CONNECT, captured with
+  // esp_http_client_get_and_clear_last_tls_error(). Fork-only diagnostics:
+  // ESP_ERR_HTTP_CONNECT alone cannot tell a name-resolution failure from a
+  // refused socket from a handshake that ran out of contiguous heap, and those
+  // need completely different fixes.
+  //
+  // Negative values are raw mbedtls errors, positive ones esp-tls errors; the
+  // ranges are disjoint, so a single int is unambiguous.
+  //
+  //   lastTlsError  0       = nothing was recorded at the TLS layer at all
+  //                 -32512  = MBEDTLS_ERR_SSL_ALLOC_FAILED (-0x7F00) -> out of
+  //                           contiguous heap for the 16.5KB/2KB SSL buffers
+  //                 32769   = ESP_ERR_ESP_TLS_CANNOT_RESOLVE_HOSTNAME (0x8001)
+  //                 32770   = ESP_ERR_ESP_TLS_CANNOT_CREATE_SOCKET (0x8002)
+  //                 32772   = ESP_ERR_ESP_TLS_FAILED_CONNECT_TO_HOST (0x8004)
+  //                 32774   = ESP_ERR_ESP_TLS_CONNECTION_TIMEOUT (0x8006)
+  //                 other   = see esp_tls_errors.h / mbedtls' ssl.h
+  //   lastTlsFlags  non-zero     = certificate verification failed; the bits are
+  //                                mbedtls' MBEDTLS_X509_BADCERT_* set
+  static int lastTlsError;
+  static int lastTlsFlags;
+
+  // Which esp_crt_bundle failure produced a tls=12288. mbedtls collapses every
+  // certificate rejection into MBEDTLS_ERR_X509_FATAL_ERROR, so this is the
+  // only way to tell them apart without a serial console:
+  //   0 = no certificate failure recorded
+  //   1 = bundle never attached
+  //   2 = parsing the root's public key failed  -> out of memory
+  //   3 = key type / signature algorithm mismatch
+  //   4 = hash algorithm unsupported in this build
+  //   5 = hashing the certificate body failed
+  //   6 = signature rejected, or an MPI allocation failed inside the verify
+  //   7 = only the generic wrapper was seen (should not happen; 2-6 precede it)
+  //   8 = no matching trusted root in the bundle
+  static int lastCrtDiag;
+
+  // The mbedtls error code carried by the "PK parse/verify failed with error
+  // 0x%x" log line, positive (as logged). 0x4300 is
+  // MBEDTLS_ERR_RSA_VERIFY_FAILED — the signature was genuinely rejected;
+  // 0x0010 is MBEDTLS_ERR_MPI_ALLOC_FAILED — it ran out of memory instead.
+  static int lastCrtErr;
+
+  // Free heap and largest free block, in KB, sampled *inside* the failing
+  // handshake rather than after it unwinds. This is the only view of the state
+  // the failed allocation actually faced.
+  static int lastCrtHeapKb;
+  static int lastCrtBlkKb;
+
+  // Free heap / largest block at the start of the request, before any
+  // esp_http_client or mbedtls allocation. The gap to lastCrtHeapKb is what the
+  // connection cost.
+  static int lastPreHeapKb;
+  static int lastPreBlkKb;
+
+  // Captured by a heap_caps failed-allocation callback, i.e. at the instant the
+  // allocator gave up rather than after the caller unwound. lastFailSize is the
+  // requested byte count, lastFailBlk the largest block that existed then (in
+  // bytes — at these sizes kilobytes hide the answer).
+  static int lastFailSize;
+  static int lastFailFreeKb;
+  static int lastFailBlk;
 
   /**
    * Fetch text content from a URL with optional credentials.

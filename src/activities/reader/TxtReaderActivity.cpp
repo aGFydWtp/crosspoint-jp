@@ -55,6 +55,14 @@ void TxtReaderActivity::onExit() {
   APP_STATE.readerActivityLoadCount = 0;
   APP_STATE.saveToFile();
   txt.reset();
+
+  // Release the SD card font's lazy caches — see EpubReaderActivity::onExit()
+  // for why they must not outlive the reader.
+  auto* fcm = renderer.getFontCacheManager();
+  if (fcm) {
+    fcm->clearCache();
+    fcm->freeKernLigatureData();
+  }
 }
 
 void TxtReaderActivity::loop() {
