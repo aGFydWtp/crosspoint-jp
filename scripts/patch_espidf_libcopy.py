@@ -43,7 +43,10 @@ Fix:
 
   Already fixed upstream, but only in 55.03.311 (2026-07-24), which also jumps
   Arduino 3.3.7 -> 3.3.11 and ESP-IDF 5.5.2 -> 5.5.5. 55.03.38/38-1/39 do not
-  carry it. Until this project takes that upgrade, patch locally.
+  carry it. Staying on 55.03.37 is a deliberate choice — it matches what
+  crosspoint-reader upstream pins — so patch locally instead. See
+  docs/adr/0001-pioarduino-platform-version.md for the trade-off and for what to
+  verify when the version is eventually raised.
 
 Applied idempotently — safe to run on every build. Rewrites espidf.py only when
 the marker is absent, and does nothing at all on a platform that already copies
