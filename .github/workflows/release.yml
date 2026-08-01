@@ -14,6 +14,8 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      # Deploy Flasher を workflow_dispatch で起動するのに必要
+      actions: write
     steps:
       - uses: actions/checkout@v6
         with:
@@ -94,3 +96,27 @@ jobs:
           prerelease: ${{ contains(github.ref, '-') }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # この run が release-dispatch.yml から workflow_dispatch で起動された場合、
+      # run 自体が GITHUB_TOKEN 由来なので完了時に workflow_run イベントが発生せず、
+      # deploy-flasher.yml の `workflow_run: workflows: ["Compile Release"]` が連鎖しない。
+      # そのため Web Flasher のマニフェストが古いリリースを指したままになる。
+      # タグ push で起動された場合は通常どおり連鎖するので、その場合は何もしない。
+      - name: Trigger flasher deployment
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # workflow_run で起動されたときと同じ ref を使う
+          REF: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            if gh workflow run deploy-flasher.yml --ref "${REF}"; then
+              echo "Deploy Flasher を起動しました。"
+              exit 0
+            fi
+            echo "Deploy Flasher の起動に失敗しました (${attempt}/3)。再試行します。"
+            sleep 5
+          done
+          echo "::error::Deploy Flasher の起動に失敗しました。Release は作成済みなので、Actions から Deploy Flasher を手動実行してください。"
+          exit 1
