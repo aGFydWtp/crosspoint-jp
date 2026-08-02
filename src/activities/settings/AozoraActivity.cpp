@@ -232,6 +232,10 @@ bool AozoraActivity::fetchWorks(const char* queryParam) {
   // 不要なバッファを解放してヒープ確保（TLSバッファ用）
   authors_.clear();
   authors_.shrink_to_fit();
+  // ページ送りでの再取得時、旧ページの 30 件と JSON 一時バッファが同時に生存する
+  // ピークを避けるため、works_ も取得前に返却しておく。
+  works_.clear();
+  works_.shrink_to_fit();
 
   // 新しいクエリの場合はオフセットをリセットし、クエリを保存
   if (queryParam) {
@@ -302,6 +306,8 @@ bool AozoraActivity::parseWorksJson(JsonDocument& doc) {
     snprintf(entry.kana, sizeof(entry.kana), "%s", (obj["kana"] | ""));
     snprintf(entry.ndc, sizeof(entry.ndc), "%s", (obj["ndc"] | ""));
     snprintf(entry.author, sizeof(entry.author), "%s", (obj["author"] | ""));
+    snprintf(entry.subtitle, sizeof(entry.subtitle), "%s", (obj["subtitle"] | ""));
+    snprintf(entry.variant, sizeof(entry.variant), "%s", (obj["variant"] | ""));
     works_.push_back(entry);
   }
 
@@ -819,6 +825,9 @@ void AozoraActivity::loop() {
         snprintf(selectedWorkTitle_, sizeof(selectedWorkTitle_), "%s", work.title);
         snprintf(selectedWorkAuthor_, sizeof(selectedWorkAuthor_), "%s",
                  work.author[0] ? work.author : selectedAuthorName_);
+        snprintf(selectedWorkSubtitle_, sizeof(selectedWorkSubtitle_), "%s", work.subtitle);
+        snprintf(selectedWorkVariant_, sizeof(selectedWorkVariant_), "%s", work.variant);
+        snprintf(selectedWorkNdc_, sizeof(selectedWorkNdc_), "%s", work.ndc);
 
         {
           RenderLock lock(*this);
@@ -1050,6 +1059,11 @@ void AozoraActivity::loop() {
           selectedWorkId_ = entry.workId;
           snprintf(selectedWorkTitle_, sizeof(selectedWorkTitle_), "%s", entry.title);
           snprintf(selectedWorkAuthor_, sizeof(selectedWorkAuthor_), "%s", entry.author);
+          // ダウンロード履歴には副題・文字遣い・NDC を保存していないため、
+          // 直前に見た作品の値が残らないようクリアする。
+          selectedWorkSubtitle_[0] = '\0';
+          selectedWorkVariant_[0] = '\0';
+          selectedWorkNdc_[0] = '\0';
 
           {
             RenderLock lock(*this);
@@ -1214,8 +1228,27 @@ void AozoraActivity::render(RenderLock&&) {
     renderer.drawText(UI_12_FONT_ID, metrics.contentSidePadding, y, selectedWorkTitle_);
     y += renderer.getLineHeight(UI_12_FONT_ID) + metrics.verticalSpacing;
 
+    if (selectedWorkSubtitle_[0] != '\0') {
+      renderer.drawText(UI_10_FONT_ID, metrics.contentSidePadding, y, selectedWorkSubtitle_);
+      y += lineHeight + metrics.verticalSpacing;
+    }
+
     if (selectedWorkAuthor_[0] != '\0') {
       renderer.drawText(UI_10_FONT_ID, metrics.contentSidePadding, y, selectedWorkAuthor_);
+      y += lineHeight + metrics.verticalSpacing;
+    }
+
+    // 文字遣い（新字新仮名など）と NDC 分類。同名作品の判別材料になる。
+    if (selectedWorkVariant_[0] != '\0' || selectedWorkNdc_[0] != '\0') {
+      char meta[48];
+      if (selectedWorkVariant_[0] != '\0' && selectedWorkNdc_[0] != '\0') {
+        snprintf(meta, sizeof(meta), "%s  NDC %s", selectedWorkVariant_, selectedWorkNdc_);
+      } else if (selectedWorkVariant_[0] != '\0') {
+        snprintf(meta, sizeof(meta), "%s", selectedWorkVariant_);
+      } else {
+        snprintf(meta, sizeof(meta), "NDC %s", selectedWorkNdc_);
+      }
+      renderer.drawText(UI_10_FONT_ID, metrics.contentSidePadding, y, meta);
       y += lineHeight + metrics.verticalSpacing;
     }
 

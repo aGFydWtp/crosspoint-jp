@@ -55,6 +55,10 @@ class AozoraActivity : public Activity {
     char kana[48];
     char ndc[8];
     char author[48];
+    char subtitle[64];  // API の subtitle。CJK 21 文字相当
+    // API の variant（文字遣い）。実測値は「新字新仮名」「新字旧仮名」「旧字旧仮名」の
+    // 3 種でいずれも UTF-8 15 バイト。char[16] では NUL 込みで余裕がないため 20 とする。
+    char variant[20];
   };
 
   State state_ = WIFI_SELECTION;
@@ -97,6 +101,9 @@ class AozoraActivity : public Activity {
   int selectedWorkId_ = 0;
   char selectedWorkTitle_[80] = {};
   char selectedWorkAuthor_[48] = {};
+  char selectedWorkSubtitle_[64] = {};
+  char selectedWorkVariant_[20] = {};
+  char selectedWorkNdc_[8] = {};
 
   // Download progress
   size_t downloadProgress_ = 0;
