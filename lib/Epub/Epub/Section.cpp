@@ -309,7 +309,7 @@ bool Section::createSectionFile(const int fontId, const float lineCompression, c
   if (cssParser) {
     cssParser->clear();
   }
-  SECTION_PERF_LOG(spineIndex, pageCount);
+  SECTION_PERF_LOG(spineIndex, pageCount, fontId, verticalMode);
   return true;
 }
 

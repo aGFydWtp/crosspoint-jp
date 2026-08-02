@@ -71,14 +71,13 @@ class ScopedPerfTimer {
   const uint32_t startUs;
 };
 
-inline void logSectionBuildPerf(const int spineIndex, const uint32_t pageCount) {
-  const SectionBuildPerf& p = gSectionBuildPerf;
-  LOG_DBG("SCT",
-          "PERF spine=%d html=%uB pages=%u | extract=%ums read=%ums parse=%ums "
-          "(layout=%ums adv=%ums/n=%u img=%ums pgser=%ums) heap=%u",
-          spineIndex, p.htmlBytes, pageCount, p.extractUs / 1000, p.readUs / 1000, p.parseUs / 1000, p.layoutUs / 1000,
-          p.advanceUs / 1000, p.advanceCalls, p.imageUs / 1000, p.serializeUs / 1000, ESP.getFreeHeap());
-}
+// 計測結果を LOG_DBG と SDカード上のログファイル（PERF_LOG_PATH）の両方へ出力する。
+// ESP32-C3 の USB Serial/JTAG は実機動作中に切断されがちでシリアルが当てにならないため、
+// SD へ追記して後からカードを抜いて回収できるようにしている
+// （main.cpp の appendPowerLog が /.crosspoint/power_log.txt に対して行っているのと同じ手法）。
+// SDカードフォントかどうかは advn（advance テーブル構築の呼び出し回数）が
+// 0 より大きいかで判別できるため、専用のフラグは持たない。
+void logSectionBuildPerf(int spineIndex, uint32_t pageCount, int fontId, bool verticalMode);
 
 #define SECTION_PERF_CONCAT_INNER(a, b) a##b
 #define SECTION_PERF_CONCAT(a, b) SECTION_PERF_CONCAT_INNER(a, b)
@@ -92,7 +91,8 @@ inline void logSectionBuildPerf(const int spineIndex, const uint32_t pageCount) 
 #define SECTION_PERF_COUNT(field) (++gSectionBuildPerf.field)
 #define SECTION_PERF_SET(field, value) (gSectionBuildPerf.field = (value))
 #define SECTION_PERF_RESET() gSectionBuildPerf.reset()
-#define SECTION_PERF_LOG(spineIndex, pageCount) logSectionBuildPerf((spineIndex), (pageCount))
+#define SECTION_PERF_LOG(spineIndex, pageCount, fontId, verticalMode) \
+  logSectionBuildPerf((spineIndex), (pageCount), (fontId), (verticalMode))
 
 #else
 
@@ -102,6 +102,6 @@ inline void logSectionBuildPerf(const int spineIndex, const uint32_t pageCount) 
 #define SECTION_PERF_COUNT(field) ((void)0)
 #define SECTION_PERF_SET(field, value) ((void)0)
 #define SECTION_PERF_RESET() ((void)0)
-#define SECTION_PERF_LOG(spineIndex, pageCount) ((void)0)
+#define SECTION_PERF_LOG(spineIndex, pageCount, fontId, verticalMode) ((void)0)
 
 #endif
