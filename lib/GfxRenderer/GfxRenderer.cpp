@@ -168,14 +168,19 @@ const uint8_t* GfxRenderer::getGlyphBitmap(const EpdFontData* fontData, const Ep
   return &fontData->bitmap[glyph->dataOffset];
 }
 
-void GfxRenderer::ensureSdCardFontReady(int fontId, const char* utf8Text) const {
+void GfxRenderer::ensureSdCardFontReady(int fontId, const char* utf8Text, uint8_t styleMask) const {
   auto it = sdCardFonts_.find(fontId);
   if (it != sdCardFonts_.end()) {
     // Build a compact advance-only table for layout measurement.
     // Unlike prewarm(), this has no codepoint limit — handles CJK paragraphs
     // with 2000+ unique codepoints without overflow thrashing.
-    // Uses 6 bytes per codepoint (vs 16 for full EpdGlyph), no bitmap data.
-    int missed = it->second->buildAdvanceTable(utf8Text, 0x0F);
+    // Uses 8 bytes per codepoint (vs 16 for full EpdGlyph), no bitmap data.
+    //
+    // styleMask には「このテキストで実際に使うスタイル」だけを渡すこと。
+    // 全スタイル（0x0F）を渡すと、本文が Regular だけの段落でも Bold のぶんまで
+    // .cpfont を開いて読むことになる（本フォークの CJK フォントは Regular + Bold
+    // の2スタイル持ちなので、そのまま2倍のコストになる）。
+    int missed = it->second->buildAdvanceTable(utf8Text, styleMask);
     if (missed > 0) {
       LOG_DBG("GFX", "ensureSdCardFontReady: %d glyph(s) not found", missed);
     }

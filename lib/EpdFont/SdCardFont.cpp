@@ -5,6 +5,7 @@
 #include <Utf8.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 
@@ -874,218 +875,250 @@ bool SdCardFont::loadVertData(uint8_t style) {
 // --- Advance table ---
 
 void SdCardFont::clearAdvanceTables() {
+  clearAdvanceSpill();
   for (uint8_t i = 0; i < MAX_STYLES; i++) {
-    delete[] advanceTable_[i];
+    free(advanceTable_[i]);
     advanceTable_[i] = nullptr;
     advanceTableSize_[i] = 0;
+    advanceTableCap_[i] = 0;
+  }
+}
+
+void SdCardFont::clearAdvanceSpill() {
+  for (uint8_t i = 0; i < MAX_STYLES; i++) {
+    free(advanceSpill_[i]);
+    advanceSpill_[i] = nullptr;
+    advanceSpillSize_[i] = 0;
   }
 }
 
 bool SdCardFont::hasAdvanceTable() const {
   for (uint8_t i = 0; i < MAX_STYLES; i++) {
-    if (advanceTable_[i]) return true;
+    if (advanceTable_[i] || advanceSpill_[i]) return true;
   }
   return false;
+}
+
+// 累積テーブル → ブロックローカルの退避テーブルの順に引く。どちらもコードポイント昇順。
+const SdCardFont::AdvanceEntry* SdCardFont::findAdvanceEntry(const uint8_t styleIdx, const uint32_t codepoint) const {
+  if (styleIdx >= MAX_STYLES) return nullptr;
+  for (int pass = 0; pass < 2; pass++) {
+    const AdvanceEntry* table = (pass == 0) ? advanceTable_[styleIdx] : advanceSpill_[styleIdx];
+    const uint32_t size = (pass == 0) ? advanceTableSize_[styleIdx] : advanceSpillSize_[styleIdx];
+    if (!table || size == 0) continue;
+    uint32_t lo = 0, hi = size;
+    while (lo < hi) {
+      const uint32_t mid = lo + (hi - lo) / 2;
+      if (table[mid].codepoint < codepoint) {
+        lo = mid + 1;
+      } else {
+        hi = mid;
+      }
+    }
+    if (lo < size && table[lo].codepoint == codepoint) return &table[lo];
+  }
+  return nullptr;
 }
 
 uint16_t SdCardFont::getAdvance(uint32_t codepoint, uint8_t style) const {
   // Fall back to Regular (style 0) if requested style has no advance table
   // (e.g., Bold requested but font only has Regular)
-  if (style >= MAX_STYLES || !advanceTable_[style]) {
-    if (style != 0 && advanceTable_[0]) {
+  if (style >= MAX_STYLES || (!advanceTable_[style] && !advanceSpill_[style])) {
+    if (style != 0 && (advanceTable_[0] || advanceSpill_[0])) {
       style = 0;  // fallback to Regular
     } else {
       return 0;
     }
   }
-  const AdvanceEntry* table = advanceTable_[style];
-  const uint32_t size = advanceTableSize_[style];
-  // Binary search sorted by codepoint
-  uint32_t lo = 0, hi = size;
-  while (lo < hi) {
-    uint32_t mid = lo + (hi - lo) / 2;
-    if (table[mid].codepoint < codepoint) {
-      lo = mid + 1;
-    } else {
-      hi = mid;
-    }
+  const AdvanceEntry* entry = findAdvanceEntry(style, codepoint);
+  return entry ? entry->advanceX : 0;
+}
+
+// 累積テーブルを needed エントリぶん収容できるまで伸長する。
+// AdvanceEntry は POD なので realloc が使える（その場拡張が効けばコピーも起きない）。
+bool SdCardFont::ensureAdvanceCapacity(const uint8_t styleIdx, const uint32_t needed) {
+  if (needed <= advanceTableCap_[styleIdx]) return true;
+  if (needed > ADVANCE_TABLE_MAX_CAP) return false;
+
+  uint32_t cap = advanceTableCap_[styleIdx] ? advanceTableCap_[styleIdx] : ADVANCE_TABLE_INITIAL_CAP;
+  while (cap < needed) cap *= 2;
+  if (cap > ADVANCE_TABLE_MAX_CAP) cap = ADVANCE_TABLE_MAX_CAP;
+
+  auto* grown = static_cast<AdvanceEntry*>(realloc(advanceTable_[styleIdx], cap * sizeof(AdvanceEntry)));
+  if (!grown) {
+    LOG_ERR("SDCF", "advance table grow failed (style %u, %u entries)", styleIdx, cap);
+    return false;
   }
-  if (lo < size && table[lo].codepoint == codepoint) {
-    return table[lo].advanceX;
-  }
-  return 0;
+  advanceTable_[styleIdx] = grown;
+  advanceTableCap_[styleIdx] = cap;
+  return true;
 }
 
 int SdCardFont::buildAdvanceTable(const char* utf8Text, uint8_t styleMask) {
   if (!loaded_) return -1;
 
-  clearAdvanceTables();
+  // 退避テーブルだけがブロックローカル。累積テーブル（advanceTable_）は破棄しない。
+  clearAdvanceSpill();
 
-  unsigned long startMs = millis();
+  const unsigned long startMs = millis();
 
-  // Step 1: Extract unique codepoints (no limit).
-  // First pass: count total codepoints to size the dedup buffer.
-  uint32_t totalChars = 0;
-  {
-    const unsigned char* p = reinterpret_cast<const unsigned char*>(utf8Text);
-    while (*p) {
-      utf8NextCodepoint(&p);
-      totalChars++;
-    }
-  }
-  if (totalChars == 0) return 0;
-
-  // Allocate buffer for unique codepoints.
-  // Cap at MAX_ADVANCE_CODEPOINTS to prevent OOM on large CJK sections.
-  // Codepoints beyond the cap are still renderable via onGlyphMiss(), just
-  // without a cached advance value (falls back to SD read).
-  static constexpr uint32_t MAX_ADVANCE_CODEPOINTS = 1024;
-  const uint32_t bufSize = (totalChars < MAX_ADVANCE_CODEPOINTS) ? totalChars : MAX_ADVANCE_CODEPOINTS;
-  uint32_t* codepoints = new (std::nothrow) uint32_t[bufSize];
-  if (!codepoints) {
-    LOG_ERR("SDCF", "buildAdvanceTable: failed to allocate codepoint buffer (%u bytes)", bufSize * 4);
-    return -1;
-  }
-  uint32_t cpCount = 0;
-
-  // Second pass: collect unique codepoints via O(n²) dedup.
-  const unsigned char* p = reinterpret_cast<const unsigned char*>(utf8Text);
-  while (*p && cpCount < bufSize) {
-    uint32_t cp = utf8NextCodepoint(&p);
-    if (cp == 0) break;
-
-    bool found = false;
-    for (uint32_t i = 0; i < cpCount; i++) {
-      if (codepoints[i] == cp) {
-        found = true;
-        break;
-      }
-    }
-    if (!found) {
-      codepoints[cpCount++] = cp;
-    }
-  }
-
-  // Sort for ordered glyph index mapping and final table output
-  std::sort(codepoints, codepoints + cpCount);
-
-  // Step 2: Build per-style advance tables
   int totalMissed = 0;
   for (uint8_t si = 0; si < MAX_STYLES; si++) {
     if (!(styleMask & (1 << si)) || !styles_[si].present) continue;
-    const auto& s = styles_[si];
+    const int missed = buildAdvanceTableForStyle(si, utf8Text);
+    if (missed > 0) totalMissed += missed;
+  }
 
-    // Map codepoints to global glyph indices
-    struct CpIdx {
-      uint32_t codepoint;
-      int32_t glyphIndex;
-    };
-    CpIdx* mappings = new (std::nothrow) CpIdx[cpCount];
-    if (!mappings) {
-      LOG_ERR("SDCF", "buildAdvanceTable: failed to allocate mappings for style %u", si);
-      totalMissed += cpCount;
-      continue;
+  stats_.prewarmTotalMs = millis() - startMs;
+  return totalMissed;
+}
+
+// 1スタイルぶんの advance を、累積テーブルへ「足りないぶんだけ」追加する。
+// 必要なコードポイントが既に全部揃っていれば .cpfont を開かずに戻る。
+// 章の冒頭数ブロックを過ぎればこれが定常状態になり、SD I/O がほぼ消える。
+int SdCardFont::buildAdvanceTableForStyle(const uint8_t styleIdx, const char* utf8Text) {
+  const auto& s = styles_[styleIdx];
+
+  // Pass 1: 未取得のコードポイント数を数える（重複を含む上限値）。
+  // ゼロなら確保も I/O も一切せずに戻る。
+  uint32_t missUpperBound = 0;
+  {
+    const unsigned char* p = reinterpret_cast<const unsigned char*>(utf8Text);
+    while (*p) {
+      const uint32_t cp = utf8NextCodepoint(&p);
+      if (cp == 0) break;
+      if (!findAdvanceEntry(styleIdx, cp)) missUpperBound++;
     }
+  }
+  if (missUpperBound == 0) return 0;
+  if (missUpperBound > MAX_MISSES_PER_CALL) missUpperBound = MAX_MISSES_PER_CALL;
 
-    uint32_t validCount = 0;
-    for (uint32_t i = 0; i < cpCount; i++) {
-      int32_t idx = findGlobalGlyphIndex(s, codepoints[i]);
-      if (idx >= 0) {
-        mappings[validCount].codepoint = codepoints[i];
-        mappings[validCount].glyphIndex = idx;
-        validCount++;
-      }
-    }
-    totalMissed += static_cast<int>(cpCount - validCount);
+  struct Pending {
+    uint32_t codepoint;
+    int32_t glyphIndex;
+    uint16_t advanceX;
+    uint8_t hasGlyph;
+  };
+  const std::unique_ptr<Pending[]> pending(new (std::nothrow) Pending[missUpperBound]);
+  if (!pending) {
+    LOG_ERR("SDCF", "buildAdvanceTable: pending alloc failed (%u entries)", missUpperBound);
+    return -1;
+  }
 
-    if (validCount == 0) {
-      delete[] mappings;
-      continue;
-    }
-
-    // Allocate advance table
-    advanceTable_[si] = new (std::nothrow) AdvanceEntry[validCount];
-    if (!advanceTable_[si]) {
-      LOG_ERR("SDCF", "buildAdvanceTable: failed to allocate advance table (%u entries) for style %u", validCount, si);
-      delete[] mappings;
-      continue;
-    }
-    advanceTableSize_[si] = validCount;
-
-    // Copy codepoints into advance table (already sorted)
-    for (uint32_t i = 0; i < validCount; i++) {
-      advanceTable_[si][i].codepoint = mappings[i].codepoint;
-      advanceTable_[si][i].advanceX = 0;
-    }
-
-    // Sort mappings by glyph index for sequential SD reads
-    std::sort(mappings, mappings + validCount,
-              [](const CpIdx& a, const CpIdx& b) { return a.glyphIndex < b.glyphIndex; });
-
-    // Build a reverse map: for each mapping index, find its position in the
-    // sorted-by-codepoint advance table. Since both are small and this runs
-    // once per section build, O(n²) is acceptable.
-    std::unique_ptr<uint32_t[]> tablePos(new (std::nothrow) uint32_t[validCount]);
-    if (!tablePos) {
-      LOG_ERR("SDCF", "buildAdvanceTable: failed to allocate tablePos for style %u", si);
-      delete[] advanceTable_[si];
-      advanceTable_[si] = nullptr;
-      advanceTableSize_[si] = 0;
-      delete[] mappings;
-      continue;
-    }
-    for (uint32_t i = 0; i < validCount; i++) {
-      // Binary search the advance table (sorted by codepoint) for this mapping's codepoint
-      uint32_t lo = 0, hi = validCount;
-      while (lo < hi) {
-        uint32_t mid = lo + (hi - lo) / 2;
-        if (advanceTable_[si][mid].codepoint < mappings[i].codepoint) {
-          lo = mid + 1;
-        } else {
-          hi = mid;
+  // Pass 2: 未取得のコードポイントを重複除去して集める。
+  // 除去対象は未取得ぶんだけなので、O(n²) でも実際の件数は小さい。
+  uint32_t missCount = 0;
+  {
+    const unsigned char* p = reinterpret_cast<const unsigned char*>(utf8Text);
+    while (*p && missCount < missUpperBound) {
+      const uint32_t cp = utf8NextCodepoint(&p);
+      if (cp == 0) break;
+      if (findAdvanceEntry(styleIdx, cp)) continue;
+      bool dup = false;
+      for (uint32_t i = 0; i < missCount; i++) {
+        if (pending[i].codepoint == cp) {
+          dup = true;
+          break;
         }
       }
-      tablePos[i] = lo;
+      if (dup) continue;
+      pending[missCount].codepoint = cp;
+      pending[missCount].glyphIndex = findGlobalGlyphIndex(s, cp);  // RAM常駐の interval 表を引くだけ
+      pending[missCount].advanceX = 0;
+      pending[missCount].hasGlyph = 0;
+      missCount++;
     }
+  }
+  if (missCount == 0) return 0;
 
-    // Open file once, read advanceX for each glyph in index order
+  uint32_t withGlyph = 0;
+  for (uint32_t i = 0; i < missCount; i++) {
+    if (pending[i].glyphIndex >= 0) withGlyph++;
+  }
+  const int missed = static_cast<int>(missCount - withGlyph);
+
+  // Pass 3: グリフを持つものだけ SD から advanceX を読む。
+  // グリフ番号順に並べ替えることで、連続する番号では seek を省ける。
+  if (withGlyph > 0) {
+    std::sort(pending.get(), pending.get() + missCount,
+              [](const Pending& a, const Pending& b) { return a.glyphIndex < b.glyphIndex; });
+
     FsFile file;
     if (!Storage.openFileForRead("SDCF", filePath_, file)) {
-      LOG_ERR("SDCF", "buildAdvanceTable: failed to open .cpfont for style %u", si);
-      delete[] advanceTable_[si];
-      advanceTable_[si] = nullptr;
-      advanceTableSize_[si] = 0;
-      delete[] mappings;
-      continue;
+      LOG_ERR("SDCF", "buildAdvanceTable: failed to open .cpfont for style %u", styleIdx);
+      return missed;  // キャッシュに書かずに戻る。次の呼び出しで再試行される
     }
 
     EpdGlyph tempGlyph;
     int32_t lastReadIndex = INT32_MIN;
-    for (uint32_t i = 0; i < validCount; i++) {
-      int32_t gIdx = mappings[i].glyphIndex;
-      uint32_t fileOff = s.glyphsFileOffset + static_cast<uint32_t>(gIdx) * sizeof(EpdGlyph);
+    bool readError = false;
+    for (uint32_t i = 0; i < missCount; i++) {
+      const int32_t gIdx = pending[i].glyphIndex;
+      if (gIdx < 0) continue;  // ソート済みなので負の値は先頭に固まっている
+      const uint32_t fileOff = s.glyphsFileOffset + static_cast<uint32_t>(gIdx) * sizeof(EpdGlyph);
       if (gIdx != lastReadIndex + 1) {
         file.seekSet(fileOff);
       }
       if (file.read(reinterpret_cast<uint8_t*>(&tempGlyph), sizeof(EpdGlyph)) != sizeof(EpdGlyph)) {
-        LOG_ERR("SDCF", "buildAdvanceTable: short glyph read (style %u, glyph %d)", si, gIdx);
+        LOG_ERR("SDCF", "buildAdvanceTable: short glyph read (style %u, glyph %d)", styleIdx, gIdx);
+        readError = true;
         break;
       }
       lastReadIndex = gIdx;
-      advanceTable_[si][tablePos[i]].advanceX = tempGlyph.advanceX;
+      pending[i].advanceX = tempGlyph.advanceX;
+      pending[i].hasGlyph = 1;
     }
-
     file.close();
-    delete[] mappings;
 
-    LOG_DBG("SDCF", "Built advance table: style %u, %u entries, %u bytes", si, validCount,
-            validCount * static_cast<uint32_t>(sizeof(AdvanceEntry)));
+    // 途中で失敗したものを hasGlyph=0 でキャッシュすると「グリフ無し」として
+    // 固定されてしまう。読み直せるよう、何も登録せずに戻る。
+    if (readError) return missed;
   }
 
-  delete[] codepoints;
+  // Pass 4: コードポイント昇順に並べ替えて累積テーブルへマージする。
+  // グリフが無かったものも hasGlyph=0 で登録する（ネガティブキャッシュ）。
+  // これをしないと、フォントに無い字が出るたびに毎ブロック探索し直すことになる。
+  std::sort(pending.get(), pending.get() + missCount,
+            [](const Pending& a, const Pending& b) { return a.codepoint < b.codepoint; });
 
-  stats_.prewarmTotalMs = millis() - startMs;
-  return totalMissed;
+  if (ensureAdvanceCapacity(styleIdx, advanceTableSize_[styleIdx] + missCount)) {
+    // 後ろから詰めるインプレースマージ。pending は既存テーブルに無い要素のみなので重複しない。
+    AdvanceEntry* table = advanceTable_[styleIdx];
+    uint32_t i = advanceTableSize_[styleIdx];
+    uint32_t j = missCount;
+    uint32_t w = i + j;
+    while (j > 0) {
+      --w;
+      if (i > 0 && table[i - 1].codepoint > pending[j - 1].codepoint) {
+        table[w] = table[i - 1];
+        --i;
+      } else {
+        --j;
+        table[w].codepoint = pending[j].codepoint;
+        table[w].advanceX = pending[j].advanceX;
+        table[w].hasGlyph = pending[j].hasGlyph;
+      }
+    }
+    advanceTableSize_[styleIdx] += missCount;
+    return missed;
+  }
+
+  // 累積テーブルが上限に達した（または伸長に失敗した）。このブロックぶんだけ退避テーブルへ入れる。
+  // 累積ぶんは捨てないので、上限到達後も既知のコードポイントは引き続きヒットする。
+  auto* spill = static_cast<AdvanceEntry*>(malloc(missCount * sizeof(AdvanceEntry)));
+  if (!spill) {
+    LOG_ERR("SDCF", "advance spill alloc failed (style %u, %u entries)", styleIdx, missCount);
+    return missed;
+  }
+  for (uint32_t i = 0; i < missCount; i++) {
+    spill[i].codepoint = pending[i].codepoint;
+    spill[i].advanceX = pending[i].advanceX;
+    spill[i].hasGlyph = pending[i].hasGlyph;
+  }
+  free(advanceSpill_[styleIdx]);
+  advanceSpill_[styleIdx] = spill;
+  advanceSpillSize_[styleIdx] = missCount;
+  return missed;
 }
 
 // --- Stats ---

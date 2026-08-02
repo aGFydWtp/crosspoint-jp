@@ -3,6 +3,7 @@
 #ifdef SECTION_BUILD_PERF
 
 #include <HalStorage.h>
+#include <esp_heap_caps.h>
 
 #include <cstdio>
 #include <cstring>
@@ -18,12 +19,13 @@ void logSectionBuildPerf(const int spineIndex, const uint32_t pageCount, const i
 
   // 1行に収める。ミリ秒へ丸めて出力する（µs のままだと桁が読みにくいだけで精度は不要）。
   char line[256];
-  const int len = snprintf(line, sizeof(line),
-                           "t=%u spine=%d html=%u pages=%u font=%d vert=%d "
-                           "extract=%u read=%u parse=%u layout=%u adv=%u advn=%u img=%u pgser=%u heap=%u\n",
-                           millis(), spineIndex, p.htmlBytes, pageCount, fontId, verticalMode ? 1 : 0,
-                           p.extractUs / 1000, p.readUs / 1000, p.parseUs / 1000, p.layoutUs / 1000, p.advanceUs / 1000,
-                           p.advanceCalls, p.imageUs / 1000, p.serializeUs / 1000, ESP.getFreeHeap());
+  const int len =
+      snprintf(line, sizeof(line),
+               "t=%u spine=%d html=%u pages=%u font=%d vert=%d "
+               "extract=%u read=%u parse=%u layout=%u adv=%u advn=%u img=%u pgser=%u heap=%u minheap=%u\n",
+               millis(), spineIndex, p.htmlBytes, pageCount, fontId, verticalMode ? 1 : 0, p.extractUs / 1000,
+               p.readUs / 1000, p.parseUs / 1000, p.layoutUs / 1000, p.advanceUs / 1000, p.advanceCalls,
+               p.imageUs / 1000, p.serializeUs / 1000, ESP.getFreeHeap(), esp_get_minimum_free_heap_size());
   if (len <= 0) return;
 
   LOG_DBG("SCT", "PERF %s", line);
