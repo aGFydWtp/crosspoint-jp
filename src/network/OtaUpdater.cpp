@@ -144,11 +144,11 @@ OtaUpdater::OtaUpdaterError OtaUpdater::installUpdate(ProgressCallback onProgres
   }
   lastErrorDetail.clear();
 
-  // esp_https_ota is hardwired to esp-tls/mbedTLS, whose precompiled build on this
-  // package can't negotiate TLS 1.3 (see SecureClient.h). Drive the OTA partition
-  // ourselves and stream the firmware through HttpDownloader, which runs over
-  // wolfSSL when FREEINK_NET_WOLFSSL is set, reusing its redirect handling for the
-  // GitHub -> CDN hop.
+  // esp_https_ota opens its own esp_http_client with its own buffer sizes and
+  // no visibility into the TLS diagnostics this fork captures. Drive the OTA
+  // partition ourselves and stream the firmware through HttpDownloader instead,
+  // reusing its redirect handling for the GitHub -> CDN hop and the LARGE TX
+  // profile that hop's signed URL needs.
   const esp_partition_t* updatePartition = esp_ota_get_next_update_partition(nullptr);
   if (!updatePartition) {
     LOG_ERR("OTA", "No OTA partition available");
