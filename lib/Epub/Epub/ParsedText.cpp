@@ -11,6 +11,7 @@
 #include <limits>
 #include <vector>
 
+#include "SectionBuildPerf.h"
 #include "hyphenation/Hyphenator.h"
 
 namespace {
@@ -72,6 +73,24 @@ uint16_t measureWordWidth(const GfxRenderer& renderer, const int fontId, const s
     sanitized.push_back('-');
   }
   return renderer.getTextAdvanceX(fontId, sanitized.c_str(), style);
+}
+
+// このブロックで実際に使われているフォントスタイルのビット集合を返す。
+// SDカードフォントの advance テーブルを、使わないスタイルのぶんまで
+// 構築してしまわないようにするためのもの（Issue #99）。
+//
+// UNDERLINE(4) は下線フラグであってスタイル番号ではない。SdCardFont::getAdvance() は
+// MAX_STYLES(4) 以上のスタイルを Regular にフォールバックさせるので、ここでも
+// 同じ扱いにして参照先を一致させる。
+// 幅の計測にはスペースや CJK インデント参照文字（いずれも REGULAR）も使うため、
+// REGULAR は常に含める。
+uint8_t usedStyleMask(const std::vector<EpdFontFamily::Style>& wordStyles) {
+  uint8_t mask = 1u << EpdFontFamily::REGULAR;
+  for (const auto style : wordStyles) {
+    const uint8_t idx = (style < EpdFontFamily::UNDERLINE) ? static_cast<uint8_t>(style) : 0;
+    mask |= static_cast<uint8_t>(1u << idx);
+  }
+  return mask;
 }
 
 // Check if a word is a single CJK character (used for zero-spacing between adjacent CJK words)
@@ -158,6 +177,7 @@ void ParsedText::layoutAndExtractLines(const GfxRenderer& renderer, const int fo
   if (words.empty()) {
     return;
   }
+  SECTION_PERF_SCOPE(layoutUs);
 
   // Apply fixed transforms before any per-line layout work.
   applyParagraphIndent();
@@ -168,13 +188,15 @@ void ParsedText::layoutAndExtractLines(const GfxRenderer& renderer, const int fo
   // (advanceX only, no bitmaps) for all unique codepoints in this paragraph so
   // that calculateWordWidths() can measure text without on-demand SD I/O.
   if (renderer.isSdCardFont(fontId)) {
+    SECTION_PERF_SCOPE(advanceUs);
+    SECTION_PERF_COUNT(advanceCalls);
     std::string allText;
     for (size_t i = 0; i < words.size(); i++) {
       if (i > 0) allText += ' ';
       allText += words[i];
     }
     if (hyphenationEnabled) allText += '-';
-    renderer.ensureSdCardFontReady(fontId, allText.c_str());
+    renderer.ensureSdCardFontReady(fontId, allText.c_str(), usedStyleMask(wordStyles));
   }
 
   const int pageWidth = viewportWidth;
@@ -237,15 +259,18 @@ void ParsedText::layoutVerticalColumns(const GfxRenderer& renderer, const int fo
                                        const std::function<void(std::shared_ptr<TextBlock>)>& processColumn,
                                        const bool includeLastColumn) {
   if (words.empty()) return;
+  SECTION_PERF_SCOPE(layoutUs);
 
   // Ensure SD card font metrics are loaded
   if (renderer.isSdCardFont(fontId)) {
+    SECTION_PERF_SCOPE(advanceUs);
+    SECTION_PERF_COUNT(advanceCalls);
     std::string allText;
     for (const auto& w : words) {
       allText += w;
       allText += ' ';
     }
-    renderer.ensureSdCardFontReady(fontId, allText.c_str());
+    renderer.ensureSdCardFontReady(fontId, allText.c_str(), usedStyleMask(wordStyles));
   }
 
   const int lineHeight = renderer.getLineHeight(fontId);

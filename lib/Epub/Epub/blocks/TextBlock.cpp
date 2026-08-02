@@ -60,7 +60,9 @@ void TextBlock::render(const GfxRenderer& renderer, const int fontId, const int 
       if (!rt.empty()) allRuby += rt;
     }
     if (!allRuby.empty()) {
-      renderer.ensureSdCardFontReady(rubyFontId, allRuby.c_str());
+      // ルビは常に REGULAR で描画する（下の drawText/drawTextVertical 参照）。
+      // 全スタイルを要求すると、使わない Bold のぶんまで .cpfont を読むことになる。
+      renderer.ensureSdCardFontReady(rubyFontId, allRuby.c_str(), 1u << EpdFontFamily::REGULAR);
     }
   }
 

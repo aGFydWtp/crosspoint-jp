@@ -124,7 +124,9 @@ class GfxRenderer {
   bool isSdCardFont(int fontId) const { return sdCardFonts_.count(fontId) > 0; }
   // Ensure SD card font glyph data is loaded for the given text. Called from layout code
   // (which holds a const GfxRenderer&) before measuring word widths. Safe to call on non-SD fonts (no-op).
-  void ensureSdCardFontReady(int fontId, const char* utf8Text) const;
+  // styleMask は「このテキストで実際に使うスタイル」のビット集合（1 << EpdFontFamily::Style）。
+  // 既定の 0x0F は全スタイル。レイアウト経路からは使用スタイルに絞って渡すこと。
+  void ensureSdCardFontReady(int fontId, const char* utf8Text, uint8_t styleMask = 0x0F) const;
 
   // Orientation control (affects logical width/height and coordinate
   // transforms)

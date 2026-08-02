@@ -168,14 +168,19 @@ const uint8_t* GfxRenderer::getGlyphBitmap(const EpdFontData* fontData, const Ep
   return &fontData->bitmap[glyph->dataOffset];
 }
 
-void GfxRenderer::ensureSdCardFontReady(int fontId, const char* utf8Text) const {
+void GfxRenderer::ensureSdCardFontReady(int fontId, const char* utf8Text, uint8_t styleMask) const {
   auto it = sdCardFonts_.find(fontId);
   if (it != sdCardFonts_.end()) {
     // Build a compact advance-only table for layout measurement.
     // Unlike prewarm(), this has no codepoint limit — handles CJK paragraphs
     // with 2000+ unique codepoints without overflow thrashing.
-    // Uses 6 bytes per codepoint (vs 16 for full EpdGlyph), no bitmap data.
-    int missed = it->second->buildAdvanceTable(utf8Text, 0x0F);
+    // Uses 8 bytes per codepoint (vs 16 for full EpdGlyph), no bitmap data.
+    //
+    // styleMask には「このテキストで実際に使うスタイル」だけを渡すこと。
+    // 全スタイル（0x0F）を渡すと、本文が Regular だけの段落でも Bold のぶんまで
+    // .cpfont を開いて読むことになる（本フォークの CJK フォントは Regular + Bold
+    // の2スタイル持ちなので、そのまま2倍のコストになる）。
+    int missed = it->second->buildAdvanceTable(utf8Text, styleMask);
     if (missed > 0) {
       LOG_DBG("GFX", "ensureSdCardFontReady: %d glyph(s) not found", missed);
     }
@@ -1654,8 +1659,26 @@ int GfxRenderer::getTextAdvanceX(const int fontId, const char* text, EpdFontFami
   if (sdIt != sdCardFonts_.end() && sdIt->second->hasAdvanceTable()) {
     int32_t widthFP = 0;
     const uint8_t styleIdx = static_cast<uint8_t>(style);
+    // フォントにグリフが無いと分かっている字は renderChar() が '?' を描く。幅もそれに
+    // 合わせないとレイアウトが実際の描画より狭く見積もられ、行からはみ出す。
+    // （builtinGlyphAdvanceX が組み込みフォントに対して担保しているのと同じ整合性）
+    int32_t fallbackFP = -1;
     while (uint32_t cp = utf8NextCodepoint(reinterpret_cast<const uint8_t**>(&text))) {
-      widthFP += sdIt->second->getAdvance(cp, styleIdx);
+      uint16_t advance = 0;
+      switch (sdIt->second->lookupAdvance(cp, styleIdx, advance)) {
+        case SdCardFont::AdvanceLookup::Found:
+          widthFP += advance;
+          break;
+        case SdCardFont::AdvanceLookup::NoGlyph:
+          if (fallbackFP < 0) fallbackFP = sdIt->second->getAdvance('?', styleIdx);
+          widthFP += fallbackFP;
+          break;
+        case SdCardFont::AdvanceLookup::NotCached:
+          // このテキスト用にテーブルが用意されていない場合は従来どおり 0 のままにする。
+          // ここで '?' 幅を足すと、ルビ先読み直後の TextBlock::render が
+          // 参照字 "一" を測るときに columnWidth を壊してしまう。
+          break;
+      }
     }
     const uint16_t scale = getSdCardFontScale(fontId);
     if (scale != 256) {
