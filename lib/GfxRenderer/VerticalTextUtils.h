@@ -166,12 +166,11 @@ inline bool isKinsokuHead(uint32_t cp) {
   if (cp == 0xFF01 || cp == 0xFF1F) return true;                                  // ！？
   if (cp == 0xFF1A || cp == 0xFF1B) return true;                                  // ：；
   if (cp == 0x3009 || cp == 0x300B) return true;                                  // 〉》
-  // Small kana (行頭禁止)
-  if (cp == 0x3041 || cp == 0x3043 || cp == 0x3045 || cp == 0x3047 || cp == 0x3049) return true;  // ぁぃぅぇぉ
-  if (cp == 0x3063 || cp == 0x3083 || cp == 0x3085 || cp == 0x3087) return true;                  // っゃゅょ
-  if (cp == 0x30A1 || cp == 0x30A3 || cp == 0x30A5 || cp == 0x30A7 || cp == 0x30A9) return true;  // ァィゥェォ
-  if (cp == 0x30C3 || cp == 0x30E3 || cp == 0x30E5 || cp == 0x30E7) return true;                  // ッャュョ
-  if (cp == 0x30FC) return true;                                                                  // ー
+  // Small kana (行頭禁止). Shares isSmallKana() so the two lists cannot drift:
+  // the open-coded version here used to omit ゎ ヮ ゕ ゖ ヵ ヶ and the Ainu
+  // small katakana, which JIS X 4051 treats the same as っ ゃ ゅ ょ.
+  if (isSmallKana(cp)) return true;
+  if (cp == 0x30FC) return true;  // ー
   return false;
 }
 

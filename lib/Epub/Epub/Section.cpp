@@ -12,7 +12,7 @@
 
 namespace {
 // Version 31: ruby text data added to TextBlock serialization.
-constexpr uint8_t SECTION_FILE_VERSION = 31;
+constexpr uint8_t SECTION_FILE_VERSION = 32;
 // Minimum free heap required before attempting to build section pages.
 // Section building involves heavy allocations (Page, TextBlock, PageLine, etc.)
 // and on ESP32 without C++ exceptions, allocation failure calls abort().
