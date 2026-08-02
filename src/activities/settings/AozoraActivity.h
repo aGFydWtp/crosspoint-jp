@@ -138,6 +138,11 @@ class AozoraActivity : public Activity {
   bool fetchWorks(const char* queryParam);
   bool downloadBook();
   bool updateBook();
+  /**
+   * 選択中の作品をリーダーで開く。呼び出し後は this が破棄され得るため、
+   * 呼び出し元は即座に return してメンバに触れないこと。
+   */
+  void openSelectedWorkInReader();
   // Download destPath from url with the same retry policy as the listing calls.
   // Sets errorMessage_ and returns false once every attempt has failed.
   bool downloadWithRetry(const char* url, const char* destPath);

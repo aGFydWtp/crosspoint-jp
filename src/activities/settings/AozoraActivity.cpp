@@ -423,6 +423,48 @@ bool AozoraActivity::updateBook() {
   return true;
 }
 
+void AozoraActivity::openSelectedWorkInReader() {
+  // downloadBook() と同一のパス構築ロジックを使う。ファイルブラウザから開いた場合と
+  // 同じ絶対パスになることで .crosspoint/ キャッシュのハッシュが一致し、読書進捗が共有される。
+  char relPath[160];
+  if (!AozoraIndexManager::makeRelativePath(selectedWorkId_, selectedWorkTitle_, selectedWorkAuthor_, relPath,
+                                            sizeof(relPath))) {
+    LOG_ERR("AOZORA", "openSelectedWorkInReader: failed to make relative path");
+    {
+      RenderLock lock(*this);
+      errorMessage_ = "Path error";
+      state_ = ERROR;
+    }
+    requestUpdate();
+    return;
+  }
+  char fullPath[192];
+  snprintf(fullPath, sizeof(fullPath), "%s/%s", AozoraIndexManager::AOZORA_DIR, relPath);
+
+  // インデックス上は存在しても実ファイルが消えている場合がある（SD を PC で編集した等）
+  if (!Storage.exists(fullPath)) {
+    LOG_ERR("AOZORA", "openSelectedWorkInReader: file missing: %s", fullPath);
+    {
+      RenderLock lock(*this);
+      errorMessage_ = "File not found";
+      state_ = ERROR;
+    }
+    requestUpdate();
+    return;
+  }
+
+  // goToReader() は replaceActivity() の前に SD フォントをロードする。この時点では WiFi
+  // スタックがまだ生きているため、先に一覧バッファを返してヒープの余裕を作っておく。
+  works_.clear();
+  works_.shrink_to_fit();
+  authors_.clear();
+  authors_.shrink_to_fit();
+
+  // replaceActivity() は pendingActivity への登録のみで、実際の破棄は loop() が戻った後に
+  // ActivityManager::loop() が行う（"delete this" 問題は起きない）。呼び出し後はメンバに触れないこと。
+  onSelectBook(fullPath);
+}
+
 // --- Input handling ---
 
 void AozoraActivity::loop() {
@@ -818,8 +860,11 @@ void AozoraActivity::loop() {
         requestUpdate();
       }
     } else {
-      // ダウンロード済み: Left = 削除, Right = 更新
-      if (mappedInput.wasPressed(MappedInputManager::Button::Left)) {
+      // ダウンロード済み: Confirm = 読む, Left = 削除, Right = 更新
+      if (mappedInput.wasPressed(MappedInputManager::Button::Confirm)) {
+        openSelectedWorkInReader();
+        return;  // goToReader() 後は this が破棄され得るのでメンバに触れない
+      } else if (mappedInput.wasPressed(MappedInputManager::Button::Left)) {
         if (indexManager_.removeEntry(selectedWorkId_)) {
           invalidateDownloadedPageCache();
           // popState() は selectedIndex_ を selectedIndexStack_.back() で上書きするため、
@@ -1179,7 +1224,8 @@ void AozoraActivity::render(RenderLock&&) {
       y += metrics.verticalSpacing;
       renderer.drawText(UI_10_FONT_ID, metrics.contentSidePadding, y, tr(STR_DOWNLOAD_COMPLETE));
 
-      const auto labels = mappedInput.mapLabels(tr(STR_BACK), "", tr(STR_DELETE_CONFIRM), tr(STR_AOZORA_UPDATE));
+      const auto labels =
+          mappedInput.mapLabels(tr(STR_BACK), tr(STR_AOZORA_READ), tr(STR_DELETE_CONFIRM), tr(STR_AOZORA_UPDATE));
       GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
     } else {
       const auto labels = mappedInput.mapLabels(tr(STR_BACK), "", "", tr(STR_AOZORA_GET));
