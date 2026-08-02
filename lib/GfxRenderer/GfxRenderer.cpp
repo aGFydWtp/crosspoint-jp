@@ -1659,18 +1659,26 @@ int GfxRenderer::getTextAdvanceX(const int fontId, const char* text, EpdFontFami
   if (sdIt != sdCardFonts_.end() && sdIt->second->hasAdvanceTable()) {
     int32_t widthFP = 0;
     const uint8_t styleIdx = static_cast<uint8_t>(style);
-    // フォントにグリフが無い字は renderChar() が '?' を描く。幅もそれに合わせないと
-    // レイアウトが実際の描画より狭く見積もられ、行からはみ出す。
+    // フォントにグリフが無いと分かっている字は renderChar() が '?' を描く。幅もそれに
+    // 合わせないとレイアウトが実際の描画より狭く見積もられ、行からはみ出す。
     // （builtinGlyphAdvanceX が組み込みフォントに対して担保しているのと同じ整合性）
     int32_t fallbackFP = -1;
     while (uint32_t cp = utf8NextCodepoint(reinterpret_cast<const uint8_t**>(&text))) {
-      uint16_t advance;
-      if (sdIt->second->tryGetAdvance(cp, styleIdx, advance)) {
-        widthFP += advance;
-        continue;
+      uint16_t advance = 0;
+      switch (sdIt->second->lookupAdvance(cp, styleIdx, advance)) {
+        case SdCardFont::AdvanceLookup::Found:
+          widthFP += advance;
+          break;
+        case SdCardFont::AdvanceLookup::NoGlyph:
+          if (fallbackFP < 0) fallbackFP = sdIt->second->getAdvance('?', styleIdx);
+          widthFP += fallbackFP;
+          break;
+        case SdCardFont::AdvanceLookup::NotCached:
+          // このテキスト用にテーブルが用意されていない場合は従来どおり 0 のままにする。
+          // ここで '?' 幅を足すと、ルビ先読み直後の TextBlock::render が
+          // 参照字 "一" を測るときに columnWidth を壊してしまう。
+          break;
       }
-      if (fallbackFP < 0) fallbackFP = sdIt->second->getAdvance('?', styleIdx);
-      widthFP += fallbackFP;
     }
     const uint16_t scale = getSdCardFontScale(fontId);
     if (scale != 256) {

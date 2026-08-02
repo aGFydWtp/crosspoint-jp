@@ -71,10 +71,13 @@ class ScopedPerfTimer {
   const uint32_t startUs;
 };
 
-// 計測結果を LOG_DBG と SDカード上のログファイル（PERF_LOG_PATH）の両方へ出力する。
-// ESP32-C3 の USB Serial/JTAG は実機動作中に切断されがちでシリアルが当てにならないため、
-// SD へ追記して後からカードを抜いて回収できるようにしている
-// （main.cpp の appendPowerLog が /.crosspoint/power_log.txt に対して行っているのと同じ手法）。
+// 計測結果を LOG_DBG と SDカード上のログファイル（/.crosspoint/index_perf.log）の
+// 両方へ出力する。ESP32-C3 の USB Serial/JTAG は実機動作中に切断されがちで
+// シリアルが当てにならないため、SD へ追記して後からカードを抜いて回収できるようにしている。
+//
+// main.cpp の appendPowerLog も同じくSDへ追記するが、あちらは SETTINGS.debugDisplay で
+// ガードされているのに対し、こちらはガードしていない（lib から src の設定を参照できないため）。
+// 代わりにこのビルド自体が LOG_LEVEL>=2 限定であることと、ファイルサイズ上限で歯止めをかける。
 // SDカードフォントかどうかは advn（advance テーブル構築の呼び出し回数）が
 // 0 より大きいかで判別できるため、専用のフラグは持たない。
 void logSectionBuildPerf(int spineIndex, uint32_t pageCount, int fontId, bool verticalMode);

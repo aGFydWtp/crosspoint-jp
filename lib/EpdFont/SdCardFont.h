@@ -35,10 +35,14 @@ class SdCardFont {
   // Returns the 12.4 fixed-point advance, or 0 if not found.
   uint16_t getAdvance(uint32_t codepoint, uint8_t style) const;
 
-  // getAdvance() と同じ引数で、「テーブルに載っていて、かつフォントにグリフがある」
-  // 場合だけ true を返す。戻り値 0 が「幅0の字」なのか「グリフが無い字」なのかを
-  // 呼び出し側が区別できるようにするためのもの。
-  bool tryGetAdvance(uint32_t codepoint, uint8_t style, uint16_t& advanceOut) const;
+  // advance テーブルの参照結果。getAdvance() が返す 0 の意味を呼び出し側が
+  // 区別できるようにするためのもの。
+  enum class AdvanceLookup : uint8_t {
+    NotCached,  // テーブルに載っていない（このテキスト用に構築されていない）
+    Found,      // グリフがあり advanceOut が有効（幅0の結合文字などもここ）
+    NoGlyph,    // フォントにグリフが無いと分かっている（renderChar は '?' を描く）
+  };
+  AdvanceLookup lookupAdvance(uint32_t codepoint, uint8_t style, uint16_t& advanceOut) const;
 
   // Returns true if advance table is populated for at least one style.
   bool hasAdvanceTable() const;
@@ -198,7 +202,10 @@ class SdCardFont {
   // 1セクションビルドあたり最大1回で済む。
   //
   // 寿命は clearAdvanceTables() まで。実際には clearCache() 経由で
-  // セクションビルドの直前に破棄される（EpubReaderActivity）。
+  // (a) セクションビルドの直前（EpubReaderActivity）と
+  // (b) 毎ページの描画前（FontCacheManager::PrewarmScope の ctor）
+  // に破棄される。つまり読書中に載りっぱなしにはならず、常駐するのは
+  // 1セクションビルド中および1ページ描画中だけ。
   struct AdvanceEntry {
     uint32_t codepoint;
     uint16_t advanceX;  // 12.4 fixed-point

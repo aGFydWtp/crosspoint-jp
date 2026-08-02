@@ -934,18 +934,19 @@ uint16_t SdCardFont::getAdvance(uint32_t codepoint, uint8_t style) const {
   return entry ? entry->advanceX : 0;
 }
 
-bool SdCardFont::tryGetAdvance(uint32_t codepoint, uint8_t style, uint16_t& advanceOut) const {
+SdCardFont::AdvanceLookup SdCardFont::lookupAdvance(uint32_t codepoint, uint8_t style, uint16_t& advanceOut) const {
   if (style >= MAX_STYLES || (!advanceTable_[style] && !advanceSpill_[style])) {
     if (style != 0 && (advanceTable_[0] || advanceSpill_[0])) {
       style = 0;  // fallback to Regular
     } else {
-      return false;
+      return AdvanceLookup::NotCached;
     }
   }
   const AdvanceEntry* entry = findAdvanceEntry(style, codepoint);
-  if (!entry || !entry->hasGlyph) return false;
+  if (!entry) return AdvanceLookup::NotCached;
+  if (!entry->hasGlyph) return AdvanceLookup::NoGlyph;
   advanceOut = entry->advanceX;
-  return true;
+  return AdvanceLookup::Found;
 }
 
 // 累積テーブルを needed エントリぶん収容できるまで伸長する。
@@ -977,14 +978,19 @@ int SdCardFont::buildAdvanceTable(const char* utf8Text, uint8_t styleMask) {
   const unsigned long startMs = millis();
 
   int totalMissed = 0;
+  bool failed = false;
   for (uint8_t si = 0; si < MAX_STYLES; si++) {
     if (!(styleMask & (1 << si)) || !styles_[si].present) continue;
     const int missed = buildAdvanceTableForStyle(si, utf8Text);
-    if (missed > 0) totalMissed += missed;
+    if (missed < 0) {
+      failed = true;
+    } else {
+      totalMissed += missed;
+    }
   }
 
   stats_.prewarmTotalMs = millis() - startMs;
-  return totalMissed;
+  return failed ? -1 : totalMissed;
 }
 
 // 1スタイルぶんの advance を、累積テーブルへ「足りないぶんだけ」追加する。
@@ -996,8 +1002,10 @@ int SdCardFont::buildAdvanceTableForStyle(const uint8_t styleIdx, const char* ut
   // グリフを持たない字は renderChar() が '?' を描くので、レイアウトもその幅に
   // 合わせる必要がある（GfxRenderer::getTextAdvanceX を参照）。参照できるよう
   // このスタイルの最初の構築時に '?' を必ずテーブルへ載せておく。
-  const bool seedFallbackGlyph = (advanceTableSize_[styleIdx] == 0);
-  const char* const segments[2] = {utf8Text, seedFallbackGlyph ? "?" : nullptr};
+  // '?' を先に置く。後ろに置くと、1回の呼び出しで新規コードポイントが
+  // MAX_MISSES_PER_CALL に達したときに '?' だけ取りこぼす。
+  const bool seedFallbackGlyph = (findAdvanceEntry(styleIdx, '?') == nullptr);
+  const char* const segments[2] = {seedFallbackGlyph ? "?" : nullptr, utf8Text};
 
   // Pass 1: 未取得のコードポイント数を数える（重複を含む上限値）。
   // ゼロなら確保も I/O も一切せずに戻る。
