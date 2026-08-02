@@ -1908,7 +1908,18 @@ void GfxRenderer::drawTextVertical(const int fontId, const int x, const int y, c
         charBuf[1] = static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
         charBuf[2] = static_cast<char>(0x80 | (cp & 0x3F));
       }
-      drawText(effectiveFontId, x, yPos, charBuf, black, style);
+      // Small kana are designed for horizontal layout, where they sit low in
+      // the em box. Vertical layout wants them toward the upper right, so
+      // shift the drawn glyph by the measured 'vert' displacement. Only the
+      // draw position moves - the cell advance is unchanged, so column layout,
+      // kinsoku and cached section geometry are unaffected.
+      int drawX = x;
+      int drawY = yPos;
+      if (VerticalTextUtils::isSmallKana(cp)) {
+        drawX += (advance * VerticalTextUtils::SMALL_KANA_DX_PERCENT + 50) / 100;
+        drawY -= (advance * VerticalTextUtils::SMALL_KANA_DY_PERCENT + 50) / 100;
+      }
+      drawText(effectiveFontId, drawX, drawY, charBuf, black, style);
       yPos += verticalAdvance;
     }
   }
