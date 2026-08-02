@@ -1659,8 +1659,18 @@ int GfxRenderer::getTextAdvanceX(const int fontId, const char* text, EpdFontFami
   if (sdIt != sdCardFonts_.end() && sdIt->second->hasAdvanceTable()) {
     int32_t widthFP = 0;
     const uint8_t styleIdx = static_cast<uint8_t>(style);
+    // フォントにグリフが無い字は renderChar() が '?' を描く。幅もそれに合わせないと
+    // レイアウトが実際の描画より狭く見積もられ、行からはみ出す。
+    // （builtinGlyphAdvanceX が組み込みフォントに対して担保しているのと同じ整合性）
+    int32_t fallbackFP = -1;
     while (uint32_t cp = utf8NextCodepoint(reinterpret_cast<const uint8_t**>(&text))) {
-      widthFP += sdIt->second->getAdvance(cp, styleIdx);
+      uint16_t advance;
+      if (sdIt->second->tryGetAdvance(cp, styleIdx, advance)) {
+        widthFP += advance;
+        continue;
+      }
+      if (fallbackFP < 0) fallbackFP = sdIt->second->getAdvance('?', styleIdx);
+      widthFP += fallbackFP;
     }
     const uint16_t scale = getSdCardFontScale(fontId);
     if (scale != 256) {

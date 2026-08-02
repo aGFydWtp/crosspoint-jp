@@ -35,6 +35,11 @@ class SdCardFont {
   // Returns the 12.4 fixed-point advance, or 0 if not found.
   uint16_t getAdvance(uint32_t codepoint, uint8_t style) const;
 
+  // getAdvance() と同じ引数で、「テーブルに載っていて、かつフォントにグリフがある」
+  // 場合だけ true を返す。戻り値 0 が「幅0の字」なのか「グリフが無い字」なのかを
+  // 呼び出し側が区別できるようにするためのもの。
+  bool tryGetAdvance(uint32_t codepoint, uint8_t style, uint16_t& advanceOut) const;
+
   // Returns true if advance table is populated for at least one style.
   bool hasAdvanceTable() const;
 

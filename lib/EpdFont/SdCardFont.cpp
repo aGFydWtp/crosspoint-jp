@@ -934,6 +934,20 @@ uint16_t SdCardFont::getAdvance(uint32_t codepoint, uint8_t style) const {
   return entry ? entry->advanceX : 0;
 }
 
+bool SdCardFont::tryGetAdvance(uint32_t codepoint, uint8_t style, uint16_t& advanceOut) const {
+  if (style >= MAX_STYLES || (!advanceTable_[style] && !advanceSpill_[style])) {
+    if (style != 0 && (advanceTable_[0] || advanceSpill_[0])) {
+      style = 0;  // fallback to Regular
+    } else {
+      return false;
+    }
+  }
+  const AdvanceEntry* entry = findAdvanceEntry(style, codepoint);
+  if (!entry || !entry->hasGlyph) return false;
+  advanceOut = entry->advanceX;
+  return true;
+}
+
 // 累積テーブルを needed エントリぶん収容できるまで伸長する。
 // AdvanceEntry は POD なので realloc が使える（その場拡張が効けばコピーも起きない）。
 bool SdCardFont::ensureAdvanceCapacity(const uint8_t styleIdx, const uint32_t needed) {
@@ -979,11 +993,18 @@ int SdCardFont::buildAdvanceTable(const char* utf8Text, uint8_t styleMask) {
 int SdCardFont::buildAdvanceTableForStyle(const uint8_t styleIdx, const char* utf8Text) {
   const auto& s = styles_[styleIdx];
 
+  // グリフを持たない字は renderChar() が '?' を描くので、レイアウトもその幅に
+  // 合わせる必要がある（GfxRenderer::getTextAdvanceX を参照）。参照できるよう
+  // このスタイルの最初の構築時に '?' を必ずテーブルへ載せておく。
+  const bool seedFallbackGlyph = (advanceTableSize_[styleIdx] == 0);
+  const char* const segments[2] = {utf8Text, seedFallbackGlyph ? "?" : nullptr};
+
   // Pass 1: 未取得のコードポイント数を数える（重複を含む上限値）。
   // ゼロなら確保も I/O も一切せずに戻る。
   uint32_t missUpperBound = 0;
-  {
-    const unsigned char* p = reinterpret_cast<const unsigned char*>(utf8Text);
+  for (const char* segment : segments) {
+    if (!segment) continue;
+    const unsigned char* p = reinterpret_cast<const unsigned char*>(segment);
     while (*p) {
       const uint32_t cp = utf8NextCodepoint(&p);
       if (cp == 0) break;
@@ -1008,8 +1029,9 @@ int SdCardFont::buildAdvanceTableForStyle(const uint8_t styleIdx, const char* ut
   // Pass 2: 未取得のコードポイントを重複除去して集める。
   // 除去対象は未取得ぶんだけなので、O(n²) でも実際の件数は小さい。
   uint32_t missCount = 0;
-  {
-    const unsigned char* p = reinterpret_cast<const unsigned char*>(utf8Text);
+  for (const char* segment : segments) {
+    if (!segment) continue;
+    const unsigned char* p = reinterpret_cast<const unsigned char*>(segment);
     while (*p && missCount < missUpperBound) {
       const uint32_t cp = utf8NextCodepoint(&p);
       if (cp == 0) break;
