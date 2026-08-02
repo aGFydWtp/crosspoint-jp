@@ -11,6 +11,7 @@
 #include <limits>
 #include <vector>
 
+#include "SectionBuildPerf.h"
 #include "hyphenation/Hyphenator.h"
 
 namespace {
@@ -158,6 +159,7 @@ void ParsedText::layoutAndExtractLines(const GfxRenderer& renderer, const int fo
   if (words.empty()) {
     return;
   }
+  SECTION_PERF_SCOPE(layoutUs);
 
   // Apply fixed transforms before any per-line layout work.
   applyParagraphIndent();
@@ -168,6 +170,8 @@ void ParsedText::layoutAndExtractLines(const GfxRenderer& renderer, const int fo
   // (advanceX only, no bitmaps) for all unique codepoints in this paragraph so
   // that calculateWordWidths() can measure text without on-demand SD I/O.
   if (renderer.isSdCardFont(fontId)) {
+    SECTION_PERF_SCOPE(advanceUs);
+    SECTION_PERF_COUNT(advanceCalls);
     std::string allText;
     for (size_t i = 0; i < words.size(); i++) {
       if (i > 0) allText += ' ';
@@ -237,9 +241,12 @@ void ParsedText::layoutVerticalColumns(const GfxRenderer& renderer, const int fo
                                        const std::function<void(std::shared_ptr<TextBlock>)>& processColumn,
                                        const bool includeLastColumn) {
   if (words.empty()) return;
+  SECTION_PERF_SCOPE(layoutUs);
 
   // Ensure SD card font metrics are loaded
   if (renderer.isSdCardFont(fontId)) {
+    SECTION_PERF_SCOPE(advanceUs);
+    SECTION_PERF_COUNT(advanceCalls);
     std::string allText;
     for (const auto& w : words) {
       allText += w;
