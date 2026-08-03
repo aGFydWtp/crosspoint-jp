@@ -9,6 +9,7 @@
 #include <WiFi.h>
 
 #include <algorithm>
+#include <cstring>
 
 #include "MappedInputManager.h"
 #include "activities/network/WifiSelectionActivity.h"
@@ -311,8 +312,83 @@ bool AozoraActivity::parseWorksJson(JsonDocument& doc) {
     works_.push_back(entry);
   }
 
+  computeWorkDuplicateMasks();
+
   LOG_DBG("AOZORA", "Parsed %zu works", works_.size());
   return true;
+}
+
+void AozoraActivity::computeWorkDuplicateMasks() {
+  dupTitleMask_ = 0;
+  ambiguousMask_ = 0;
+
+  // works_ は 1 ページ 30 件（WORKS_PAGE_SIZE）なので総当たりでも最大 435 回の strcmp。
+  // パース時の 1 回だけなので描画コストには乗らない。
+  const int n = static_cast<int>(std::min<size_t>(works_.size(), 32));
+  for (int i = 0; i < n; ++i) {
+    for (int j = i + 1; j < n; ++j) {
+      if (strcmp(works_[i].title, works_[j].title) != 0) continue;
+      dupTitleMask_ |= (1u << i) | (1u << j);
+      // 副題・文字遣いも一致する場合は作品 ID でしか区別できない
+      if (strcmp(works_[i].variant, works_[j].variant) == 0 && strcmp(works_[i].subtitle, works_[j].subtitle) == 0) {
+        ambiguousMask_ |= (1u << i) | (1u << j);
+      }
+    }
+  }
+}
+
+std::string AozoraActivity::buildWorkListSubtitle(int index) const {
+  const auto& work = works_[index];
+
+  // 作品名検索・ジャンル・新着では author が見えないと誰の作品か分からないため常に表示する
+  std::string line = work.author[0] ? work.author : selectedAuthorName_;
+
+  if (work.subtitle[0] != '\0') {
+    line += "　";
+    line += work.subtitle;
+  }
+
+  const bool inMaskRange = index >= 0 && index < 32;
+  // 文字遣い（新字新仮名など）は同名が並ぶときだけ出す。常時表示はノイズになる。
+  if (inMaskRange && (dupTitleMask_ & (1u << index)) != 0 && work.variant[0] != '\0') {
+    line += "　(";
+    line += work.variant;
+    line += ")";
+  }
+  // 副題・文字遣いまで同一なら、残る識別子は作品 ID だけ
+  if (inMaskRange && (ambiguousMask_ & (1u << index)) != 0) {
+    char idBuf[16];
+    snprintf(idBuf, sizeof(idBuf), "　#%d", work.id);
+    line += idBuf;
+  }
+
+  return line;
+}
+
+std::string AozoraActivity::buildDownloadedListSubtitle(int index) const {
+  const int localIdx = index - dlPageStart_;
+  if (localIdx < 0 || localIdx >= dlPageCount_) return "";
+  const auto& entry = dlPageCache_[localIdx];
+
+  std::string line = entry.author;
+
+  if (entry.subtitle[0] != '\0') {
+    line += "　";
+    line += entry.subtitle;
+  }
+
+  if ((dlDupTitleMask_ & (1u << localIdx)) != 0 && entry.variant[0] != '\0') {
+    line += "　(";
+    line += entry.variant;
+    line += ")";
+  }
+  if ((dlAmbiguousMask_ & (1u << localIdx)) != 0) {
+    char idBuf[16];
+    snprintf(idBuf, sizeof(idBuf), "　#%d", static_cast<int>(entry.workId));
+    line += idBuf;
+  }
+
+  return line;
 }
 
 bool AozoraActivity::downloadWithRetry(const char* url, const char* destPath) {
@@ -374,8 +450,8 @@ bool AozoraActivity::downloadBook() {
   }
 
   // Add to index
-  if (!indexManager_.addEntry(selectedWorkId_, selectedWorkTitle_, selectedWorkAuthor_, relPath,
-                              selectedWorkSubtitle_, selectedWorkVariant_)) {
+  if (!indexManager_.addEntry(selectedWorkId_, selectedWorkTitle_, selectedWorkAuthor_, relPath, selectedWorkSubtitle_,
+                              selectedWorkVariant_)) {
     LOG_ERR("AOZORA", "Failed to add index entry");
     // File is downloaded but index failed -- not critical
   } else {
@@ -1209,7 +1285,8 @@ void AozoraActivity::render(RenderLock&&) {
           renderer,
           Rect{0, listTop, pageWidth, pageHeight - listTop - metrics.buttonHintsHeight - metrics.verticalSpacing},
           static_cast<int>(works_.size()), selectedIndex_,
-          [this](int index) -> std::string { return works_[index].title; }, nullptr, nullptr,
+          [this](int index) -> std::string { return works_[index].title; },
+          [this](int index) -> std::string { return buildWorkListSubtitle(index); }, nullptr,
           [this](int index) -> std::string {
             if (indexManager_.isDownloaded(works_[index].id)) {
               return tr(STR_DOWNLOADED_BOOKS);
@@ -1352,13 +1429,10 @@ void AozoraActivity::render(RenderLock&&) {
             if (localIdx < 0 || localIdx >= dlPageCount_) return "";
             return dlPageCache_[localIdx].title;
           },
-          nullptr, nullptr,
-          [this](int index) -> std::string {
-            const int localIdx = index - dlPageStart_;
-            if (localIdx < 0 || localIdx >= dlPageCount_) return "";
-            return dlPageCache_[localIdx].author;
-          },
-          false, nullptr);
+          // 著者は右端の value 列から 2 行目に移した。副題・文字遣いを併記して
+          // 同名作品を区別できるようにするため。
+          [this](int index) -> std::string { return buildDownloadedListSubtitle(index); }, nullptr, nullptr, false,
+          nullptr);
 
       const auto labels = mappedInput.mapLabels(tr(STR_BACK), tr(STR_SELECT), tr(STR_DIR_UP), tr(STR_DIR_DOWN));
       GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
@@ -1378,6 +1452,8 @@ void AozoraActivity::render(RenderLock&&) {
 
 void AozoraActivity::loadDownloadedPage(int desiredStart) {
   const int total = static_cast<int>(indexManager_.activeCount());
+  dlDupTitleMask_ = 0;
+  dlAmbiguousMask_ = 0;
   if (total == 0) {
     dlPageStart_ = 0;
     dlPageCount_ = 0;
@@ -1402,5 +1478,18 @@ void AozoraActivity::loadDownloadedPage(int desiredStart) {
       break;
     }
     dlPageCount_++;
+  }
+
+  // 同名作品の識別マスクを計算する（WORK_LIST と同じルール）。ページロード時の
+  // 1 回だけなので、最大 435 回の strcmp は描画コストに乗らない。
+  for (int i = 0; i < dlPageCount_; ++i) {
+    for (int j = i + 1; j < dlPageCount_; ++j) {
+      if (strcmp(dlPageCache_[i].title, dlPageCache_[j].title) != 0) continue;
+      dlDupTitleMask_ |= (1u << i) | (1u << j);
+      if (strcmp(dlPageCache_[i].variant, dlPageCache_[j].variant) == 0 &&
+          strcmp(dlPageCache_[i].subtitle, dlPageCache_[j].subtitle) == 0) {
+        dlAmbiguousMask_ |= (1u << i) | (1u << j);
+      }
+    }
   }
 }
