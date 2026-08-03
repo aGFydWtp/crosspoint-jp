@@ -2,7 +2,10 @@ name: Compile Release
 on:
   push:
     tags:
-      - '*'
+      # fork: forked タグに限定する。CrossPointJP 追従時にベースタグ (v0.1.16 など) を
+      # origin へ push するが (release-dispatch.yml の採番が参照する)、それで
+      # ベース版のリリースが fork に公開されてはならない。
+      - 'v*-forked*'
   # release-dispatch.yml がタグ ref を指定して起動する。GITHUB_TOKEN で push した
   # タグは push イベントを発生させないため、上の push トリガーだけでは足りない。
   workflow_dispatch:

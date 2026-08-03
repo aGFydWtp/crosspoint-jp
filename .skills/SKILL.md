@@ -1029,6 +1029,10 @@ git merge zrn/master
 # それ以外は zrn 側を優先
 ```
 
+**ベースタグ (v0.1.16 など) を origin へ push してはいけない**: タグが指す commit の
+release.yml (zrn 版は `tags: '*'`) が発火し、ベース版のリリースが fork に公開されてしまう。
+release-dispatch.yml が採番時に zrn のタグを直接 fetch するので push は不要。
+
 **rebaseではなくmergeを使用**（機能ごとのマージ履歴を保持するため）。
 
 ## 既知の制限事項
