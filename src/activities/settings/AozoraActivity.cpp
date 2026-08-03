@@ -374,7 +374,8 @@ bool AozoraActivity::downloadBook() {
   }
 
   // Add to index
-  if (!indexManager_.addEntry(selectedWorkId_, selectedWorkTitle_, selectedWorkAuthor_, relPath)) {
+  if (!indexManager_.addEntry(selectedWorkId_, selectedWorkTitle_, selectedWorkAuthor_, relPath,
+                              selectedWorkSubtitle_, selectedWorkVariant_)) {
     LOG_ERR("AOZORA", "Failed to add index entry");
     // File is downloaded but index failed -- not critical
   } else {
@@ -1059,10 +1060,9 @@ void AozoraActivity::loop() {
           selectedWorkId_ = entry.workId;
           snprintf(selectedWorkTitle_, sizeof(selectedWorkTitle_), "%s", entry.title);
           snprintf(selectedWorkAuthor_, sizeof(selectedWorkAuthor_), "%s", entry.author);
-          // ダウンロード履歴には副題・文字遣い・NDC を保存していないため、
-          // 直前に見た作品の値が残らないようクリアする。
-          selectedWorkSubtitle_[0] = '\0';
-          selectedWorkVariant_[0] = '\0';
+          snprintf(selectedWorkSubtitle_, sizeof(selectedWorkSubtitle_), "%s", entry.subtitle);
+          snprintf(selectedWorkVariant_, sizeof(selectedWorkVariant_), "%s", entry.variant);
+          // NDC はダウンロード履歴に保存していないため、直前に見た作品の値が残らないようクリアする
           selectedWorkNdc_[0] = '\0';
 
           {
