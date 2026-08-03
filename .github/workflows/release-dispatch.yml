@@ -45,6 +45,14 @@ jobs:
         run: |
           set -euo pipefail
 
+          # ベースタグ (v0.1.16 など) は CrossPointJP (zrn) 側にしかない。origin へ
+          # push するとタグが指す commit の release.yml (zrn 版は tags: '*') が発火して
+          # ベース版のリリースが fork に公開されてしまうため、push せずここで fetch する。
+          # --no-recurse-submodules: open-x4-sdk への再帰 fetch が "not our ref" で
+          # 失敗するため (タグ取得に submodule は不要)。
+          git remote add zrn https://github.com/zrn-ns/crosspoint-jp.git
+          git fetch zrn --tags --quiet --no-recurse-submodules
+
           # このブランチの祖先にある直近のリリースタグを見る。CrossPointJP を merge で
           # 取り込んでいるため、取り込み済みの最新ベース版 (v0.1.16 など) がここに出る。
           latest="$(git describe --tags --match 'v[0-9]*.[0-9]*.[0-9]*' --abbrev=0 2>/dev/null || echo '')"
