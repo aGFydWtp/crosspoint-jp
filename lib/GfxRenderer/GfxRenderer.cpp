@@ -78,6 +78,24 @@ bool isCjkCodepoint(const uint32_t cp) {
   return false;
 }
 
+// Advance width of a code point rendered from a built-in EPD font, mirroring the
+// fallback chain in GfxRenderer::renderChar(): a code point with no glyph is drawn
+// as '?' and advances by the width of '?'. Width calculations must agree with what
+// is actually drawn, otherwise truncatedText() under-measures and the text overflows
+// its column.
+int builtinGlyphAdvanceX(const EpdFontFamily& fontFamily, const uint32_t cp, const EpdFontFamily::Style style,
+                         const bool isCjk) {
+  const EpdGlyph* glyph = fontFamily.getGlyph(cp, style);
+  if (!glyph) {
+    glyph = fontFamily.getGlyph('?', style);
+  }
+  if (glyph) {
+    return fp4::toPixel(glyph->advanceX);
+  }
+  // Same last-resort advances as renderChar()
+  return isCjk ? 20 : 10;
+}
+
 bool isAsciiDigit(const uint32_t cp) { return cp >= '0' && cp <= '9'; }
 
 bool isAsciiLetter(const uint32_t cp) { return (cp >= 'A' && cp <= 'Z') || (cp >= 'a' && cp <= 'z'); }
@@ -150,14 +168,19 @@ const uint8_t* GfxRenderer::getGlyphBitmap(const EpdFontData* fontData, const Ep
   return &fontData->bitmap[glyph->dataOffset];
 }
 
-void GfxRenderer::ensureSdCardFontReady(int fontId, const char* utf8Text) const {
+void GfxRenderer::ensureSdCardFontReady(int fontId, const char* utf8Text, uint8_t styleMask) const {
   auto it = sdCardFonts_.find(fontId);
   if (it != sdCardFonts_.end()) {
     // Build a compact advance-only table for layout measurement.
     // Unlike prewarm(), this has no codepoint limit — handles CJK paragraphs
     // with 2000+ unique codepoints without overflow thrashing.
-    // Uses 6 bytes per codepoint (vs 16 for full EpdGlyph), no bitmap data.
-    int missed = it->second->buildAdvanceTable(utf8Text, 0x0F);
+    // Uses 8 bytes per codepoint (vs 16 for full EpdGlyph), no bitmap data.
+    //
+    // styleMask には「このテキストで実際に使うスタイル」だけを渡すこと。
+    // 全スタイル（0x0F）を渡すと、本文が Regular だけの段落でも Bold のぶんまで
+    // .cpfont を開いて読むことになる（本フォークの CJK フォントは Regular + Bold
+    // の2スタイル持ちなので、そのまま2倍のコストになる）。
+    int missed = it->second->buildAdvanceTable(utf8Text, styleMask);
     if (missed > 0) {
       LOG_DBG("GFX", "ensureSdCardFontReady: %d glyph(s) not found", missed);
     }
@@ -516,17 +539,11 @@ int GfxRenderer::getTextWidth(const int fontId, const char* text, const EpdFontF
             }
           } else {
             // No external font, use built-in font width
-            const EpdGlyph* glyph = fontFamily.getGlyph(cp, style);
-            if (glyph) {
-              width += fp4::toPixel(glyph->advanceX);
-            }
+            width += builtinGlyphAdvanceX(fontFamily, cp, style, true);
           }
         } else {
           // Character not in UI font: use built-in font width
-          const EpdGlyph* glyph = fontFamily.getGlyph(cp, style);
-          if (glyph) {
-            width += fp4::toPixel(glyph->advanceX);
-          }
+          width += builtinGlyphAdvanceX(fontFamily, cp, style, isCjkCodepoint(cp));
         }
       }
       return width;
@@ -1642,8 +1659,26 @@ int GfxRenderer::getTextAdvanceX(const int fontId, const char* text, EpdFontFami
   if (sdIt != sdCardFonts_.end() && sdIt->second->hasAdvanceTable()) {
     int32_t widthFP = 0;
     const uint8_t styleIdx = static_cast<uint8_t>(style);
+    // フォントにグリフが無いと分かっている字は renderChar() が '?' を描く。幅もそれに
+    // 合わせないとレイアウトが実際の描画より狭く見積もられ、行からはみ出す。
+    // （builtinGlyphAdvanceX が組み込みフォントに対して担保しているのと同じ整合性）
+    int32_t fallbackFP = -1;
     while (uint32_t cp = utf8NextCodepoint(reinterpret_cast<const uint8_t**>(&text))) {
-      widthFP += sdIt->second->getAdvance(cp, styleIdx);
+      uint16_t advance = 0;
+      switch (sdIt->second->lookupAdvance(cp, styleIdx, advance)) {
+        case SdCardFont::AdvanceLookup::Found:
+          widthFP += advance;
+          break;
+        case SdCardFont::AdvanceLookup::NoGlyph:
+          if (fallbackFP < 0) fallbackFP = sdIt->second->getAdvance('?', styleIdx);
+          widthFP += fallbackFP;
+          break;
+        case SdCardFont::AdvanceLookup::NotCached:
+          // このテキスト用にテーブルが用意されていない場合は従来どおり 0 のままにする。
+          // ここで '?' 幅を足すと、ルビ先読み直後の TextBlock::render が
+          // 参照字 "一" を測るときに columnWidth を壊してしまう。
+          break;
+      }
     }
     const uint16_t scale = getSdCardFontScale(fontId);
     if (scale != 256) {
@@ -1896,7 +1931,18 @@ void GfxRenderer::drawTextVertical(const int fontId, const int x, const int y, c
         charBuf[1] = static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
         charBuf[2] = static_cast<char>(0x80 | (cp & 0x3F));
       }
-      drawText(effectiveFontId, x, yPos, charBuf, black, style);
+      // Small kana are designed for horizontal layout, where they sit low in
+      // the em box. Vertical layout wants them toward the upper right, so
+      // shift the drawn glyph by the measured 'vert' displacement. Only the
+      // draw position moves - the cell advance is unchanged, so column layout,
+      // kinsoku and cached section geometry are unaffected.
+      int drawX = x;
+      int drawY = yPos;
+      if (VerticalTextUtils::isSmallKana(cp)) {
+        drawX += (advance * VerticalTextUtils::SMALL_KANA_DX_PERCENT + 50) / 100;
+        drawY -= (advance * VerticalTextUtils::SMALL_KANA_DY_PERCENT + 50) / 100;
+      }
+      drawText(effectiveFontId, drawX, drawY, charBuf, black, style);
       yPos += verticalAdvance;
     }
   }

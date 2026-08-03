@@ -9,12 +9,14 @@
 #include <WiFi.h>
 
 #include <algorithm>
+#include <cstring>
 
 #include "MappedInputManager.h"
 #include "activities/network/WifiSelectionActivity.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
 #include "network/HttpDownloader.h"
+#include "network/TlsHeapReclaim.h"
 
 // --- 50音行定義 ---
 
@@ -87,13 +89,7 @@ void AozoraActivity::onWifiSelectionComplete(const bool success) {
     return;
   }
 
-  // Free ExternalFont LRU caches (~34KB each) to make room for TLS buffers.
-  FontManager& fm = FontManager::getInstance();
-  ExternalFont* uiFont = fm.getActiveUiFont();
-  ExternalFont* readerFont = fm.getActiveFont();
-  if (uiFont) uiFont->unload();
-  if (readerFont) readerFont->unload();
-  LOG_DBG("AOZORA", "Freed font caches, heap=%d", ESP.getFreeHeap());
+  reclaimHeapForTls(renderer, "AOZORA");
 
   // Load download index
   indexManager_.loadAndPurge();
@@ -150,6 +146,22 @@ static std::string lastApiError_;
 
 static constexpr int API_MAX_RETRIES = 3;
 
+// Build the one-line diagnostic shown on the error screen.
+//
+// blk = largest contiguous block. A TLS handshake needs a ~16.5KB contiguous
+// block for the inbound record buffer plus ~4KB for the outbound one, so free
+// heap alone cannot tell an out-of-memory failure from a fragmentation one.
+// http is negative when it carries an esp_err_t: -28674 is ESP_ERR_HTTP_CONNECT,
+// i.e. the connection never opened. tls is the mbedtls/esp-tls reason behind
+// that (0 = the failure never reached TLS, so it was DNS or the TCP connect);
+// -32512 is MBEDTLS_ERR_SSL_ALLOC_FAILED, which pins it on the heap.
+static void formatNetworkError(char* buf, size_t bufSize, int result) {
+  snprintf(buf, bufSize, "err=%d http=%d tls=%d/%X crt=%d/%X p=%d/%d f=%d/%d", result, HttpDownloader::lastHttpCode,
+           HttpDownloader::lastTlsError, HttpDownloader::lastTlsFlags, HttpDownloader::lastCrtDiag,
+           HttpDownloader::lastCrtErr, HttpDownloader::lastPreHeapKb, HttpDownloader::lastPreBlkKb,
+           HttpDownloader::lastCrtHeapKb, HttpDownloader::lastCrtBlkKb);
+}
+
 static bool fetchApiJson(const char* url, JsonDocument& doc) {
   LOG_DBG("AOZORA", "API call: %s (heap=%d)", url, ESP.getFreeHeap());
 
@@ -159,16 +171,18 @@ static bool fetchApiJson(const char* url, JsonDocument& doc) {
       LOG_DBG("AOZORA", "Retry %d/%d", attempt + 1, API_MAX_RETRIES);
       delay(1000);
     }
-    result = HttpDownloader::downloadToFile(url, API_TMP_FILE, nullptr, 30000);
+    // HttpDownloader は esp_http_client の HTTP_TIMEOUT_MS=60000 を使うため、
+    // 従来 fork にあった 30000 ms タイムアウト引数は不要 (本家 API に合わせて除去)。
+    result = HttpDownloader::downloadToFile(url, API_TMP_FILE);
     if (result == HttpDownloader::OK) break;
-    LOG_ERR("AOZORA", "API fetch attempt %d failed: err=%d http=%d", attempt + 1, result, HttpDownloader::lastHttpCode);
+    LOG_ERR("AOZORA", "API fetch attempt %d failed: err=%d http=%d heap=%d blk=%d", attempt + 1, result,
+            HttpDownloader::lastHttpCode, static_cast<int>(ESP.getFreeHeap()), static_cast<int>(ESP.getMaxAllocHeap()));
     Storage.remove(API_TMP_FILE);
   }
 
   if (result != HttpDownloader::OK) {
-    char buf[128];
-    snprintf(buf, sizeof(buf), "err=%d http=%d heap=%dKB", static_cast<int>(result), HttpDownloader::lastHttpCode,
-             ESP.getFreeHeap() / 1024);
+    char buf[160];
+    formatNetworkError(buf, sizeof(buf), static_cast<int>(result));
     lastApiError_ = buf;
     return false;
   }
@@ -219,6 +233,10 @@ bool AozoraActivity::fetchWorks(const char* queryParam) {
   // 不要なバッファを解放してヒープ確保（TLSバッファ用）
   authors_.clear();
   authors_.shrink_to_fit();
+  // ページ送りでの再取得時、旧ページの 30 件と JSON 一時バッファが同時に生存する
+  // ピークを避けるため、works_ も取得前に返却しておく。
+  works_.clear();
+  works_.shrink_to_fit();
 
   // 新しいクエリの場合はオフセットをリセットし、クエリを保存
   if (queryParam) {
@@ -257,7 +275,8 @@ bool AozoraActivity::parseAuthorsJson(JsonDocument& doc) {
     return false;
   }
 
-  authors_.reserve(arr.size());
+  // No reserve(): deque grows one 512-byte node at a time, so there is no
+  // reallocate-and-copy to pre-empt.
   for (JsonObject obj : arr) {
     AuthorEntry entry;
     entry.id = obj["id"] | 0;
@@ -280,7 +299,7 @@ bool AozoraActivity::parseWorksJson(JsonDocument& doc) {
     return false;
   }
 
-  works_.reserve(arr.size());
+  // No reserve(): see parseAuthorsJson.
   for (JsonObject obj : arr) {
     WorkEntry entry;
     entry.id = obj["id"] | 0;
@@ -288,11 +307,121 @@ bool AozoraActivity::parseWorksJson(JsonDocument& doc) {
     snprintf(entry.kana, sizeof(entry.kana), "%s", (obj["kana"] | ""));
     snprintf(entry.ndc, sizeof(entry.ndc), "%s", (obj["ndc"] | ""));
     snprintf(entry.author, sizeof(entry.author), "%s", (obj["author"] | ""));
+    snprintf(entry.subtitle, sizeof(entry.subtitle), "%s", (obj["subtitle"] | ""));
+    snprintf(entry.variant, sizeof(entry.variant), "%s", (obj["variant"] | ""));
     works_.push_back(entry);
   }
 
+  computeWorkDuplicateMasks();
+
   LOG_DBG("AOZORA", "Parsed %zu works", works_.size());
   return true;
+}
+
+void AozoraActivity::computeWorkDuplicateMasks() {
+  dupTitleMask_ = 0;
+  ambiguousMask_ = 0;
+
+  // works_ は 1 ページ 30 件（WORKS_PAGE_SIZE）なので総当たりでも最大 435 回の strcmp。
+  // パース時の 1 回だけなので描画コストには乗らない。
+  const int n = static_cast<int>(std::min<size_t>(works_.size(), 32));
+  for (int i = 0; i < n; ++i) {
+    for (int j = i + 1; j < n; ++j) {
+      if (strcmp(works_[i].title, works_[j].title) != 0) continue;
+      dupTitleMask_ |= (1u << i) | (1u << j);
+      // 副題・文字遣いも一致する場合は作品 ID でしか区別できない
+      if (strcmp(works_[i].variant, works_[j].variant) == 0 && strcmp(works_[i].subtitle, works_[j].subtitle) == 0) {
+        ambiguousMask_ |= (1u << i) | (1u << j);
+      }
+    }
+  }
+}
+
+std::string AozoraActivity::buildWorkListSubtitle(int index) const {
+  const auto& work = works_[index];
+
+  // 作品名検索・ジャンル・新着では author が見えないと誰の作品か分からないため常に表示する
+  std::string line = work.author[0] ? work.author : selectedAuthorName_;
+
+  if (work.subtitle[0] != '\0') {
+    line += "　";
+    line += work.subtitle;
+  }
+
+  const bool inMaskRange = index >= 0 && index < 32;
+  // 文字遣い（新字新仮名など）は同名が並ぶときだけ出す。常時表示はノイズになる。
+  if (inMaskRange && (dupTitleMask_ & (1u << index)) != 0 && work.variant[0] != '\0') {
+    line += "　(";
+    line += work.variant;
+    line += ")";
+  }
+  // 副題・文字遣いまで同一なら、残る識別子は作品 ID だけ
+  if (inMaskRange && (ambiguousMask_ & (1u << index)) != 0) {
+    char idBuf[16];
+    snprintf(idBuf, sizeof(idBuf), "　#%d", work.id);
+    line += idBuf;
+  }
+
+  return line;
+}
+
+std::string AozoraActivity::buildDownloadedListSubtitle(int index) const {
+  const int localIdx = index - dlPageStart_;
+  if (localIdx < 0 || localIdx >= dlPageCount_) return "";
+  const auto& entry = dlPageCache_[localIdx];
+
+  std::string line = entry.author;
+
+  if (entry.subtitle[0] != '\0') {
+    line += "　";
+    line += entry.subtitle;
+  }
+
+  if ((dlDupTitleMask_ & (1u << localIdx)) != 0 && entry.variant[0] != '\0') {
+    line += "　(";
+    line += entry.variant;
+    line += ")";
+  }
+  if ((dlAmbiguousMask_ & (1u << localIdx)) != 0) {
+    char idBuf[16];
+    snprintf(idBuf, sizeof(idBuf), "　#%d", static_cast<int>(entry.workId));
+    line += idBuf;
+  }
+
+  return line;
+}
+
+bool AozoraActivity::downloadWithRetry(const char* url, const char* destPath) {
+  // Same retry policy as fetchApiJson(): a TLS handshake needs a large
+  // contiguous block, so on a fragmented heap esp_http_client_open() fails with
+  // ESP_ERR_HTTP_CONNECT before a single byte moves — and the next attempt, a
+  // second later, often succeeds. The listing calls have always retried; the
+  // book download did not, which is why downloads failed far more visibly than
+  // listings even though both hit the same endpoint.
+  HttpDownloader::DownloadError result = HttpDownloader::HTTP_ERROR;
+  for (int attempt = 0; attempt < API_MAX_RETRIES; attempt++) {
+    if (attempt > 0) {
+      LOG_DBG("AOZORA", "Download retry %d/%d", attempt + 1, API_MAX_RETRIES);
+      delay(1000);
+    }
+    downloadProgress_ = 0;
+    downloadTotal_ = 0;
+    // downloadToFile() removes the partial file itself on failure.
+    result = HttpDownloader::downloadToFile(url, destPath, [this](size_t downloaded, size_t total) {
+      downloadProgress_ = downloaded;
+      downloadTotal_ = total;
+      requestUpdate(true);
+    });
+    if (result == HttpDownloader::OK) return true;
+    LOG_ERR("AOZORA", "Download attempt %d failed: err=%d http=%d tls=%d/%X heap=%d blk=%d", attempt + 1, result,
+            HttpDownloader::lastHttpCode, HttpDownloader::lastTlsError, HttpDownloader::lastTlsFlags,
+            static_cast<int>(ESP.getFreeHeap()), static_cast<int>(ESP.getMaxAllocHeap()));
+  }
+
+  char buf[160];
+  formatNetworkError(buf, sizeof(buf), static_cast<int>(result));
+  errorMessage_ = buf;
+  return false;
 }
 
 bool AozoraActivity::downloadBook() {
@@ -315,28 +444,14 @@ bool AozoraActivity::downloadBook() {
     return false;
   }
 
-  auto result = HttpDownloader::downloadToFile(
-      std::string(url), std::string(destPath),
-      [this](size_t downloaded, size_t total) {
-        downloadProgress_ = downloaded;
-        downloadTotal_ = total;
-        requestUpdate(true);
-        return true;
-      },
-      30000);
-
-  if (result != HttpDownloader::OK) {
-    LOG_ERR("AOZORA", "Download failed: err=%d http=%d", static_cast<int>(result), HttpDownloader::lastHttpCode);
-    // Remove incomplete file
-    Storage.remove(destPath);
-    char buf[80];
-    snprintf(buf, sizeof(buf), "err=%d http=%d", static_cast<int>(result), HttpDownloader::lastHttpCode);
-    errorMessage_ = buf;
+  if (!downloadWithRetry(url, destPath)) {
+    Storage.remove(destPath);  // 念のため取り残しを掃除
     return false;
   }
 
   // Add to index
-  if (!indexManager_.addEntry(selectedWorkId_, selectedWorkTitle_, selectedWorkAuthor_, relPath)) {
+  if (!indexManager_.addEntry(selectedWorkId_, selectedWorkTitle_, selectedWorkAuthor_, relPath, selectedWorkSubtitle_,
+                              selectedWorkVariant_)) {
     LOG_ERR("AOZORA", "Failed to add index entry");
     // File is downloaded but index failed -- not critical
   } else {
@@ -373,22 +488,8 @@ bool AozoraActivity::updateBook() {
   Storage.remove(tmpPath);
 
   // 一時ファイルにダウンロード（既存ファイルはこの時点では無傷）
-  auto result = HttpDownloader::downloadToFile(
-      std::string(url), std::string(tmpPath),
-      [this](size_t downloaded, size_t total) {
-        downloadProgress_ = downloaded;
-        downloadTotal_ = total;
-        requestUpdate(true);
-        return true;
-      },
-      30000);
-
-  if (result != HttpDownloader::OK) {
-    LOG_ERR("AOZORA", "Update download failed: err=%d http=%d", static_cast<int>(result), HttpDownloader::lastHttpCode);
+  if (!downloadWithRetry(url, tmpPath)) {
     Storage.remove(tmpPath);  // 不完全な一時ファイルを削除、旧ファイルは保持
-    char buf[80];
-    snprintf(buf, sizeof(buf), "err=%d http=%d", static_cast<int>(result), HttpDownloader::lastHttpCode);
-    errorMessage_ = buf;
     return false;
   }
 
@@ -403,6 +504,48 @@ bool AozoraActivity::updateBook() {
 
   LOG_DBG("AOZORA", "Updated: %s", destPath);
   return true;
+}
+
+void AozoraActivity::openSelectedWorkInReader() {
+  // downloadBook() と同一のパス構築ロジックを使う。ファイルブラウザから開いた場合と
+  // 同じ絶対パスになることで .crosspoint/ キャッシュのハッシュが一致し、読書進捗が共有される。
+  char relPath[160];
+  if (!AozoraIndexManager::makeRelativePath(selectedWorkId_, selectedWorkTitle_, selectedWorkAuthor_, relPath,
+                                            sizeof(relPath))) {
+    LOG_ERR("AOZORA", "openSelectedWorkInReader: failed to make relative path");
+    {
+      RenderLock lock(*this);
+      errorMessage_ = "Path error";
+      state_ = ERROR;
+    }
+    requestUpdate();
+    return;
+  }
+  char fullPath[192];
+  snprintf(fullPath, sizeof(fullPath), "%s/%s", AozoraIndexManager::AOZORA_DIR, relPath);
+
+  // インデックス上は存在しても実ファイルが消えている場合がある（SD を PC で編集した等）
+  if (!Storage.exists(fullPath)) {
+    LOG_ERR("AOZORA", "openSelectedWorkInReader: file missing: %s", fullPath);
+    {
+      RenderLock lock(*this);
+      errorMessage_ = "File not found";
+      state_ = ERROR;
+    }
+    requestUpdate();
+    return;
+  }
+
+  // goToReader() は replaceActivity() の前に SD フォントをロードする。この時点では WiFi
+  // スタックがまだ生きているため、先に一覧バッファを返してヒープの余裕を作っておく。
+  works_.clear();
+  works_.shrink_to_fit();
+  authors_.clear();
+  authors_.shrink_to_fit();
+
+  // replaceActivity() は pendingActivity への登録のみで、実際の破棄は loop() が戻った後に
+  // ActivityManager::loop() が行う（"delete this" 問題は起きない）。呼び出し後はメンバに触れないこと。
+  onSelectBook(fullPath);
 }
 
 // --- Input handling ---
@@ -759,6 +902,9 @@ void AozoraActivity::loop() {
         snprintf(selectedWorkTitle_, sizeof(selectedWorkTitle_), "%s", work.title);
         snprintf(selectedWorkAuthor_, sizeof(selectedWorkAuthor_), "%s",
                  work.author[0] ? work.author : selectedAuthorName_);
+        snprintf(selectedWorkSubtitle_, sizeof(selectedWorkSubtitle_), "%s", work.subtitle);
+        snprintf(selectedWorkVariant_, sizeof(selectedWorkVariant_), "%s", work.variant);
+        snprintf(selectedWorkNdc_, sizeof(selectedWorkNdc_), "%s", work.ndc);
 
         {
           RenderLock lock(*this);
@@ -800,8 +946,11 @@ void AozoraActivity::loop() {
         requestUpdate();
       }
     } else {
-      // ダウンロード済み: Left = 削除, Right = 更新
-      if (mappedInput.wasPressed(MappedInputManager::Button::Left)) {
+      // ダウンロード済み: Confirm = 読む, Left = 削除, Right = 更新
+      if (mappedInput.wasPressed(MappedInputManager::Button::Confirm)) {
+        openSelectedWorkInReader();
+        return;  // goToReader() 後は this が破棄され得るのでメンバに触れない
+      } else if (mappedInput.wasPressed(MappedInputManager::Button::Left)) {
         if (indexManager_.removeEntry(selectedWorkId_)) {
           invalidateDownloadedPageCache();
           // popState() は selectedIndex_ を selectedIndexStack_.back() で上書きするため、
@@ -987,6 +1136,10 @@ void AozoraActivity::loop() {
           selectedWorkId_ = entry.workId;
           snprintf(selectedWorkTitle_, sizeof(selectedWorkTitle_), "%s", entry.title);
           snprintf(selectedWorkAuthor_, sizeof(selectedWorkAuthor_), "%s", entry.author);
+          snprintf(selectedWorkSubtitle_, sizeof(selectedWorkSubtitle_), "%s", entry.subtitle);
+          snprintf(selectedWorkVariant_, sizeof(selectedWorkVariant_), "%s", entry.variant);
+          // NDC はダウンロード履歴に保存していないため、直前に見た作品の値が残らないようクリアする
+          selectedWorkNdc_[0] = '\0';
 
           {
             RenderLock lock(*this);
@@ -1132,7 +1285,8 @@ void AozoraActivity::render(RenderLock&&) {
           renderer,
           Rect{0, listTop, pageWidth, pageHeight - listTop - metrics.buttonHintsHeight - metrics.verticalSpacing},
           static_cast<int>(works_.size()), selectedIndex_,
-          [this](int index) -> std::string { return works_[index].title; }, nullptr, nullptr,
+          [this](int index) -> std::string { return works_[index].title; },
+          [this](int index) -> std::string { return buildWorkListSubtitle(index); }, nullptr,
           [this](int index) -> std::string {
             if (indexManager_.isDownloaded(works_[index].id)) {
               return tr(STR_DOWNLOADED_BOOKS);
@@ -1151,8 +1305,27 @@ void AozoraActivity::render(RenderLock&&) {
     renderer.drawText(UI_12_FONT_ID, metrics.contentSidePadding, y, selectedWorkTitle_);
     y += renderer.getLineHeight(UI_12_FONT_ID) + metrics.verticalSpacing;
 
+    if (selectedWorkSubtitle_[0] != '\0') {
+      renderer.drawText(UI_10_FONT_ID, metrics.contentSidePadding, y, selectedWorkSubtitle_);
+      y += lineHeight + metrics.verticalSpacing;
+    }
+
     if (selectedWorkAuthor_[0] != '\0') {
       renderer.drawText(UI_10_FONT_ID, metrics.contentSidePadding, y, selectedWorkAuthor_);
+      y += lineHeight + metrics.verticalSpacing;
+    }
+
+    // 文字遣い（新字新仮名など）と NDC 分類。同名作品の判別材料になる。
+    if (selectedWorkVariant_[0] != '\0' || selectedWorkNdc_[0] != '\0') {
+      char meta[48];
+      if (selectedWorkVariant_[0] != '\0' && selectedWorkNdc_[0] != '\0') {
+        snprintf(meta, sizeof(meta), "%s  NDC %s", selectedWorkVariant_, selectedWorkNdc_);
+      } else if (selectedWorkVariant_[0] != '\0') {
+        snprintf(meta, sizeof(meta), "%s", selectedWorkVariant_);
+      } else {
+        snprintf(meta, sizeof(meta), "NDC %s", selectedWorkNdc_);
+      }
+      renderer.drawText(UI_10_FONT_ID, metrics.contentSidePadding, y, meta);
       y += lineHeight + metrics.verticalSpacing;
     }
 
@@ -1161,7 +1334,8 @@ void AozoraActivity::render(RenderLock&&) {
       y += metrics.verticalSpacing;
       renderer.drawText(UI_10_FONT_ID, metrics.contentSidePadding, y, tr(STR_DOWNLOAD_COMPLETE));
 
-      const auto labels = mappedInput.mapLabels(tr(STR_BACK), "", tr(STR_DELETE_CONFIRM), tr(STR_AOZORA_UPDATE));
+      const auto labels =
+          mappedInput.mapLabels(tr(STR_BACK), tr(STR_AOZORA_READ), tr(STR_DELETE_CONFIRM), tr(STR_AOZORA_UPDATE));
       GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
     } else {
       const auto labels = mappedInput.mapLabels(tr(STR_BACK), "", "", tr(STR_AOZORA_GET));
@@ -1255,13 +1429,10 @@ void AozoraActivity::render(RenderLock&&) {
             if (localIdx < 0 || localIdx >= dlPageCount_) return "";
             return dlPageCache_[localIdx].title;
           },
-          nullptr, nullptr,
-          [this](int index) -> std::string {
-            const int localIdx = index - dlPageStart_;
-            if (localIdx < 0 || localIdx >= dlPageCount_) return "";
-            return dlPageCache_[localIdx].author;
-          },
-          false, nullptr);
+          // 著者は右端の value 列から 2 行目に移した。副題・文字遣いを併記して
+          // 同名作品を区別できるようにするため。
+          [this](int index) -> std::string { return buildDownloadedListSubtitle(index); }, nullptr, nullptr, false,
+          nullptr);
 
       const auto labels = mappedInput.mapLabels(tr(STR_BACK), tr(STR_SELECT), tr(STR_DIR_UP), tr(STR_DIR_DOWN));
       GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
@@ -1281,6 +1452,8 @@ void AozoraActivity::render(RenderLock&&) {
 
 void AozoraActivity::loadDownloadedPage(int desiredStart) {
   const int total = static_cast<int>(indexManager_.activeCount());
+  dlDupTitleMask_ = 0;
+  dlAmbiguousMask_ = 0;
   if (total == 0) {
     dlPageStart_ = 0;
     dlPageCount_ = 0;
@@ -1305,5 +1478,18 @@ void AozoraActivity::loadDownloadedPage(int desiredStart) {
       break;
     }
     dlPageCount_++;
+  }
+
+  // 同名作品の識別マスクを計算する（WORK_LIST と同じルール）。ページロード時の
+  // 1 回だけなので、最大 435 回の strcmp は描画コストに乗らない。
+  for (int i = 0; i < dlPageCount_; ++i) {
+    for (int j = i + 1; j < dlPageCount_; ++j) {
+      if (strcmp(dlPageCache_[i].title, dlPageCache_[j].title) != 0) continue;
+      dlDupTitleMask_ |= (1u << i) | (1u << j);
+      if (strcmp(dlPageCache_[i].variant, dlPageCache_[j].variant) == 0 &&
+          strcmp(dlPageCache_[i].subtitle, dlPageCache_[j].subtitle) == 0) {
+        dlAmbiguousMask_ |= (1u << i) | (1u << j);
+      }
+    }
   }
 }

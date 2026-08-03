@@ -440,9 +440,10 @@ void OpdsBookBrowserActivity::downloadBook(const OpdsEntry& book, const OpdsAcqu
   Storage.remove(kTempDownloadPath);
 
   HttpDownloader::HttpResponseMetadata metadata;
+  bool cancelRequested = false;
   const auto result = HttpDownloader::downloadToFile(
       downloadUrl, kTempDownloadPath,
-      [this](const size_t downloaded, const size_t total) -> bool {
+      [this, &cancelRequested](const size_t downloaded, const size_t total) {
         downloadProgress = downloaded;
         downloadTotal = total;
         requestUpdate(true);
@@ -454,15 +455,15 @@ void OpdsBookBrowserActivity::downloadBook(const OpdsEntry& book, const OpdsAcqu
         mappedInput.update();
         if (mappedInput.isPressed(MappedInputManager::Button::Back) &&
             mappedInput.getHeldTime() >= kDownloadCancelHoldMs) {
-          return false;
+          cancelRequested = true;
         }
-        return true;
       },
-      0, server.username, server.password, &metadata, server.verifyTls);
+      &cancelRequested, server.username, server.password, HttpDownloader::BufferProfile::COMPACT, &metadata,
+      server.verifyTls);
 
   if (result == HttpDownloader::ABORTED) {
     LOG_INF("OPDS", "Download cancelled by user (held Back)");
-    // downloadToFile() already removed the partial temp file on the short-write path.
+    // downloadToFile() already removed the partial temp file on the aborted path.
     consumeBack = true;  // Swallow the wasReleased(Back) once the user lets go of the button, so
                          // it doesn't also fire navigateBack() on the same release.
     state = BrowserState::BROWSING;

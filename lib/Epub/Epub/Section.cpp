@@ -7,12 +7,13 @@
 
 #include "Epub/css/CssParser.h"
 #include "Page.h"
+#include "SectionBuildPerf.h"
 #include "hyphenation/Hyphenator.h"
 #include "parsers/ChapterHtmlSlimParser.h"
 
 namespace {
 // Version 31: ruby text data added to TextBlock serialization.
-constexpr uint8_t SECTION_FILE_VERSION = 31;
+constexpr uint8_t SECTION_FILE_VERSION = 32;
 // Minimum free heap required before attempting to build section pages.
 // Section building involves heavy allocations (Page, TextBlock, PageLine, etc.)
 // and on ESP32 without C++ exceptions, allocation failure calls abort().
@@ -30,7 +31,12 @@ uint32_t Section::onPageComplete(std::unique_ptr<Page> page) {
   }
 
   const uint32_t position = file.position();
-  if (!page->serialize(file)) {
+  bool serialized;
+  {
+    SECTION_PERF_SCOPE(serializeUs);
+    serialized = page->serialize(file);
+  }
+  if (!serialized) {
     LOG_ERR("SCT", "Failed to serialize page %d", pageCount);
     return 0;
   }
@@ -159,6 +165,8 @@ bool Section::createSectionFile(const int fontId, const float lineCompression, c
                                 const bool verticalMode, const uint8_t charSpacing,
                                 const std::function<void()>& popupFn, const int* headingFontIds,
                                 const int tableFontId) {
+  SECTION_PERF_RESET();
+
   const auto localPath = epub->getSpineItem(spineIndex).href;
   const auto tmpHtmlPath = epub->getCachePath() + "/.tmp_" + std::to_string(spineIndex) + ".html";
 
@@ -171,6 +179,7 @@ bool Section::createSectionFile(const int fontId, const float lineCompression, c
   // Retry logic for SD card timing issues
   bool success = false;
   uint32_t fileSize = 0;
+  SECTION_PERF_BEGIN(extractStartUs);
   for (int attempt = 0; attempt < 3 && !success; attempt++) {
     if (attempt > 0) {
       LOG_DBG("SCT", "Retrying stream (attempt %d)...", attempt + 1);
@@ -196,6 +205,8 @@ bool Section::createSectionFile(const int fontId, const float lineCompression, c
       LOG_DBG("SCT", "Removed incomplete temp file after failed attempt");
     }
   }
+  SECTION_PERF_END(extractStartUs, extractUs);
+  SECTION_PERF_SET(htmlBytes, fileSize);
 
   if (!success) {
     LOG_ERR("SCT", "Failed to stream item contents to temp file after retries");
@@ -298,6 +309,7 @@ bool Section::createSectionFile(const int fontId, const float lineCompression, c
   if (cssParser) {
     cssParser->clear();
   }
+  SECTION_PERF_LOG(spineIndex, pageCount, fontId, verticalMode);
   return true;
 }
 

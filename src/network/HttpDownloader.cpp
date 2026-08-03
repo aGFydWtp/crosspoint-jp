@@ -1,511 +1,452 @@
 #include "HttpDownloader.h"
 
-#include <HTTPClient.h>
+#include <Arduino.h>
 #include <Logging.h>
-#include <NetworkClient.h>
-#include <NetworkClientSecure.h>
-#include <StreamString.h>
+#include <Memory.h>
 #include <base64.h>
+#include <esp_heap_caps.h>
+#include <esp_http_client.h>
+#include <esp_log.h>
 
+#include <cstdarg>
+#include <cstdlib>
 #include <cstring>
-#include <memory>
-#include <utility>
+#include <functional>
+#include <string>
 
-#include "CrossPointSettings.h"
-#include "SecureNetworkClient.h"
-#include "util/UrlUtils.h"
+/*
+ * When esp_crt_bundle.h is included, it points to the wrong header file
+ * (something under WiFiClientSecure) because our framework is based on the
+ * Arduino platform. To manage this obstacle, don't include anything, just
+ * extern and it will point to the correct one.
+ */
+extern "C" {
+extern esp_err_t esp_crt_bundle_attach(void* conf);
+}
 
+// fork-only: activities show these in error messages for diagnostics
 int HttpDownloader::lastHttpCode = 0;
+int HttpDownloader::lastTlsError = 0;
+int HttpDownloader::lastTlsFlags = 0;
+int HttpDownloader::lastCrtDiag = 0;
+int HttpDownloader::lastCrtErr = 0;
+int HttpDownloader::lastCrtHeapKb = 0;
+int HttpDownloader::lastCrtBlkKb = 0;
+int HttpDownloader::lastPreHeapKb = 0;
+int HttpDownloader::lastPreBlkKb = 0;
+int HttpDownloader::lastFailSize = 0;
+int HttpDownloader::lastFailFreeKb = 0;
+int HttpDownloader::lastFailBlk = 0;
 
 namespace {
-
-// Maximum time the streaming read loop waits without receiving a single body byte before it
-// gives up. Only reached when the peer stops sending mid-body but keeps the socket open; a
-// well-behaved response either delivers Content-Length bytes or closes the connection.
-constexpr uint32_t STREAM_IDLE_TIMEOUT_MS = 10000;
-
-// Builds the NetworkClient appropriate for the URL/verifyTls combination.
-// - https + verifyTls: SecureNetworkClient with the default CA bundle attached (chain + hostname
-//   verification). *outSecureForError is set so the caller can pull a diagnostic message on failure.
-// - https + !verifyTls: NetworkClientSecure with setInsecure() (unchanged legacy behavior).
-// - http (plain): NetworkClient, unless verifyTls was requested -- html2xtc is https-only, so
-//   verifyTls=true against a plain http:// URL is a caller error and yields nullptr.
-std::unique_ptr<NetworkClient> makeHttpClient(const std::string& url, bool verifyTls,
-                                              SecureNetworkClient** outSecureForError) {
-  if (outSecureForError) *outSecureForError = nullptr;
-
-  if (UrlUtils::isHttpsUrl(url)) {
-    if (verifyTls) {
-      auto* secureClient = new SecureNetworkClient();
-      secureClient->useDefaultCertBundle();
-      secureClient->setHandshakeTimeout(20);
-      if (outSecureForError) *outSecureForError = secureClient;
-      return std::unique_ptr<NetworkClient>(secureClient);
-    }
-    auto* secureClient = new NetworkClientSecure();
-    secureClient->setInsecure();
-    secureClient->setHandshakeTimeout(20);
-    return std::unique_ptr<NetworkClient>(secureClient);
-  }
-
-  if (verifyTls) {
-    LOG_ERR("HTTP", "verifyTls requested for a non-HTTPS URL: %s", url.c_str());
-    return nullptr;
-  }
-  return std::unique_ptr<NetworkClient>(new NetworkClient());
-}
-
-// Logs the mbedtls-level diagnostic for a TLS/connection failure. Only meaningful when
-// secureForError is non-null (i.e. verifyTls was in effect) and the HTTP layer reported a
-// transport-level failure (httpCode <= 0) rather than a genuine HTTP status code (>= 100).
-bool logTlsFailureIfAny(SecureNetworkClient* secureForError, int httpCode) {
-  if (!secureForError || httpCode > 0) {
-    return false;
-  }
-  char errBuf[128];
-  secureForError->lastError(errBuf, sizeof(errBuf));
-  LOG_ERR("HTTP", "TLS/connection error: %s (code=%d)", errBuf, httpCode);
-  return true;
-}
-
-class FileWriteStream final : public Stream {
- public:
-  FileWriteStream(FsFile& file, size_t total, HttpDownloader::ProgressCallback progress)
-      : file_(file), total_(total), progress_(std::move(progress)) {}
-
-  size_t write(uint8_t byte) override { return write(&byte, 1); }
-
-  size_t write(const uint8_t* buffer, size_t size) override {
-    // Write-through stream for HTTPClient::writeToStream with progress tracking.
-    if (aborted_) {
-      // A previous call already requested cancellation via a short-write return. HTTPClient's
-      // writeToStreamDataBlock() retries the remainder of the same chunk once after a short
-      // write before giving up, so this can be invoked again after aborted_ is set. Reporting a
-      // short write again is harmless: downloadToFile() discards the entire temp file on error.
-      return 0;
-    }
-
-    const size_t written = file_.write(buffer, size);
-    if (written != size) {
-      writeOk_ = false;
-    }
-    downloaded_ += written;
-    // Reported even when total_ is 0 (a chunked response carries no Content-Length). Gating on a
-    // known total used to make such downloads both progress-less and impossible to cancel, since
-    // cancellation is signalled through this very callback. Callers already treat total == 0 as
-    // "length unknown" and skip their progress bar.
-    if (progress_) {
-      if (!progress_(downloaded_, total_)) {
-        // Cancellation requested: report a short write so HTTPClient::writeToStreamDataBlock
-        // treats this as a stream error, stops the connection (via returnError()), and unwinds
-        // back to downloadToFile() with a negative writeResult.
-        aborted_ = true;
-        return 0;
-      }
-    }
-    return written;
-  }
-
-  int available() override { return 0; }
-  int read() override { return -1; }
-  int peek() override { return -1; }
-  void flush() override { file_.flush(); }
-
-  size_t downloaded() const { return downloaded_; }
-  bool ok() const { return writeOk_; }
-  bool aborted() const { return aborted_; }
-
- private:
-  FsFile& file_;
-  size_t total_;
-  size_t downloaded_ = 0;
-  bool writeOk_ = true;
-  bool aborted_ = false;
-  HttpDownloader::ProgressCallback progress_;
+/*
+ * tls=12288 is MBEDTLS_ERR_X509_FATAL_ERROR, but that value says almost
+ * nothing on its own: mbedtls rewrites the bundle callback's
+ * MBEDTLS_ERR_X509_CERT_VERIFY_FAILED into it (x509_crt.c, "prevent misuse of
+ * the vrfy callback"), so an empty bundle, an unknown root and a failed
+ * signature check all arrive as the same number. esp_crt_bundle does
+ * distinguish them — but only in its log output, and the USB Serial/JTAG link
+ * on this device drops out exactly when a failure is being reproduced.
+ *
+ * So tap the log stream instead. ESP_LOGx passes its *format string* to the
+ * vprintf hook with the arguments still unformatted, and every marker below is
+ * literal text in that format string, so the common case costs only a few
+ * strstr() calls before delegating to whatever handler was there before. Only
+ * the two markers that carry an error code render the line, and only on the
+ * failure path.
+ */
+/*
+ * Ordered inner-reason-first. esp_crt_check_signature() logs the specific cause
+ * and then its caller logs the generic "Certificate matched but signature
+ * verification failed", so the *first* marker seen in a run is always the
+ * informative one — hence first-write-wins below. An earlier version kept the
+ * lowest code instead, which let the generic message mask the specific one and
+ * made a bare crt=2 ambiguous.
+ */
+constexpr const char* CRT_MARKERS[] = {
+    "No certificates in bundle",  // 1: bundle never attached
+    "PK parse failed",            // 2: parsing the root's public key failed (OOM lands here)
+    "Unsuitable public key",      // 3: key type does not match the signature algorithm
+    "Unknown message digest",     // 4: hash algorithm unsupported in this build
+    "MD failed",                  // 5: hashing the cert body failed
+    "PK verify failed",           // 6: signature mathematically rejected (or MPI alloc failure)
+    "Certificate matched but signature verification failed",  // 7: generic wrapper for 2-6
+    "Failed to verify certificate",  // 8: generic tail; alone it means "no matching root in bundle"
 };
-}  // namespace
+constexpr int CRT_MARKER_COUNT = 8;
 
-bool HttpDownloader::fetchUrl(const std::string& url, const DataCallback& onData, const std::string& username,
-                              const std::string& password, bool verifyTls) {
-  // Streaming variant: identical connection setup to the std::string overload,
-  // but pushes body chunks into onData instead of buffering them. Used by the
-  // OTA release-check path where TLS session heap + full-body buffer would OOM.
-  SecureNetworkClient* secureForError = nullptr;
-  std::unique_ptr<NetworkClient> client = makeHttpClient(url, verifyTls, &secureForError);
-  if (!client) {
-    lastHttpCode = TLS_ERROR_CODE;
-    return false;
-  }
-  HTTPClient http;
+vprintf_like_t g_prevLogHandler = nullptr;
 
-  http.begin(*client, url.c_str());
-  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-  http.addHeader("User-Agent", "CrossPoint-ESP32-" CROSSPOINT_VERSION);
-
-  if (!username.empty() && !password.empty()) {
-    std::string credentials = username + ":" + password;
-    String encoded = base64::encode(credentials.c_str());
-    http.addHeader("Authorization", "Basic " + encoded);
-  }
-
-  LOG_DBG("HTTP", "FetchStream: %s (heap=%d)", url.c_str(), ESP.getFreeHeap());
-  const int httpCode = http.GET();
-  lastHttpCode = httpCode;
-
-  if (logTlsFailureIfAny(secureForError, httpCode)) {
-    lastHttpCode = TLS_ERROR_CODE;
-  }
-  if (httpCode != HTTP_CODE_OK) {
-    LOG_ERR("HTTP", "FetchStream failed: %d", httpCode);
-    http.end();
-    return false;
-  }
-
-  NetworkClient* stream = http.getStreamPtr();
-  // getStreamPtr() returns nullptr when connected() is false, i.e. the peer closed the socket
-  // (or the TLS session dropped) after the 200 header but before sending any body byte. The read
-  // loop below dereferences stream unconditionally, so bail out here instead of panicking.
-  if (!stream) {
-    LOG_ERR("HTTP", "FetchStream: no stream (connection closed before body)");
-    http.end();
-    lastHttpCode = -904;  // Custom code: stream unavailable after 200 response
-    return false;
-  }
-  // Content-Length bounds the body exactly. Without it the loop can only stop when the peer
-  // closes the socket -- and HTTPClient sends Connection: keep-alive by default, so a server
-  // that holds the connection open after the body would leave available()==0 &&
-  // connected()==true forever. A negative/zero size means chunked or unknown length; that case
-  // still relies on connected(), with STREAM_IDLE_TIMEOUT_MS as the backstop.
-  const int contentLen = http.getSize();
-  const size_t expected = contentLen > 0 ? static_cast<size_t>(contentLen) : 0;
-
-  uint8_t buf[512];
-  size_t total = 0;
-  bool aborted = false;
-  bool timedOut = false;
-  uint32_t lastDataMs = millis();
-  while (stream->available() || stream->connected()) {
-    if (expected > 0 && total >= expected) break;
-
-    int avail = stream->available();
-    if (avail <= 0) {
-      // Unsigned subtraction so a millis() rollover still yields the true elapsed interval.
-      if (static_cast<uint32_t>(millis() - lastDataMs) >= STREAM_IDLE_TIMEOUT_MS) {
-        timedOut = true;
+int crtLogHook(const char* fmt, va_list args) {
+  if (fmt) {
+    for (int i = 0; i < CRT_MARKER_COUNT; i++) {
+      if (strstr(fmt, CRT_MARKERS[i]) != nullptr) {
+        // First write wins: the specific reason is logged before the generic one.
+        if (HttpDownloader::lastCrtDiag == 0) HttpDownloader::lastCrtDiag = i + 1;
+        // "PK parse failed with error 0x%x" and "PK verify failed with error
+        // 0x%x" carry the mbedtls code, which is the difference between a
+        // genuine signature mismatch (0x4300 = MBEDTLS_ERR_RSA_VERIFY_FAILED)
+        // and an allocation that died mid-verify (0x0010 =
+        // MBEDTLS_ERR_MPI_ALLOC_FAILED). Format the line only on this rare
+        // failure path and scrape the number back out, rather than walking the
+        // va_list — the log macro's argument layout is an IDF implementation
+        // detail, but the rendered text is not.
+        if (strstr(fmt, "with error 0x") != nullptr && HttpDownloader::lastCrtErr == 0) {
+          char line[160];
+          va_list copy;
+          va_copy(copy, args);
+          const int written = vsnprintf(line, sizeof(line), fmt, copy);
+          va_end(copy);
+          if (written > 0) {
+            const char* at = strstr(line, "error 0x");
+            if (at) HttpDownloader::lastCrtErr = static_cast<int>(strtol(at + 8, nullptr, 16));
+          }
+          // Sample the heap here, not after the request unwinds. This hook runs
+          // synchronously from the failing mbedtls call, still inside the
+          // handshake, so these are the numbers the allocation actually saw —
+          // the post-mortem values an activity prints have already had ~40KB of
+          // TLS structures returned to the arena and look far healthier than
+          // reality.
+          HttpDownloader::lastCrtHeapKb = static_cast<int>(ESP.getFreeHeap() / 1024);
+          HttpDownloader::lastCrtBlkKb = static_cast<int>(ESP.getMaxAllocHeap() / 1024);
+        }
         break;
       }
-      delay(1);  // Yield so the task watchdog is fed while waiting for more body bytes.
-      continue;
     }
-    size_t toRead = (avail < static_cast<int>(sizeof(buf))) ? static_cast<size_t>(avail) : sizeof(buf);
-    if (expected > 0 && toRead > expected - total) {
-      toRead = expected - total;  // Never read past the body into a pipelined keep-alive response.
-    }
-    int bytesRead = stream->readBytes(buf, toRead);
-    if (bytesRead <= 0) break;
-    if (onData && !onData(buf, static_cast<size_t>(bytesRead))) {
-      aborted = true;
-      break;
-    }
-    total += bytesRead;
-    lastDataMs = millis();
   }
-  http.end();
-
-  if (aborted) {
-    LOG_DBG("HTTP", "FetchStream aborted by callback after %zu bytes", total);
-    return false;
-  }
-  if (timedOut) {
-    LOG_ERR("HTTP", "FetchStream stalled after %zu bytes (contentLen=%d)", total, contentLen);
-    lastHttpCode = -902;  // Custom code: no body data received within STREAM_IDLE_TIMEOUT_MS
-    return false;
-  }
-  if (total == 0) {
-    LOG_ERR("HTTP", "FetchStream: empty body");
-    lastHttpCode = -901;
-    return false;
-  }
-  // The loop also exits when the peer closes the socket, which happens before the body is
-  // complete if the connection drops mid-response. Without this check a truncated body would be
-  // reported as success and the caller would parse a partial payload (e.g. a release JSON whose
-  // download URL is cut in half). Only enforceable when Content-Length was present; expected == 0
-  // means chunked/unknown length, where the connected() + idle-timeout logic above is all we have.
-  if (expected > 0 && total < expected) {
-    LOG_ERR("HTTP", "FetchStream truncated: got %zu bytes, expected %zu", total, expected);
-    lastHttpCode = -903;  // Custom code: body shorter than Content-Length
-    return false;
-  }
-
-  LOG_DBG("HTTP", "FetchStream success: %zu bytes", total);
-  return true;
+  return g_prevLogHandler ? g_prevLogHandler(fmt, args) : 0;
 }
+
+// Fires from inside the allocator at the moment a request cannot be satisfied —
+// unlike the log hook, which only runs once the failing call has unwound and its
+// siblings have already been freed. The requested size and the largest block
+// available right then are the two numbers that decide whether the problem is
+// the total, the layout, or a size nobody expected.
+void heapFailHook(size_t size, uint32_t /*caps*/, const char* /*fn*/) {
+  if (HttpDownloader::lastFailSize != 0) return;  // keep the first failure of the request
+  HttpDownloader::lastFailSize = static_cast<int>(size);
+  HttpDownloader::lastFailFreeKb = static_cast<int>(ESP.getFreeHeap() / 1024);
+  HttpDownloader::lastFailBlk = static_cast<int>(ESP.getMaxAllocHeap());
+}
+
+void ensureDiagnostics() {
+  static bool installed = false;
+  if (installed) return;
+  installed = true;
+  g_prevLogHandler = esp_log_set_vprintf(&crtLogHook);
+  heap_caps_register_failed_alloc_callback(&heapFailHook);
+}
+
+// RX holds the response headers; TX must fit the whole request line.
+// fork: upstream uses a flat 4096/1024 for every request. Both are held for the
+// whole connection, so this fork shrinks them to leave room for the TLS record
+// buffers (see BufferProfile in the header) and reintroduces the extra TX size
+// as LARGE for the one caller that needs it.
+// RX is profile-independent: the response header block from the GitHub release
+// CDN measures 840 bytes with a 65-byte longest line, and runGet() streams the
+// body in READ_CHUNK pieces, so a bigger RX buys nothing on either profile.
+constexpr int HTTP_RX_BUF = 2048;
+constexpr int HTTP_TX_BUF_COMPACT = 512;
+// LARGE is a TX-only distinction, sized from measurement: the signed redirect's
+// request line alone is 892 bytes. Add Host (44) and a User-Agent carrying
+// CROSSPOINT_VERSION — 81 bytes on a dev build, where the version string is
+// "0.1.14-dev-<branch>-<sha>" — plus esp_http_client's own headers, and the
+// worst case lands just over 1024. Overflowing it fails the request with
+// ESP_FAIL before a byte is sent (http=1), so 1536 leaves margin for long
+// branch names.
+constexpr int HTTP_TX_BUF_LARGE = 1536;
+// Per-socket-op timeout. Some OPDS download endpoints are slow to send headers
+// (>15s) and chunked catalogs stall mid-body, so 15s killed them. 60s gives
+// slow servers room. esp_http_client's timeout_ms is uint32, so unlike Arduino
+// HTTPClient's uint16 setTimeout it doesn't silently truncate.
+constexpr int HTTP_TIMEOUT_MS = 60000;
+constexpr size_t READ_CHUNK = 1024;
+constexpr int MAX_REDIRECTS = 5;
+
+struct Sink {
+  std::function<bool(const uint8_t*, size_t)> write;  // returns false to abort the transfer
+  HttpDownloader::ProgressCallback progress;
+  bool* cancelFlag = nullptr;
+  size_t total = 0;
+  size_t downloaded = 0;
+};
+
+bool isRedirect(int status) {
+  return status == 301 || status == 302 || status == 303 || status == 307 || status == 308;
+}
+
+bool isHttpsUrl(const std::string& url) { return url.rfind("https://", 0) == 0; }
+
+// fork: collects the response headers OPDS format detection needs. Wired as the
+// esp_http_client event handler (user_data = the metadata struct); ON_HEADER
+// fires during esp_http_client_fetch_headers(), including on each redirect hop,
+// so runGet() clears the strings per hop and the final response wins.
+esp_err_t metadataHeaderEvent(esp_http_client_event_t* evt) {
+  if (evt->event_id != HTTP_EVENT_ON_HEADER || !evt->user_data) return ESP_OK;
+  auto* meta = static_cast<HttpDownloader::HttpResponseMetadata*>(evt->user_data);
+  if (!evt->header_key || !evt->header_value) return ESP_OK;
+  if (strcasecmp(evt->header_key, "Content-Type") == 0) {
+    meta->contentType = evt->header_value;
+  } else if (strcasecmp(evt->header_key, "Content-Disposition") == 0) {
+    meta->contentDisposition = evt->header_value;
+  }
+  return ESP_OK;
+}
+
+// Pull the TLS-layer reason out of the client after open() reported
+// ESP_ERR_HTTP_CONNECT. The transport clears it on read, so call this once, and
+// only on the failure path. Leaves the fields at 0 when the failure never
+// reached esp-tls (plain http, DNS, refused socket).
+void captureTlsError(esp_http_client_handle_t client) {
+  int mbedtlsCode = 0;
+  int flags = 0;
+  // The return value is esp-tls' own error (ESP_ERR_ESP_TLS_*, 0x8000-based),
+  // which is what separates "DNS never resolved" from "the socket was refused";
+  // the out-params carry the underlying mbedtls code. Both are meaningful, and
+  // the call wipes the handle, so read it exactly once and keep whichever is
+  // set. The two ranges are disjoint — mbedtls codes are negative, esp-tls ones
+  // positive — so one int can hold either without ambiguity.
+  const esp_err_t layerErr = esp_http_client_get_and_clear_last_tls_error(client, &mbedtlsCode, &flags);
+  if (layerErr == ESP_ERR_INVALID_STATE) return;  // plain http: no TLS handle to report on
+
+  HttpDownloader::lastTlsError = mbedtlsCode != 0 ? mbedtlsCode : static_cast<int>(layerErr);
+  HttpDownloader::lastTlsFlags = flags;
+  if (HttpDownloader::lastTlsError || flags) {
+    LOG_ERR("HTTP", "TLS error: esp_tls=0x%X mbedtls=%d (-0x%X) flags=0x%X", layerErr, mbedtlsCode, -mbedtlsCode,
+            flags);
+  }
+}
+
+// fork: after captureTlsError(), decide whether the connect failure was a
+// certificate verification rejection (as opposed to DNS / refused socket /
+// OOM). Verification failures get their own DownloadError so the OPDS UI can
+// tell the user to check the server's certificate rather than the network.
+HttpDownloader::DownloadError classifyConnectError() {
+  if (HttpDownloader::lastTlsFlags != 0 || HttpDownloader::lastCrtDiag != 0) {
+    HttpDownloader::lastHttpCode = HttpDownloader::TLS_ERROR_CODE;
+    return HttpDownloader::TLS_ERROR;
+  }
+  return HttpDownloader::HTTP_ERROR;
+}
+
+// Streams a GET body through sink.write in READ_CHUNK pieces. Uses the manual
+// open/fetch_headers/read path rather than esp_http_client_perform(): perform()
+// pushes the whole body through an event callback and reports a chunked body
+// that ends early as ESP_ERR_HTTP_INCOMPLETE_DATA, whereas the read loop streams
+// large/slow files and surfaces a short read directly.
+HttpDownloader::DownloadError runGet(const std::string& url, const std::string& username, const std::string& password,
+                                     Sink& sink, HttpDownloader::BufferProfile buffers,
+                                     HttpDownloader::HttpResponseMetadata* meta = nullptr, bool verifyTls = true) {
+  const bool large = buffers == HttpDownloader::BufferProfile::LARGE;
+  ensureDiagnostics();
+  // Baseline for the diagnostics: the state going in, before esp_http_client or
+  // mbedtls have allocated anything for this request. Paired with lastCrtHeapKb
+  // (sampled inside a failing handshake) it says how much the connection itself
+  // consumed, which is the number that decides whether there is anything left
+  // to reclaim on our side.
+  HttpDownloader::lastPreHeapKb = static_cast<int>(ESP.getFreeHeap() / 1024);
+  HttpDownloader::lastPreBlkKb = static_cast<int>(ESP.getMaxAllocHeap() / 1024);
+  HttpDownloader::lastFailSize = 0;
+  HttpDownloader::lastFailFreeKb = 0;
+  HttpDownloader::lastFailBlk = 0;
+  // reset before each attempt so activities' diagnostics reflect this call only
+  HttpDownloader::lastHttpCode = 0;
+  HttpDownloader::lastTlsError = 0;
+  HttpDownloader::lastTlsFlags = 0;
+  HttpDownloader::lastCrtDiag = 0;
+  HttpDownloader::lastCrtErr = 0;
+  HttpDownloader::lastCrtHeapKb = 0;
+  HttpDownloader::lastCrtBlkKb = 0;
+  esp_http_client_config_t config = {};
+  config.url = url.c_str();
+  config.buffer_size = HTTP_RX_BUF;
+  config.buffer_size_tx = large ? HTTP_TX_BUF_LARGE : HTTP_TX_BUF_COMPACT;
+  config.timeout_ms = HTTP_TIMEOUT_MS;
+  // Verify HTTPS against the bundled CA roots by default; the model is public
+  // servers over verified https and local servers over plain http
+  // (esp_http_client picks the transport from the URL scheme, so http:// needs
+  // no cert config). fork: verifyTls=false leaves the cert config empty for a
+  // user-configured OPDS server with a self-signed certificate — esp-tls then
+  // skips verification, which CONFIG_ESP_TLS_INSECURE +
+  // CONFIG_ESP_TLS_SKIP_SERVER_CERT_VERIFY (custom_sdkconfig) must allow, or
+  // the handshake refuses to start.
+  if (!isHttpsUrl(url) || verifyTls) {
+    config.crt_bundle_attach = esp_crt_bundle_attach;
+  }
+  config.keep_alive_enable = true;
+  if (meta) {
+    *meta = HttpDownloader::HttpResponseMetadata{};
+    config.event_handler = metadataHeaderEvent;
+    config.user_data = meta;
+  }
+
+  esp_http_client_handle_t client = esp_http_client_init(&config);
+  if (!client) {
+    LOG_ERR("HTTP", "client init failed");
+    return HttpDownloader::HTTP_ERROR;
+  }
+
+  esp_http_client_set_header(client, "User-Agent", "CrossPoint-ESP32-" CROSSPOINT_VERSION);
+  if (!username.empty() && !password.empty()) {
+    // Preemptive Basic auth, like the prior addHeader; don't wait for a 401.
+    const std::string credentials = username + ":" + password;
+    const String header = "Basic " + base64::encode(credentials.c_str());
+    esp_http_client_set_header(client, "Authorization", header.c_str());
+  }
+
+  // open()/read() does not auto-follow redirects (only perform() does), so step
+  // 30x responses manually. OPDS download endpoints and the GitHub release CDN
+  // both redirect.
+  esp_err_t err = esp_http_client_open(client, 0);
+  if (err != ESP_OK) {
+    LOG_ERR("HTTP", "open failed: %s", esp_err_to_name(err));
+    HttpDownloader::lastHttpCode = -static_cast<int>(err);  // fork: 負値=esp_err で診断表示
+    captureTlsError(client);
+    esp_http_client_cleanup(client);
+    return classifyConnectError();
+  }
+  int64_t contentLength = esp_http_client_fetch_headers(client);
+  int status = esp_http_client_get_status_code(client);
+  for (int hop = 0; isRedirect(status) && hop < MAX_REDIRECTS; ++hop) {
+    HttpDownloader::lastHttpCode = status;  // fork: redirect 中の失敗でも直前の status を残す
+    if (esp_http_client_set_redirection(client) != ESP_OK) break;
+    esp_http_client_close(client);
+    if (meta) {
+      // A redirect hop's headers must not leak into the final response's
+      // metadata (the hop often carries its own text/html Content-Type).
+      meta->contentType.clear();
+      meta->contentDisposition.clear();
+    }
+    err = esp_http_client_open(client, 0);
+    if (err != ESP_OK) {
+      LOG_ERR("HTTP", "redirect open failed: %s", esp_err_to_name(err));
+      HttpDownloader::lastHttpCode = -static_cast<int>(err);  // fork: 負値=esp_err で診断表示
+      captureTlsError(client);
+      esp_http_client_cleanup(client);
+      return classifyConnectError();
+    }
+    contentLength = esp_http_client_fetch_headers(client);
+    status = esp_http_client_get_status_code(client);
+  }
+  HttpDownloader::lastHttpCode = status;
+  if (meta) {
+    meta->statusCode = status;
+    meta->contentLength = contentLength > 0 ? static_cast<size_t>(contentLength) : 0;
+  }
+
+  if (status != 200) {
+    LOG_ERR("HTTP", "unexpected status: %d", status);
+    esp_http_client_cleanup(client);
+    return HttpDownloader::HTTP_ERROR;
+  }
+
+  // fetch_headers returns 0 for a chunked response (no Content-Length); leave
+  // total at 0 so the size check is skipped.
+  sink.total = contentLength > 0 ? static_cast<size_t>(contentLength) : 0;
+
+  auto buf = makeUniqueNoThrow<char[]>(READ_CHUNK);
+  if (!buf) {
+    LOG_ERR("HTTP", "OOM: %u byte read buffer", (unsigned)READ_CHUNK);
+    esp_http_client_cleanup(client);
+    return HttpDownloader::HTTP_ERROR;
+  }
+
+  while (true) {
+    if (sink.cancelFlag && *sink.cancelFlag) {
+      esp_http_client_cleanup(client);
+      return HttpDownloader::ABORTED;
+    }
+    const int read = esp_http_client_read(client, buf.get(), READ_CHUNK);
+    if (read < 0) {
+      LOG_ERR("HTTP", "read error after %zu bytes", sink.downloaded);
+      esp_http_client_cleanup(client);
+      return HttpDownloader::HTTP_ERROR;
+    }
+    if (read == 0) break;  // all data received
+    if (!sink.write(reinterpret_cast<const uint8_t*>(buf.get()), read)) {
+      esp_http_client_cleanup(client);
+      return HttpDownloader::FILE_ERROR;
+    }
+    sink.downloaded += read;
+    // fork: fire for chunked responses too (total == 0). The OPDS download UI
+    // polls its cancel input from inside the progress callback, and callers'
+    // percent throttles treat total==0 as pct 0, so the extra calls are cheap.
+    if (sink.progress) sink.progress(sink.downloaded, sink.total);
+  }
+
+  const bool complete = esp_http_client_is_complete_data_received(client);
+  esp_http_client_cleanup(client);
+  if (!complete) {
+    LOG_ERR("HTTP", "incomplete: got %zu of %zu bytes", sink.downloaded, sink.total);
+    return HttpDownloader::HTTP_ERROR;
+  }
+  return HttpDownloader::OK;
+}
+}  // namespace
 
 bool HttpDownloader::fetchUrl(const std::string& url, Stream& outContent, const std::string& username,
                               const std::string& password, bool verifyTls) {
-  SecureNetworkClient* secureForError = nullptr;
-  std::unique_ptr<NetworkClient> client = makeHttpClient(url, verifyTls, &secureForError);
-  if (!client) {
-    lastHttpCode = TLS_ERROR_CODE;
-    return false;
-  }
-  HTTPClient http;
-
   LOG_DBG("HTTP", "Fetching: %s", url.c_str());
-
-  http.begin(*client, url.c_str());
-  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-  http.addHeader("User-Agent", "CrossPoint-ESP32-" CROSSPOINT_VERSION);
-
-  if (!username.empty() && !password.empty()) {
-    std::string credentials = username + ":" + password;
-    String encoded = base64::encode(credentials.c_str());
-    http.addHeader("Authorization", "Basic " + encoded);
-  }
-
-  LOG_DBG("HTTP", "Free heap before GET: %d", ESP.getFreeHeap());
-  const int httpCode = http.GET();
-  lastHttpCode = httpCode;
-  LOG_DBG("HTTP", "GET result: %d, free heap: %d", httpCode, ESP.getFreeHeap());
-  if (logTlsFailureIfAny(secureForError, httpCode)) {
-    lastHttpCode = TLS_ERROR_CODE;
-  }
-  if (httpCode != HTTP_CODE_OK) {
-    LOG_ERR("HTTP", "Fetch failed: %d", httpCode);
-    http.end();
-    return false;
-  }
-
-  const int writeResult = http.writeToStream(&outContent);
-  http.end();
-
-  if (writeResult < 0) {
-    LOG_ERR("HTTP", "writeToStream failed: %d", writeResult);
-    lastHttpCode = writeResult;
-    return false;
-  }
-
-  LOG_DBG("HTTP", "Fetch success: %d bytes", writeResult);
-  return true;
+  Sink sink;
+  sink.write = [&outContent](const uint8_t* data, size_t len) { return outContent.write(data, len) == len; };
+  return runGet(url, username, password, sink, BufferProfile::COMPACT, nullptr, verifyTls) == OK;
 }
 
 bool HttpDownloader::fetchUrl(const std::string& url, std::string& outContent, const std::string& username,
                               const std::string& password, bool verifyTls) {
-  // Direct string fetch: avoids StreamString and writeToStream issues.
-  SecureNetworkClient* secureForError = nullptr;
-  std::unique_ptr<NetworkClient> client = makeHttpClient(url, verifyTls, &secureForError);
-  if (!client) {
-    lastHttpCode = TLS_ERROR_CODE;
-    return false;
-  }
-  HTTPClient http;
+  LOG_DBG("HTTP", "Fetching: %s", url.c_str());
+  outContent.clear();  // start clean; the sink appends, so don't carry prior content
+  Sink sink;
+  sink.write = [&outContent](const uint8_t* data, size_t len) {
+    outContent.append(reinterpret_cast<const char*>(data), len);
+    return true;
+  };
+  return runGet(url, username, password, sink, BufferProfile::COMPACT, nullptr, verifyTls) == OK;
+}
 
-  http.begin(*client, url.c_str());
-  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-  http.addHeader("User-Agent", "CrossPoint-ESP32-" CROSSPOINT_VERSION);
-
-  if (!username.empty() && !password.empty()) {
-    std::string credentials = username + ":" + password;
-    String encoded = base64::encode(credentials.c_str());
-    http.addHeader("Authorization", "Basic " + encoded);
-  }
-
-  LOG_DBG("HTTP", "FetchStr: %s (heap=%d)", url.c_str(), ESP.getFreeHeap());
-  const int httpCode = http.GET();
-  lastHttpCode = httpCode;
-
-  if (logTlsFailureIfAny(secureForError, httpCode)) {
-    lastHttpCode = TLS_ERROR_CODE;
-  }
-  if (httpCode != HTTP_CODE_OK) {
-    LOG_ERR("HTTP", "FetchStr failed: %d", httpCode);
-    http.end();
-    return false;
-  }
-
-  // Read body in small chunks to avoid large single allocation.
-  // TLS buffers (~40KB) are held during the connection, leaving limited heap.
-  NetworkClient* stream = http.getStreamPtr();
-  const int contentLen = http.getSize();
-  outContent.clear();
-  if (contentLen > 0) {
-    outContent.reserve(contentLen);
-  }
-
-  char buf[512];
-  while (stream->available() || stream->connected()) {
-    int avail = stream->available();
-    if (avail <= 0) {
-      delay(1);
-      continue;
-    }
-    int toRead = (avail < static_cast<int>(sizeof(buf))) ? avail : static_cast<int>(sizeof(buf));
-    int bytesRead = stream->readBytes(buf, toRead);
-    if (bytesRead > 0) {
-      outContent.append(buf, bytesRead);
-    } else {
-      break;
-    }
-  }
-  http.end();
-
-  if (outContent.empty()) {
-    LOG_ERR("HTTP", "FetchStr: empty body (contentLen=%d)", contentLen);
-    lastHttpCode = -901;
-    return false;
-  }
-
-  LOG_DBG("HTTP", "FetchStr success: %zu bytes", outContent.size());
-  return true;
+bool HttpDownloader::fetchUrl(const std::string& url, const DataCallback& onData, const std::string& username,
+                              const std::string& password, BufferProfile buffers, bool verifyTls) {
+  LOG_DBG("HTTP", "Fetching: %s", url.c_str());
+  Sink sink;
+  sink.write = onData;
+  return runGet(url, username, password, sink, buffers, nullptr, verifyTls) == OK;
 }
 
 HttpDownloader::DownloadError HttpDownloader::downloadToFile(const std::string& url, const std::string& destPath,
-                                                             ProgressCallback progress, int timeoutMs,
+                                                             ProgressCallback progress, bool* cancelFlag,
                                                              const std::string& username, const std::string& password,
-                                                             HttpResponseMetadata* outMetadata, bool verifyTls) {
-  SecureNetworkClient* secureForError = nullptr;
-  std::unique_ptr<NetworkClient> client = makeHttpClient(url, verifyTls, &secureForError);
-  if (!client) {
-    lastHttpCode = TLS_ERROR_CODE;
-    return TLS_ERROR;
-  }
-  HTTPClient http;
+                                                             BufferProfile buffers, HttpResponseMetadata* outMetadata,
+                                                             bool verifyTls) {
+  LOG_DBG("HTTP", "Downloading: %s -> %s", url.c_str(), destPath.c_str());
 
-  LOG_DBG("HTTP", "Downloading: %s", url.c_str());
-  LOG_DBG("HTTP", "Destination: %s", destPath.c_str());
-
-  http.begin(*client, url.c_str());
-  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-  if (timeoutMs > 0) {
-    http.setTimeout(timeoutMs);
-  }
-  http.addHeader("User-Agent", "CrossPoint-ESP32-" CROSSPOINT_VERSION);
-
-  if (!username.empty() && !password.empty()) {
-    std::string credentials = username + ":" + password;
-    String encoded = base64::encode(credentials.c_str());
-    http.addHeader("Authorization", "Basic " + encoded);
-  }
-
-  // Headers must be registered before GET() or header() will always return empty afterwards.
-  if (outMetadata) {
-    static const char* kCollectedHeaders[] = {"Content-Type", "Content-Disposition"};
-    http.collectHeaders(kCollectedHeaders, 2);
-  }
-
-  const int httpCode = http.GET();
-  lastHttpCode = httpCode;
-  const bool tlsFailure = logTlsFailureIfAny(secureForError, httpCode);
-  if (tlsFailure) {
-    lastHttpCode = TLS_ERROR_CODE;
-  }
-  if (outMetadata) {
-    outMetadata->statusCode = httpCode;
-    outMetadata->contentType = http.header("Content-Type").c_str();
-    outMetadata->contentDisposition = http.header("Content-Disposition").c_str();
-  }
-  if (httpCode != HTTP_CODE_OK) {
-    LOG_ERR("HTTP", "Download failed: %d", httpCode);
-    http.end();
-    return tlsFailure ? TLS_ERROR : HTTP_ERROR;
-  }
-
-  const int64_t reportedLength = http.getSize();
-  const size_t contentLength = reportedLength > 0 ? static_cast<size_t>(reportedLength) : 0;
-  if (contentLength > 0) {
-    LOG_DBG("HTTP", "Content-Length: %zu", contentLength);
-  } else {
-    LOG_DBG("HTTP", "Content-Length: unknown");
-  }
-  if (outMetadata) {
-    outMetadata->contentLength = contentLength;
-  }
-
-  // Download into a temporary ".part" file and rename it to destPath only after
-  // all verification passes. This keeps destPath atomic: it either holds the old
-  // complete file or the new complete file, never a truncated download.
-  const std::string partPath = destPath + ".part";
-
-  // Clean up any stale .part file left over from a previous interrupted download.
-  if (Storage.exists(partPath.c_str())) {
-    Storage.remove(partPath.c_str());
-  }
-
-  // Open file for writing
-  FsFile file;
-  if (!Storage.openFileForWrite("HTTP", partPath.c_str(), file)) {
-    LOG_ERR("HTTP", "Failed to open file for writing");
-    http.end();
-    return FILE_ERROR;
-  }
-
-  // Let HTTPClient handle chunked decoding and stream body bytes into the file.
-  FileWriteStream fileStream(file, contentLength, progress);
-  const int writeResult = http.writeToStream(&fileStream);
-
-  file.close();
-  http.end();
-
-  if (writeResult < 0) {
-    if (fileStream.aborted()) {
-      LOG_INF("HTTP", "Download cancelled by progress callback (len=%zu, downloaded=%zu)", contentLength,
-              fileStream.downloaded());
-      Storage.remove(partPath.c_str());
-      return ABORTED;
-    }
-    LOG_ERR("HTTP", "writeToStream error: %d (len=%zu)", writeResult, contentLength);
-    lastHttpCode = writeResult;  // Store writeToStream error code for diagnostics
-    Storage.remove(partPath.c_str());
-    return HTTP_ERROR;
-  }
-
-  // Defensive: if the framework ever tolerates the abort's short write and reports success,
-  // the file is still truncated -- never let an aborted download pass as OK.
-  if (fileStream.aborted()) {
-    LOG_INF("HTTP", "Download cancelled by progress callback (len=%zu, downloaded=%zu)", contentLength,
-            fileStream.downloaded());
-    Storage.remove(partPath.c_str());
-    return ABORTED;
-  }
-
-  const size_t downloaded = fileStream.downloaded();
-  LOG_DBG("HTTP", "Downloaded %zu bytes", downloaded);
-
-  // Guard against partial writes even if HTTPClient completes.
-  if (!fileStream.ok()) {
-    LOG_ERR("HTTP", "Write failed during download");
-    lastHttpCode = -900;  // Custom code: SD write failure
-    Storage.remove(partPath.c_str());
-    return FILE_ERROR;
-  }
-
-  if (contentLength == 0 && downloaded == 0) {
-    LOG_ERR("HTTP", "Download failed: no data received");
-    lastHttpCode = -901;  // Custom code: no data
-    Storage.remove(partPath.c_str());
-    return HTTP_ERROR;
-  }
-
-  // Verify download size if known
-  if (contentLength > 0 && downloaded != contentLength) {
-    LOG_ERR("HTTP", "Size mismatch: got %zu, expected %zu", downloaded, contentLength);
-    Storage.remove(partPath.c_str());
-    return HTTP_ERROR;
-  }
-
-  // All checks passed: move the .part file into place. SdFat's rename() opens the
-  // target with O_EXCL semantics and fails if it already exists, so remove the old
-  // destination first.
   if (Storage.exists(destPath.c_str())) {
     Storage.remove(destPath.c_str());
   }
-  if (!Storage.rename(partPath.c_str(), destPath.c_str())) {
-    // Keep the verified .part file: deleting it here would lose both the old file
-    // (removed above) and the fully downloaded data. The stale-.part cleanup at the
-    // top of this function reclaims it on the next download attempt.
-    LOG_ERR("HTTP", "Rename failed: %s -> %s", partPath.c_str(), destPath.c_str());
+  HalFile file;
+  if (!Storage.openFileForWrite("HTTP", destPath.c_str(), file)) {
+    LOG_ERR("HTTP", "Failed to open file for writing");
     return FILE_ERROR;
   }
 
+  Sink sink;
+  sink.progress = std::move(progress);
+  sink.cancelFlag = cancelFlag;
+  sink.write = [&file](const uint8_t* data, size_t len) { return file.write(data, len) == len; };
+
+  const DownloadError result = runGet(url, username, password, sink, buffers, outMetadata, verifyTls);
+  // Close before any remove() on the same path; DESTRUCTOR_CLOSES_FILE would
+  // otherwise close only after the remove.
+  file.close();
+
+  if (result != OK) {
+    Storage.remove(destPath.c_str());
+    return result;
+  }
+  if (sink.downloaded == 0) {
+    LOG_ERR("HTTP", "no data received");
+    Storage.remove(destPath.c_str());
+    return HTTP_ERROR;
+  }
+  LOG_DBG("HTTP", "Downloaded %zu bytes", sink.downloaded);
   return OK;
 }

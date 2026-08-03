@@ -11,61 +11,6 @@ enum class VerticalBehavior : uint8_t {
   TateChuYoko,  // 1-2 digit numbers - horizontal-in-vertical
 };
 
-// Punctuation offset for vertical text (ratio of character size, in 1/8 units)
-struct PunctuationOffset {
-  uint32_t codepoint;
-  int8_t dxEighths;  // horizontal offset in 1/8 of charWidth
-  int8_t dyEighths;  // vertical offset in 1/8 of charHeight
-  bool rotate;       // true = rotate 90 CW (e.g. long vowel mark)
-};
-
-// CJK punctuation and brackets that need 90 CW rotation in vertical text.
-// Horizontal font glyphs are designed for horizontal layout; rotating them
-// naturally transforms their position to the correct vertical placement
-// (e.g. 。at bottom-left becomes upper-right after rotation).
-// dx/dyEighths are post-rotation fine-tuning offsets (usually 0).
-static constexpr PunctuationOffset VERTICAL_PUNCTUATION[] = {
-    // Punctuation - rotate to reposition from horizontal to vertical placement
-    {0x3001, 0, 0, true},  // 、 ideographic comma
-    {0x3002, 0, 0, true},  // 。 ideographic period
-    {0xFF0C, 0, 0, true},  // ， fullwidth comma
-    {0xFF0E, 0, 0, true},  // ． fullwidth period
-    {0xFF01, 0, 0, true},  // ！ fullwidth exclamation
-    {0xFF1F, 0, 0, true},  // ？ fullwidth question mark
-    {0xFF1A, 0, 0, true},  // ： fullwidth colon
-    {0xFF1B, 0, 0, true},  // ； fullwidth semicolon
-    // Brackets - rotate so opening/closing direction matches vertical flow
-    {0x300C, 0, 0, true},  // 「 left corner bracket
-    {0x300D, 0, 0, true},  // 」 right corner bracket
-    {0x300E, 0, 0, true},  // 『 left white corner bracket
-    {0x300F, 0, 0, true},  // 』 right white corner bracket
-    {0x3010, 0, 0, true},  // 【 left black lenticular bracket
-    {0x3011, 0, 0, true},  // 】 right black lenticular bracket
-    {0xFF08, 0, 0, true},  // （ fullwidth left paren
-    {0xFF09, 0, 0, true},  // ） fullwidth right paren
-    {0x3008, 0, 0, true},  // 〈 left angle bracket
-    {0x3009, 0, 0, true},  // 〉 right angle bracket
-    {0x300A, 0, 0, true},  // 《 left double angle bracket
-    {0x300B, 0, 0, true},  // 》 right double angle bracket
-    {0x3014, 0, 0, true},  // 〔 left tortoise shell bracket
-    {0x3015, 0, 0, true},  // 〕 right tortoise shell bracket
-    // Long marks - rotate to vertical orientation
-    {0x30FC, 0, 0, true},  // ー katakana long vowel mark
-    {0x2014, 0, 0, true},  // — em dash
-    {0x2015, 0, 0, true},  // ― horizontal bar
-    {0x2026, 0, 0, true},  // … ellipsis
-    {0xFF5E, 0, 0, true},  // ～ fullwidth tilde
-};
-static constexpr int VERTICAL_PUNCTUATION_COUNT = sizeof(VERTICAL_PUNCTUATION) / sizeof(VERTICAL_PUNCTUATION[0]);
-
-// Look up punctuation offset. Returns nullptr if no special handling needed.
-inline const PunctuationOffset* getVerticalPunctuationOffset(uint32_t cp) {
-  for (int i = 0; i < VERTICAL_PUNCTUATION_COUNT; i++) {
-    if (VERTICAL_PUNCTUATION[i].codepoint == cp) return &VERTICAL_PUNCTUATION[i];
-  }
-  return nullptr;
-}
-
 // Determine if a codepoint should be drawn upright in vertical text.
 // CJK ideographs, kana, CJK symbols, fullwidth forms, etc.
 inline bool isUprightInVertical(uint32_t cp) {
@@ -80,6 +25,105 @@ inline bool isUprightInVertical(uint32_t cp) {
   if (cp >= 0x3300 && cp <= 0x33FF) return true;  // CJK Compatibility
   if (cp >= 0x3100 && cp <= 0x312F) return true;  // Bopomofo
   if (cp >= 0xAC00 && cp <= 0xD7AF) return true;  // Hangul
+  return false;
+}
+
+// Vertical repositioning for small kana (小書き仮名), as a percentage of the
+// full-width advance (em). In horizontal layout a small kana glyph is drawn
+// low in the em box and roughly centred horizontally; vertical layout places
+// it toward the upper right (JLREQ 3.1.4 / JIS X 4051).
+//
+// The magnitudes below are measured, not guessed. For each of the 24 small
+// kana the OpenType 'vert' substitute was compared against its base glyph in
+// seven typefaces, and the displacement taken as the shift of the ink
+// bounding box *centre*:
+//
+//   NotoSansCJKjp Regular  +0.112 em right  +0.106 em up
+//   NotoSansCJKjp Bold     +0.104           +0.106
+//   Hiragino Kaku Gothic W3 +0.112          +0.108
+//   Hiragino Kaku Gothic W6 +0.103          +0.098
+//   Hiragino Mincho ProN   +0.114           +0.099
+//   Hiragino Maru Gothic W4 +0.102          +0.094
+//   Hiragino Sans GB       +0.111           +0.108
+//   ------------------------------------------------
+//   mean                   +0.1083          +0.1028
+//
+// NotoSansCJKjp matters most here: it is the source of the bundled .cpfont
+// files (lib/EpdFont/scripts/downloaded_fonts/).
+//
+// Each row is a mean over the 24 characters (166 glyph pairs in total). The
+// means are tight across typefaces, but individual characters are not: the
+// per-character standard deviation is 0.013 em horizontally and 0.020 em
+// vertically (full spread 0.073..0.158 and 0.060..0.166). A single constant
+// is a deliberate approximation of that spread - a per-character table would
+// cost flash and complexity for a correction whose residual error is well
+// under one pixel at the em sizes this firmware renders (25-38 px).
+//
+// Centre rather than corner is the right reference because we translate the
+// unmodified horizontal glyph. Hiragino's vert forms are pure translations so
+// the two agree, but Noto redraws them slightly smaller, and aligning corners
+// would then overshoot to the upper right by the size difference.
+//
+// Note the offsets are deliberately derived from the advance alone and not
+// from the glyph ink box: EpdGlyph width/height/left/top are post-rasterisation
+// bitmap extents, so at a ~30 px em a one-pixel cropping difference is already
+// 0.03 em of error. The advance carries no such error.
+static constexpr int SMALL_KANA_DX_PERCENT = 11;  // rightward, % of em
+static constexpr int SMALL_KANA_DY_PERCENT = 10;  // upward, % of em
+
+// Is this codepoint a small kana needing the offset above in vertical text?
+inline constexpr bool isSmallKana(uint32_t cp) {
+  if (cp >= 0x3041 && cp <= 0x3096) {  // Hiragana
+    switch (cp) {
+      case 0x3041:  // ぁ
+      case 0x3043:  // ぃ
+      case 0x3045:  // ぅ
+      case 0x3047:  // ぇ
+      case 0x3049:  // ぉ
+      case 0x3063:  // っ
+      case 0x3083:  // ゃ
+      case 0x3085:  // ゅ
+      case 0x3087:  // ょ
+      case 0x308E:  // ゎ
+      case 0x3095:  // ゕ
+      case 0x3096:  // ゖ
+        return true;
+      default:
+        return false;
+    }
+  }
+  if (cp >= 0x30A1 && cp <= 0x30F6) {  // Katakana
+    switch (cp) {
+      case 0x30A1:  // ァ
+      case 0x30A3:  // ィ
+      case 0x30A5:  // ゥ
+      case 0x30A7:  // ェ
+      case 0x30A9:  // ォ
+      case 0x30C3:  // ッ
+      case 0x30E3:  // ャ
+      case 0x30E5:  // ュ
+      case 0x30E7:  // ョ
+      case 0x30EE:  // ヮ
+      case 0x30F5:  // ヵ
+      case 0x30F6:  // ヶ
+        return true;
+      default:
+        return false;
+    }
+  }
+  // Katakana Phonetic Extensions - small katakana for Ainu (ㇰㇱㇲ...).
+  // All 16 are small forms. Their measured displacement (+0.102 em right,
+  // +0.091 em up) sits within the spread of the main set, so they share the
+  // same constants.
+  if (cp >= 0x31F0 && cp <= 0x31FF) return true;
+  // Halfwidth small katakana (U+FF67..FF6F) are excluded on purpose, even
+  // though isUprightInVertical() above sends them down the same upright path.
+  // Two reasons: none of the seven typefaces measured carries a 'vert'
+  // substitute for them, so there is nothing to derive an offset from; and
+  // the model does not apply anyway, since a halfwidth kana fills its narrow
+  // cell rather than sitting small and low inside a full-width em box.
+  // (Four of the Hiragino faces do define halfwidth forms under 'vrt2', but
+  // fontconvert_sdcard.py reads only 'vert', so they never reach this code.)
   return false;
 }
 
@@ -122,12 +166,11 @@ inline bool isKinsokuHead(uint32_t cp) {
   if (cp == 0xFF01 || cp == 0xFF1F) return true;                                  // ！？
   if (cp == 0xFF1A || cp == 0xFF1B) return true;                                  // ：；
   if (cp == 0x3009 || cp == 0x300B) return true;                                  // 〉》
-  // Small kana (行頭禁止)
-  if (cp == 0x3041 || cp == 0x3043 || cp == 0x3045 || cp == 0x3047 || cp == 0x3049) return true;  // ぁぃぅぇぉ
-  if (cp == 0x3063 || cp == 0x3083 || cp == 0x3085 || cp == 0x3087) return true;                  // っゃゅょ
-  if (cp == 0x30A1 || cp == 0x30A3 || cp == 0x30A5 || cp == 0x30A7 || cp == 0x30A9) return true;  // ァィゥェォ
-  if (cp == 0x30C3 || cp == 0x30E3 || cp == 0x30E5 || cp == 0x30E7) return true;                  // ッャュョ
-  if (cp == 0x30FC) return true;                                                                  // ー
+  // Small kana (行頭禁止). Shares isSmallKana() so the two lists cannot drift:
+  // the open-coded version here used to omit ゎ ヮ ゕ ゖ ヵ ヶ and the Ainu
+  // small katakana, which JIS X 4051 treats the same as っ ゃ ゅ ょ.
+  if (isSmallKana(cp)) return true;
+  if (cp == 0x30FC) return true;  // ー
   return false;
 }
 

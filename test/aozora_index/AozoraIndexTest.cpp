@@ -1,7 +1,7 @@
 // 青空文庫ダウンロード履歴のバイナリ形式契約テスト。
 //
 // AozoraIndexManager は SD I/O と ArduinoJson に依存するためホストで直接動かせないが、
-// バイナリファイルフォーマット (Header + 181B レコード) の raw byte 契約と、
+// バイナリファイルフォーマット (Header + 249B レコード) の raw byte 契約と、
 // 構造体レイアウトは HalStorage / ArduinoJson 非依存で検証できる。
 //
 // このテストが壊れる = ディスク上のファイルフォーマットが変わり互換性が壊れる、
@@ -57,16 +57,19 @@ static int testsFailed = 0;
 // ============================================================================
 
 static void test_entry_layout_size() {
-  ASSERT_EQ_U(sizeof(AozoraBookEntry), 180u);
+  ASSERT_EQ_U(sizeof(AozoraBookEntry), 248u);
   PASS();
 }
 
 static void test_entry_field_offsets() {
-  // オフセットが変わるとバイナリ形式が壊れる
+  // オフセットが変わるとバイナリ形式が壊れる。
+  // workId 以降は全て char 配列なのでパディングは入らない。
   ASSERT_EQ_U(offsetof(AozoraBookEntry, workId), 0u);
   ASSERT_EQ_U(offsetof(AozoraBookEntry, title), 4u);
   ASSERT_EQ_U(offsetof(AozoraBookEntry, author), 68u);
   ASSERT_EQ_U(offsetof(AozoraBookEntry, filename), 100u);
+  ASSERT_EQ_U(offsetof(AozoraBookEntry, subtitle), 180u);
+  ASSERT_EQ_U(offsetof(AozoraBookEntry, variant), 228u);
   PASS();
 }
 
@@ -76,6 +79,22 @@ static void test_entry_field_sizes() {
   ASSERT_EQ_U(sizeof(e.title), 64u);
   ASSERT_EQ_U(sizeof(e.author), 32u);
   ASSERT_EQ_U(sizeof(e.filename), 80u);
+  ASSERT_EQ_U(sizeof(e.subtitle), 48u);
+  // variant の実測値は「新字新仮名」等の UTF-8 15 バイト。NUL 込みで余裕を持たせて 20。
+  ASSERT_EQ_U(sizeof(e.variant), 20u);
+  ASSERT_TRUE(sizeof(e.variant) > strlen("新字新仮名"));
+  PASS();
+}
+
+// v2 の先頭 180 バイトは v1 レコードとバイト単位で一致する。
+// これによりマイグレーションは「180 バイト読んで前方にコピー」で済む。
+static void test_v1_entry_layout_is_prefix_of_v2() {
+  ASSERT_EQ_U(sizeof(AozoraBookEntryV1), 180u);
+  ASSERT_EQ_U(offsetof(AozoraBookEntryV1, workId), offsetof(AozoraBookEntry, workId));
+  ASSERT_EQ_U(offsetof(AozoraBookEntryV1, title), offsetof(AozoraBookEntry, title));
+  ASSERT_EQ_U(offsetof(AozoraBookEntryV1, author), offsetof(AozoraBookEntry, author));
+  ASSERT_EQ_U(offsetof(AozoraBookEntryV1, filename), offsetof(AozoraBookEntry, filename));
+  ASSERT_EQ_U(sizeof(AozoraBookEntryV1), offsetof(AozoraBookEntry, subtitle));
   PASS();
 }
 
@@ -89,9 +108,12 @@ static void test_header_size() {
 }
 
 static void test_record_size() {
-  // レコードは status(1) + entry(180) = 181
+  // v2 レコードは status(1) + entry(248) = 249
   ASSERT_EQ_U(AozoraIndexManager::BIN_RECORD_SIZE, 1u + sizeof(AozoraBookEntry));
-  ASSERT_EQ_U(AozoraIndexManager::BIN_RECORD_SIZE, 181u);
+  ASSERT_EQ_U(AozoraIndexManager::BIN_RECORD_SIZE, 249u);
+  // v1 レコードは status(1) + entryV1(180) = 181
+  ASSERT_EQ_U(AozoraIndexManager::BIN_V1_RECORD_SIZE, 1u + sizeof(AozoraBookEntryV1));
+  ASSERT_EQ_U(AozoraIndexManager::BIN_V1_RECORD_SIZE, 181u);
   PASS();
 }
 
@@ -110,7 +132,10 @@ static void test_header_magic() {
   ASSERT_EQ_U(AozoraIndexManager::BIN_HEADER_MAGIC[1], 'Z');
   ASSERT_EQ_U(AozoraIndexManager::BIN_HEADER_MAGIC[2], 'B');
   ASSERT_EQ_U(AozoraIndexManager::BIN_HEADER_MAGIC[3], 'I');
-  ASSERT_EQ_U(AozoraIndexManager::BIN_HEADER_VERSION, 0x01u);
+  ASSERT_EQ_U(AozoraIndexManager::BIN_HEADER_VERSION, 0x02u);
+  ASSERT_EQ_U(AozoraIndexManager::BIN_HEADER_VERSION_V1, 0x01u);
+  // magic は v1/v2 で共通。バージョンバイトだけで判別する契約
+  ASSERT_TRUE(AozoraIndexManager::BIN_HEADER_VERSION != AozoraIndexManager::BIN_HEADER_VERSION_V1);
   PASS();
 }
 
@@ -225,24 +250,26 @@ static void test_sorted_workid_binary_search() {
 static void test_bin_layout_construction() {
   std::vector<uint8_t> file;
 
-  // Header (8B): magic "AZBI" + version 0x01 + reserved 0x00 0x00 0x00
+  // Header (8B): magic "AZBI" + version 0x02 + reserved 0x00 0x00 0x00
   file.push_back('A');
   file.push_back('Z');
   file.push_back('B');
   file.push_back('I');
-  file.push_back(0x01);
+  file.push_back(AozoraIndexManager::BIN_HEADER_VERSION);
   file.push_back(0x00);
   file.push_back(0x00);
   file.push_back(0x00);
   ASSERT_EQ_U(file.size(), AozoraIndexManager::BIN_HEADER_SIZE);
 
-  // 1 レコード目 (181B): status 0xA5 + entry
+  // 1 レコード目 (249B): status 0xA5 + entry
   file.push_back(AozoraIndexManager::STATUS_ACTIVE);
   AozoraBookEntry e1{};
   e1.workId = 42;
   snprintf(e1.title, sizeof(e1.title), "sample");
   snprintf(e1.author, sizeof(e1.author), "author1");
   snprintf(e1.filename, sizeof(e1.filename), "author1/42_sample.epub");
+  snprintf(e1.subtitle, sizeof(e1.subtitle), "subtitle1");
+  snprintf(e1.variant, sizeof(e1.variant), "新字新仮名");
   const uint8_t* e1bytes = reinterpret_cast<const uint8_t*>(&e1);
   file.insert(file.end(), e1bytes, e1bytes + sizeof(e1));
   ASSERT_EQ_U(file.size(), AozoraIndexManager::BIN_HEADER_SIZE + AozoraIndexManager::BIN_RECORD_SIZE);
@@ -295,6 +322,105 @@ static void test_bin_layout_construction() {
   ASSERT_EQ_U(activeOffsets.size(), 2u);
   ASSERT_EQ_U(activeOffsets[0], rec1Offset);
   ASSERT_EQ_U(activeOffsets[1], rec3Offset);
+
+  // subtitle / variant がレコードから復元できる
+  AozoraBookEntry back{};
+  memcpy(&back, file.data() + rec1Offset + 1, sizeof(back));
+  ASSERT_TRUE(strcmp(back.subtitle, "subtitle1") == 0);
+  ASSERT_TRUE(strcmp(back.variant, "新字新仮名") == 0);
+  PASS();
+}
+
+// ============================================================================
+// 7b. v1 → v2 マイグレーションの raw byte 契約
+// 既存の実機データ（v1 bin）が v2 に変換され、title/author/filename/workId が
+// 保持されることを検証する。tombstone は変換時に落ちる（active のみを引き継ぐ）。
+// ============================================================================
+
+static void test_v1_to_v2_migration_bytes() {
+  // --- v1 形式のファイルを組み立てる ---
+  std::vector<uint8_t> v1;
+  v1.push_back('A');
+  v1.push_back('Z');
+  v1.push_back('B');
+  v1.push_back('I');
+  v1.push_back(AozoraIndexManager::BIN_HEADER_VERSION_V1);
+  v1.push_back(0x00);
+  v1.push_back(0x00);
+  v1.push_back(0x00);
+
+  auto appendV1 = [&v1](uint8_t status, int32_t workId, const char* title, const char* author, const char* filename) {
+    v1.push_back(status);
+    AozoraBookEntryV1 e{};
+    e.workId = workId;
+    snprintf(e.title, sizeof(e.title), "%s", title);
+    snprintf(e.author, sizeof(e.author), "%s", author);
+    snprintf(e.filename, sizeof(e.filename), "%s", filename);
+    const uint8_t* bytes = reinterpret_cast<const uint8_t*>(&e);
+    v1.insert(v1.end(), bytes, bytes + sizeof(e));
+  };
+
+  appendV1(AozoraIndexManager::STATUS_ACTIVE, 100, "第一", "作家A", "作家A/100_第一.epub");
+  appendV1(AozoraIndexManager::STATUS_TOMBSTONE, 200, "削除済", "作家B", "作家B/200_削除済.epub");
+  appendV1(AozoraIndexManager::STATUS_ACTIVE, 300, "第三", "作家C", "作家C/300_第三.epub");
+
+  ASSERT_EQ_U(v1.size(), AozoraIndexManager::BIN_HEADER_SIZE + 3 * AozoraIndexManager::BIN_V1_RECORD_SIZE);
+  ASSERT_EQ_U(v1[4], AozoraIndexManager::BIN_HEADER_VERSION_V1);
+
+  // --- 実装 (migrateBinV1ToV2_) と同じ手順で v2 に変換する ---
+  std::vector<uint8_t> v2;
+  v2.push_back('A');
+  v2.push_back('Z');
+  v2.push_back('B');
+  v2.push_back('I');
+  v2.push_back(AozoraIndexManager::BIN_HEADER_VERSION);
+  v2.push_back(0x00);
+  v2.push_back(0x00);
+  v2.push_back(0x00);
+
+  int migrated = 0;
+  size_t off = AozoraIndexManager::BIN_HEADER_SIZE;
+  while (off + AozoraIndexManager::BIN_V1_RECORD_SIZE <= v1.size()) {
+    const uint8_t status = v1[off];
+    if (status == AozoraIndexManager::STATUS_ACTIVE) {
+      AozoraBookEntryV1 old{};
+      memcpy(&old, v1.data() + off + 1, sizeof(old));
+
+      AozoraBookEntry neu{};
+      neu.workId = old.workId;
+      snprintf(neu.title, sizeof(neu.title), "%s", old.title);
+      snprintf(neu.author, sizeof(neu.author), "%s", old.author);
+      snprintf(neu.filename, sizeof(neu.filename), "%s", old.filename);
+      // subtitle / variant は v1 に存在しないので空のまま
+
+      v2.push_back(AozoraIndexManager::STATUS_ACTIVE);
+      const uint8_t* bytes = reinterpret_cast<const uint8_t*>(&neu);
+      v2.insert(v2.end(), bytes, bytes + sizeof(neu));
+      migrated++;
+    }
+    off += AozoraIndexManager::BIN_V1_RECORD_SIZE;
+  }
+
+  // tombstone は落ち、active 2 件のみが引き継がれる
+  ASSERT_EQ(migrated, 2);
+  ASSERT_EQ_U(v2.size(), AozoraIndexManager::BIN_HEADER_SIZE + 2 * AozoraIndexManager::BIN_RECORD_SIZE);
+  ASSERT_EQ_U(v2[4], AozoraIndexManager::BIN_HEADER_VERSION);
+
+  // 変換後の各レコードが元の値を保持している
+  AozoraBookEntry r1{};
+  memcpy(&r1, v2.data() + AozoraIndexManager::BIN_HEADER_SIZE + 1, sizeof(r1));
+  ASSERT_EQ(r1.workId, 100);
+  ASSERT_TRUE(strcmp(r1.title, "第一") == 0);
+  ASSERT_TRUE(strcmp(r1.author, "作家A") == 0);
+  ASSERT_TRUE(strcmp(r1.filename, "作家A/100_第一.epub") == 0);
+  ASSERT_EQ_U(strlen(r1.subtitle), 0u);
+  ASSERT_EQ_U(strlen(r1.variant), 0u);
+
+  AozoraBookEntry r2{};
+  memcpy(&r2, v2.data() + AozoraIndexManager::BIN_HEADER_SIZE + AozoraIndexManager::BIN_RECORD_SIZE + 1, sizeof(r2));
+  ASSERT_EQ(r2.workId, 300);
+  ASSERT_TRUE(strcmp(r2.title, "第三") == 0);
+  ASSERT_TRUE(strcmp(r2.filename, "作家C/300_第三.epub") == 0);
   PASS();
 }
 
@@ -362,6 +488,7 @@ int main() {
       {"entry_layout_size", test_entry_layout_size},
       {"entry_field_offsets", test_entry_field_offsets},
       {"entry_field_sizes", test_entry_field_sizes},
+      {"v1_entry_layout_is_prefix_of_v2", test_v1_entry_layout_is_prefix_of_v2},
       {"header_size", test_header_size},
       {"record_size", test_record_size},
       {"status_bytes", test_status_bytes},
@@ -371,6 +498,7 @@ int main() {
       {"page_boundary_calculation", test_page_boundary_calculation},
       {"sorted_workid_binary_search", test_sorted_workid_binary_search},
       {"bin_layout_construction", test_bin_layout_construction},
+      {"v1_to_v2_migration_bytes", test_v1_to_v2_migration_bytes},
       {"tombstone_preserves_record_positions", test_tombstone_preserves_record_positions},
       {"workid_zero_is_invalid_marker", test_workid_zero_is_invalid_marker},
   };

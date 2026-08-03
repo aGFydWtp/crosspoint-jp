@@ -219,3 +219,56 @@ if (parsedSize != fileSize) {
     std::warning(std::format("Unparsed data detected: {} bytes remaining at offset 0x{:X}", fileSize - parsedSize, parsedSize));
 }
 ```
+
+## `.aozora_index.bin`
+
+青空文庫のダウンロード履歴。SD カード上の `/Aozora/.aozora_index.bin` に固定長の
+append-only レコードで保存する。実装は [src/AozoraIndexManager.cpp](../src/AozoraIndexManager.cpp)。
+
+削除は tombstone マーク（status バイトの書き換え）で行うため、レコードのオフセットは
+一度決まったら変わらない。`AozoraIndexManager` はメモリ上に workId のソート済み配列と
+アクティブレコードのオフセット配列のみを保持し、title などの詳細は表示時にファイルから
+ページ単位で読み出す。
+
+### Header (8 bytes)
+
+| Offset | Size | 内容 |
+|--------|------|------|
+| 0 | 4 | magic `"AZBI"` |
+| 4 | 1 | format version |
+| 5 | 3 | reserved (0x00) |
+
+### Record
+
+`status(1) + entry` の固定長。status は `0xA5` = active、`0x00` = tombstone。
+（`0x00` と `0xFF` のいずれも active と衝突しない値を選んでいる）
+
+#### Version 2 (current) — record size 249 bytes
+
+| Offset | Size | フィールド |
+|--------|------|-----------|
+| 0 | 4 | `int32_t workId`（リトルエンディアン） |
+| 4 | 64 | `char title[64]` |
+| 68 | 32 | `char author[32]` |
+| 100 | 80 | `char filename[80]`（`/Aozora` からの相対パス） |
+| 180 | 48 | `char subtitle[48]` |
+| 228 | 20 | `char variant[20]`（文字遣い。「新字新仮名」等 UTF-8 15 バイト） |
+
+#### Version 1 (legacy) — record size 181 bytes
+
+v2 の先頭 180 バイトと完全に一致する（`workId` / `title` / `author` / `filename` のみ）。
+
+起動時に version 1 を検出すると `migrateBinV1ToV2_()` が `.bin.tmp` へ v2 形式で書き出し、
+rename による atomic swap で置き換える。tombstone レコードはこの機会に落とされる。
+マイグレーション中に電源が落ちても元の v1 ファイルは無傷で、次回起動時に `.tmp` が掃除される。
+
+### バージョン更新ルール
+
+レコードのバイナリ構造を変更する場合は、変更前に `BIN_HEADER_VERSION` を
+インクリメントし、旧バージョンからのマイグレーションを追加すること。
+契約は [test/aozora_index/AozoraIndexTest.cpp](../test/aozora_index/AozoraIndexTest.cpp) の
+ホストテストで固定されている（`./test/run_aozora_index_test.sh` で実行）。
+
+不明なバージョンや magic 不一致を検出した場合は bin を破棄し、
+`/Aozora/著者名/workId_タイトル.epub` の配置から `rebuildFromDirectoryScan_()` で再構築する。
+この経路では副題・文字遣いは復元できず空欄になる。

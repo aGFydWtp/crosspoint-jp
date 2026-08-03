@@ -35,6 +35,15 @@ class SdCardFont {
   // Returns the 12.4 fixed-point advance, or 0 if not found.
   uint16_t getAdvance(uint32_t codepoint, uint8_t style) const;
 
+  // advance テーブルの参照結果。getAdvance() が返す 0 の意味を呼び出し側が
+  // 区別できるようにするためのもの。
+  enum class AdvanceLookup : uint8_t {
+    NotCached,  // テーブルに載っていない（このテキスト用に構築されていない）
+    Found,      // グリフがあり advanceOut が有効（幅0の結合文字などもここ）
+    NoGlyph,    // フォントにグリフが無いと分かっている（renderChar は '?' を描く）
+  };
+  AdvanceLookup lookupAdvance(uint32_t codepoint, uint8_t style, uint16_t& advanceOut) const;
+
   // Returns true if advance table is populated for at least one style.
   bool hasAdvanceTable() const;
 
@@ -185,13 +194,46 @@ class SdCardFont {
 
   // Compact advance-only table for layout measurement (per-style).
   // Built by buildAdvanceTable(), queried by getAdvance().
+  //
+  // エントリは呼び出しをまたいで**累積**する。レイアウトはテキストブロック
+  // （段落 または 400語）ごとに buildAdvanceTable() を呼ぶため、毎回作り直すと
+  // 同じ字を何度も .cpfont から読み直すことになる（Issue #99: 章ビルド時間の
+  // 88.8% がこれだった）。累積させることで、1コードポイントにつき SD 読みは
+  // 1セクションビルドあたり最大1回で済む。
+  //
+  // 寿命は clearAdvanceTables() まで。実際には clearCache() 経由で
+  // (a) セクションビルドの直前（EpubReaderActivity）と
+  // (b) 毎ページの描画前（FontCacheManager::PrewarmScope の ctor）
+  // に破棄される。つまり読書中に載りっぱなしにはならず、常駐するのは
+  // 1セクションビルド中および1ページ描画中だけ。
   struct AdvanceEntry {
     uint32_t codepoint;
     uint16_t advanceX;  // 12.4 fixed-point
-  };
-  AdvanceEntry* advanceTable_[MAX_STYLES] = {};
+    uint8_t hasGlyph;   // 0 = このフォントにグリフが無い（ネガティブキャッシュ。再探索を防ぐ）
+  };  // アラインメント込みで 8 バイト
+
+  // 1スタイルあたりの上限。4096エントリ = 32KB。日本語の長編でも異なり字は
+  // 3,000字程度（JIS第1水準 ≒ 3,000）なので通常は到達しない。
+  static constexpr uint32_t ADVANCE_TABLE_INITIAL_CAP = 512;
+  static constexpr uint32_t ADVANCE_TABLE_MAX_CAP = 4096;
+  // 1回の呼び出しで新規に取得するコードポイント数の上限。
+  static constexpr uint32_t MAX_MISSES_PER_CALL = 1024;
+
+  AdvanceEntry* advanceTable_[MAX_STYLES] = {};  // コードポイント昇順。realloc で伸長するため malloc 系で管理
   uint32_t advanceTableSize_[MAX_STYLES] = {};
+  uint32_t advanceTableCap_[MAX_STYLES] = {};
+
+  // 累積テーブルが上限に達した（または伸長に失敗した）ときの退避先。
+  // buildAdvanceTable() の呼び出しごとに破棄されるブロックローカルのテーブル。
+  // これが無いと、上限到達の瞬間から全ブロックが「毎回作り直し」に戻る性能の崖ができる。
+  AdvanceEntry* advanceSpill_[MAX_STYLES] = {};
+  uint32_t advanceSpillSize_[MAX_STYLES] = {};
+
   void clearAdvanceTables();
+  void clearAdvanceSpill();
+  bool ensureAdvanceCapacity(uint8_t styleIdx, uint32_t needed);
+  const AdvanceEntry* findAdvanceEntry(uint8_t styleIdx, uint32_t codepoint) const;
+  int buildAdvanceTableForStyle(uint8_t styleIdx, const char* utf8Text);
 
   Stats stats_;
   uint32_t contentHash_ = 0;

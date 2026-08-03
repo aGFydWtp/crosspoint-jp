@@ -1,0 +1,124 @@
+name: Release (dispatch)
+
+# Actions 画面から実行すると、直近の CrossPointJP ベースタグ (v0.x.y) に
+# -forked.<N> を連番で付けたタグを打ち、release.yml を起動する。ビルドと
+# GitHub Release 作成は release.yml 側の仕事なので、このワークフロー自体はビルドしない。
+#
+# fork 運用: このリポジトリは zrn-ns/crosspoint-jp (CrossPointJP) の追従フォークで、
+# 独自に x.y.z を進めることはない。リリースは常に「取り込んだベース版 + fork 差分」
+# なので、タグは vX.Y.Z-forked.N 形式に固定する (N は同じベース版の通し番号)。
+# バージョンの情報源は git tag のみ (scripts/git_branch.py が git describe で拾う)。
+#
+# これによりリリース作業は「Actions でボタンを押す」だけになる。
+# ローカルでの `git tag` / `git push --tags` は不要。
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: '算出結果を表示するだけでタグは打たない'
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      # release.yml を workflow_dispatch で起動するのに必要
+      actions: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # タグ計算に全履歴とタグが要る
+          fetch-depth: 0
+
+      - name: Refuse to release from a non-default branch
+        if: github.ref_name != github.event.repository.default_branch
+        run: |
+          echo "::error::リリースは ${{ github.event.repository.default_branch }} からのみ実行できます (今回: ${{ github.ref_name }})"
+          exit 1
+
+      - name: Compute next version
+        id: version
+        run: |
+          set -euo pipefail
+
+          # このブランチの祖先にある直近のリリースタグを見る。CrossPointJP を merge で
+          # 取り込んでいるため、取り込み済みの最新ベース版 (v0.1.16 など) がここに出る。
+          latest="$(git describe --tags --match 'v[0-9]*.[0-9]*.[0-9]*' --abbrev=0 2>/dev/null || echo '')"
+          if [ -z "${latest}" ]; then
+            echo "::error::v*.*.* 形式のタグが見つかりません。最初のタグは手動で作成してください。"
+            exit 1
+          fi
+
+          # -forked.N / -rcN サフィックスを落として素の vX.Y.Z にする
+          base="v$(printf '%s' "${latest#v}" | cut -d- -f1)"
+
+          # 既存の v<base>-forked / v<base>-forked.<N> タグから次の連番を採番。
+          # 番号付けは OtaUpdater::parseForkedSeq と対で、素の "-forked" は 0 扱い。
+          LAST=$(git tag -l "${base}-forked" "${base}-forked.*" \
+            | sed -e "s/^${base}-forked//" -e 's/^\.//' -e 's/^$/0/' \
+            | sort -n | tail -n1)
+          next="${base}-forked.$(( ${LAST:-0} + 1 ))"
+
+          if git rev-parse -q --verify "refs/tags/${next}" >/dev/null; then
+            echo "::error::タグ ${next} は既に存在します"
+            exit 1
+          fi
+
+          echo "latest=${latest}" >> "$GITHUB_OUTPUT"
+          echo "next=${next}" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### リリース"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| 直近のタグ | \`${latest}\` |"
+            echo "| ベース版 | \`${base}\` |"
+            echo "| 新しいタグ | \`${next}\` |"
+            echo "| commit | \`$(git rev-parse --short HEAD)\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Create and push tag
+        if: inputs.dry_run != true
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "${{ steps.version.outputs.next }}" \
+            -m "${{ steps.version.outputs.next }}"
+          git push origin "${{ steps.version.outputs.next }}"
+
+      # GITHUB_TOKEN で push したタグは push イベントを発生させない（ワークフローの
+      # 無限ループを防ぐための GitHub 側の仕様）ため、release.yml の
+      # `on: push: tags` は発火しない。workflow_dispatch と repository_dispatch は
+      # この制限の例外なので、タグ ref を指定して明示的に起動する。
+      # https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows
+      - name: Trigger release build
+        if: inputs.dry_run != true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.version.outputs.next }}
+        run: |
+          set -euo pipefail
+          # push 直後は API 側でタグ ref がまだ見えないことがあるのでリトライする
+          for attempt in 1 2 3 4 5; do
+            if gh workflow run release.yml --ref "${TAG}"; then
+              echo "" >> "$GITHUB_STEP_SUMMARY"
+              echo "タグ \`${TAG}\` を push し、release.yml を起動しました。ビルドと Release 作成はそちらで進みます。" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            echo "release.yml の起動に失敗しました (${attempt}/5)。再試行します。"
+            sleep 5
+          done
+          echo "::error::release.yml の起動に失敗しました。タグ ${TAG} は作成済みなので、Actions から Compile Release をこのタグで手動実行してください。"
+          exit 1
+
+      - name: Dry run notice
+        if: inputs.dry_run == true
+        run: |
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "**dry run のためタグは作成していません。**" >> "$GITHUB_STEP_SUMMARY"

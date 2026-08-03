@@ -19,7 +19,13 @@ class FontDownloadActivity : public Activity {
   void onExit() override;
   void loop() override;
   void render(RenderLock&&) override;
-  bool preventAutoSleep() override { return state_ == LOADING_MANIFEST || state_ == DOWNLOADING; }
+  bool preventAutoSleep() override {
+    return state_ == LOADING_MANIFEST || state_ == DOWNLOADING ||
+           // The download is synchronous and blocks the main loop until it
+           // completes, so activityManager.preventAutoSleep() is never polled
+           // during downloading.
+           state_ == COMPLETE || state_ == ERROR;
+  }
   bool skipLoopDelay() override { return true; }
 
  private:
@@ -33,17 +39,26 @@ class FontDownloadActivity : public Activity {
     ERROR,
   };
 
+  // Fixed-size records rather than std::string members. The manifest holds 25
+  // families and 108 files; as std::string those cost 200+ separate heap
+  // allocations scattered across the arena, and the per-family files vector
+  // grew without reserve() on top of that. The resulting fragmentation is what
+  // starved the ~45-55KB contiguous block a TLS handshake needs — the font
+  // download failed with ESP_ERR_HTTP_CONNECT while 70KB was still free but the
+  // largest block was only 37KB. Capacities are the measured manifest maxima
+  // (file name 30, family name 20, description 72) plus headroom; anything
+  // longer is truncated, which only shortens a label.
   struct ManifestFile {
-    std::string name;
-    size_t size = 0;
+    char name[40] = {0};
+    uint32_t size = 0;
   };
 
   struct ManifestFamily {
-    std::string name;
-    std::string description;
-    std::vector<std::string> styles;
-    std::vector<ManifestFile> files;
-    size_t totalSize = 0;
+    char name[32] = {0};
+    char description[80] = {0};
+    uint16_t fileStart = 0;  // index of this family's first entry in allFiles_
+    uint8_t fileCount = 0;
+    uint32_t totalSize = 0;
     bool installed = false;
     bool hasUpdate = false;
   };
@@ -52,9 +67,11 @@ class FontDownloadActivity : public Activity {
   FontInstaller fontInstaller_;
   ButtonNavigator buttonNavigator_;
 
-  // Manifest data
-  std::string baseUrl_;
+  // Manifest data. Two heap blocks total: one for families_, one for the flat
+  // file list every family indexes into.
+  char baseUrl_[96] = {0};
   std::vector<ManifestFamily> families_;
+  std::vector<ManifestFile> allFiles_;
   int selectedIndex_ = 0;
 
   // Download progress
@@ -64,6 +81,9 @@ class FontDownloadActivity : public Activity {
   size_t fileTotal_ = 0;
   int downloadingFamilyIndex_ = 0;
   std::string errorMessage_;
+  // Second error line: err/http/heap diagnostics. Kept separate from
+  // errorMessage_ so the failing file name stays readable on its own line.
+  std::string errorDetail_;
 
   void onWifiSelectionComplete(bool success);
   bool fetchAndParseManifest();

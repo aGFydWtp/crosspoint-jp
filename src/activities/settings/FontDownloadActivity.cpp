@@ -14,7 +14,12 @@
 #include "components/UITheme.h"
 #include "fontIds.h"
 #include "network/HttpDownloader.h"
+#include "network/TlsHeapReclaim.h"
 #include "util/StringUtils.h"
+
+// Retries per HTTPS request. Matches the Aozora endpoints; see the download
+// loop for why a handshake can fail once and succeed a second later.
+static constexpr int DOWNLOAD_MAX_RETRIES = 3;
 
 FontDownloadActivity::FontDownloadActivity(GfxRenderer& renderer, MappedInputManager& mappedInput)
     : Activity("FontDownload", renderer, mappedInput), fontInstaller_(sdFontSystem.registry()) {}
@@ -51,13 +56,7 @@ void FontDownloadActivity::onWifiSelectionComplete(const bool success) {
   }
   requestUpdateAndWait();
 
-  // Free ExternalFont LRU caches (~34KB each) to make room for TLS buffers.
-  FontManager& fm = FontManager::getInstance();
-  ExternalFont* uiFont = fm.getActiveUiFont();
-  ExternalFont* readerFont = fm.getActiveFont();
-  if (uiFont) uiFont->unload();
-  if (readerFont) readerFont->unload();
-  LOG_DBG("FONT", "Freed font caches, heap=%d", ESP.getFreeHeap());
+  reclaimHeapForTls(renderer, "FONT");
 
   if (!fetchAndParseManifest()) {
     {
@@ -81,14 +80,38 @@ bool FontDownloadActivity::fetchAndParseManifest() {
   // This avoids holding both TLS buffers and manifest data in RAM.
   static constexpr const char* MANIFEST_TMP = "/fonts_manifest.tmp";
 
+  errorDetail_.clear();  // don't let a previous failure's diagnostics linger
   const size_t heapBefore = ESP.getFreeHeap();
-  auto result = HttpDownloader::downloadToFile(FONT_MANIFEST_URL, MANIFEST_TMP, nullptr);
+  // LARGE buffers: the manifest lives on a GitHub release, which redirects to a
+  // signed release-assets.githubusercontent.com URL ~860 bytes long. That request
+  // line does not fit the default 512-byte TX buffer, so the reopen after the 302
+  // fails with ESP_FAIL before any byte arrives — see HttpDownloader::BufferProfile.
+  HttpDownloader::DownloadError result = HttpDownloader::HTTP_ERROR;
+  for (int attempt = 0; attempt < DOWNLOAD_MAX_RETRIES; attempt++) {
+    if (attempt > 0) {
+      LOG_DBG("FONT", "Manifest retry %d/%d", attempt + 1, DOWNLOAD_MAX_RETRIES);
+      delay(1000);
+    }
+    result = HttpDownloader::downloadToFile(FONT_MANIFEST_URL, MANIFEST_TMP, nullptr, nullptr, "", "",
+                                            HttpDownloader::BufferProfile::LARGE);
+    if (result == HttpDownloader::OK) break;
+    LOG_ERR("FONT", "Manifest attempt %d failed: err=%d http=%d tls=%d/%X blk=%d", attempt + 1,
+            static_cast<int>(result), HttpDownloader::lastHttpCode, HttpDownloader::lastTlsError,
+            HttpDownloader::lastTlsFlags, static_cast<int>(ESP.getMaxAllocHeap()));
+    Storage.remove(MANIFEST_TMP);
+  }
   if (result != HttpDownloader::OK) {
     LOG_ERR("FONT", "Manifest fetch failed (err=%d, http=%d, heap=%zu)", result, HttpDownloader::lastHttpCode,
             heapBefore);
-    char buf[80];
-    snprintf(buf, sizeof(buf), "err=%d http=%d heap=%zuKB", static_cast<int>(result), HttpDownloader::lastHttpCode,
-             heapBefore / 1024);
+    char buf[160];
+    // blk = largest contiguous block; the TLS handshake needs a ~16.5KB one for
+    // the inbound record buffer, so free heap alone cannot distinguish
+    // exhaustion from fragmentation. tls is the mbedtls/esp-tls reason behind an
+    // ESP_ERR_HTTP_CONNECT (0 = never reached TLS, so DNS or the TCP connect).
+    snprintf(buf, sizeof(buf), "err=%d http=%d tls=%d/%X crt=%d/%X p=%d/%d f=%d/%d", static_cast<int>(result),
+             HttpDownloader::lastHttpCode, HttpDownloader::lastTlsError, HttpDownloader::lastTlsFlags,
+             HttpDownloader::lastCrtDiag, HttpDownloader::lastCrtErr, HttpDownloader::lastPreHeapKb,
+             HttpDownloader::lastPreBlkKb, HttpDownloader::lastCrtHeapKb, HttpDownloader::lastCrtBlkKb);
     errorMessage_ = buf;
     Storage.remove(MANIFEST_TMP);
     return false;
@@ -115,38 +138,52 @@ bool FontDownloadActivity::fetchAndParseManifest() {
     return false;
   }
 
-  baseUrl_ = doc["baseUrl"] | "";
+  snprintf(baseUrl_, sizeof(baseUrl_), "%s", doc["baseUrl"] | "");
   families_.clear();
+  allFiles_.clear();
 
   JsonArray familiesArr = doc["families"].as<JsonArray>();
   families_.reserve(familiesArr.size());
 
+  // Count the files up front so allFiles_ is reserved exactly. Walking the
+  // JsonArray twice is far cheaper than the reallocate-copy-free cycles a
+  // growing vector would inflict on an already tight arena. The manifest's
+  // "styles" array is deliberately ignored: it is empty for every family and
+  // nothing reads it.
+  size_t fileCountTotal = 0;
+  for (JsonObject fObj : familiesArr) fileCountTotal += fObj["files"].as<JsonArray>().size();
+  allFiles_.reserve(fileCountTotal);
+
   for (JsonObject fObj : familiesArr) {
     ManifestFamily family;
-    family.name = fObj["name"] | "";
-    family.description = fObj["description"] | "";
+    snprintf(family.name, sizeof(family.name), "%s", fObj["name"] | "");
+    snprintf(family.description, sizeof(family.description), "%s", fObj["description"] | "");
 
-    for (JsonVariant s : fObj["styles"].as<JsonArray>()) {
-      family.styles.push_back(s.as<std::string>());
-    }
-
+    family.fileStart = static_cast<uint16_t>(allFiles_.size());
+    family.fileCount = 0;
     family.totalSize = 0;
     for (JsonObject fileObj : fObj["files"].as<JsonArray>()) {
+      if (family.fileCount == UINT8_MAX) {
+        LOG_ERR("FONT", "Too many files in family %s; ignoring the rest", family.name);
+        break;
+      }
       ManifestFile file;
-      file.name = fileObj["name"] | "";
-      file.size = fileObj["size"] | 0;
+      snprintf(file.name, sizeof(file.name), "%s", fileObj["name"] | "");
+      file.size = fileObj["size"] | 0u;
       family.totalSize += file.size;
-      family.files.push_back(std::move(file));
+      allFiles_.push_back(file);
+      family.fileCount++;
     }
 
-    family.installed = fontInstaller_.isFamilyInstalled(family.name.c_str());
+    family.installed = fontInstaller_.isFamilyInstalled(family.name);
 
     // Detect updates by comparing manifest file sizes with files on disk.
     // Not a checksum, but a size mismatch reliably indicates a rebuild in practice.
     if (family.installed) {
-      for (const auto& file : family.files) {
+      for (uint8_t i = 0; i < family.fileCount; i++) {
+        const auto& file = allFiles_[family.fileStart + i];
         char path[128];
-        FontInstaller::buildFontPath(family.name.c_str(), file.name.c_str(), path, sizeof(path));
+        FontInstaller::buildFontPath(family.name, file.name, path, sizeof(path));
         FsFile f;
         if (Storage.openFileForRead("FONT", path, f)) {
           size_t actual = f.fileSize();
@@ -196,24 +233,25 @@ size_t FontDownloadActivity::totalUninstalledSize() const {
 void FontDownloadActivity::downloadFamily(ManifestFamily& family) {
   {
     RenderLock lock(*this);
+    errorDetail_.clear();  // don't let a previous failure's diagnostics linger
     state_ = DOWNLOADING;
     downloadingFamilyIndex_ = static_cast<int>(&family - families_.data());
     currentFileIndex_ = 0;
-    currentFileTotal_ = family.files.size();
+    currentFileTotal_ = family.fileCount;
     fileProgress_ = 0;
     fileTotal_ = 0;
   }
   requestUpdateAndWait();
 
-  if (!fontInstaller_.ensureFamilyDir(family.name.c_str())) {
+  if (!fontInstaller_.ensureFamilyDir(family.name)) {
     RenderLock lock(*this);
     state_ = ERROR;
     errorMessage_ = "Failed to create font directory";
     return;
   }
 
-  for (size_t i = 0; i < family.files.size(); i++) {
-    const auto& file = family.files[i];
+  for (uint8_t i = 0; i < family.fileCount; i++) {
+    const auto& file = allFiles_[family.fileStart + i];
 
     {
       RenderLock lock(*this);
@@ -223,25 +261,80 @@ void FontDownloadActivity::downloadFamily(ManifestFamily& family) {
     }
     requestUpdateAndWait();
 
+    // Reclaim before every file, not just once on entry: drawing the progress
+    // screen between files re-fills the glyph caches this frees, so without it
+    // each successive file starts from a more fragmented arena than the last.
+    // Cheap insurance rather than a fix — the failures that motivated it were
+    // caused by the record buffers being twice their configured size, which
+    // scripts/patch_espidf_libcopy.py resolved.
+    reclaimHeapForTls(renderer, "FONT");
+
     char destPath[128];
-    FontInstaller::buildFontPath(family.name.c_str(), file.name.c_str(), destPath, sizeof(destPath));
+    FontInstaller::buildFontPath(family.name, file.name, destPath, sizeof(destPath));
 
-    std::string url = baseUrl_ + file.name;
+    // Stack buffer, not std::string concatenation: this runs immediately before
+    // the TLS handshake, where a transient heap allocation is exactly what the
+    // contiguous-block budget cannot afford. baseUrl_ is 67 bytes, names reach 30.
+    char url[192];
+    snprintf(url, sizeof(url), "%s%s", baseUrl_, file.name);
 
-    auto result = HttpDownloader::downloadToFile(url, destPath, [this](size_t downloaded, size_t total) {
-      fileProgress_ = downloaded;
-      // A chunked response reports total == 0; keep the manifest-declared size in that case so
-      // the progress bar still has a denominator.
-      if (total > 0) fileTotal_ = total;
-      requestUpdate(true);
-      return true;
-    });
+    // Fire the render task only on whole-percent change. HttpDownloader reads in
+    // 1KB chunks, so a per-chunk update would wake the render task ~400 times for
+    // a single font file; that framebuffer work contends with TLS on the internal
+    // arena and e-ink cannot repaint faster than a percent tick anyway. Same
+    // reasoning as the OTA download — see OtaUpdater::installUpdate.
+    // Retry like the Aozora endpoints do. Each file is a fresh TLS handshake,
+    // and on a heap this tight a handshake can fail on contiguous space alone —
+    // either on the 16.5KB record buffer or, later, on the small allocations
+    // mbedtls needs to verify the chain (tls=12288). A second later, after the
+    // previous connection's buffers have been returned, the same request
+    // usually goes through. Without this, one unlucky file aborts the whole
+    // run and the user has to start over.
+    HttpDownloader::DownloadError result = HttpDownloader::HTTP_ERROR;
+    for (int attempt = 0; attempt < DOWNLOAD_MAX_RETRIES; attempt++) {
+      if (attempt > 0) {
+        LOG_DBG("FONT", "Retry %d/%d for %s (heap=%d blk=%d)", attempt + 1, DOWNLOAD_MAX_RETRIES, file.name,
+                static_cast<int>(ESP.getFreeHeap()), static_cast<int>(ESP.getMaxAllocHeap()));
+        delay(1000);
+      }
+      int lastReportedPct = -1;
+      // LARGE buffers for the same reason as the manifest fetch: the signed
+      // redirect target runs ~900 bytes for the longest font file name.
+      result = HttpDownloader::downloadToFile(
+          url, destPath,
+          [this, &lastReportedPct](size_t downloaded, size_t total) {
+            const int pct = total > 0 ? static_cast<int>(static_cast<uint64_t>(downloaded) * 100 / total) : 0;
+            if (pct == lastReportedPct) return;
+            lastReportedPct = pct;
+            fileProgress_ = downloaded;
+            fileTotal_ = total;
+            requestUpdate(true);
+          },
+          nullptr, "", "", HttpDownloader::BufferProfile::LARGE);
+      if (result == HttpDownloader::OK) break;
+      LOG_ERR("FONT", "Attempt %d failed: %s err=%d http=%d tls=%d/%X heap=%d blk=%d got=%zu", attempt + 1, file.name,
+              static_cast<int>(result), HttpDownloader::lastHttpCode, HttpDownloader::lastTlsError,
+              HttpDownloader::lastTlsFlags, static_cast<int>(ESP.getFreeHeap()),
+              static_cast<int>(ESP.getMaxAllocHeap()), fileProgress_);
+    }
 
     if (result != HttpDownloader::OK) {
-      LOG_ERR("FONT", "Download failed: %s (%d)", file.name.c_str(), result);
+      LOG_ERR("FONT", "Download failed: %s err=%d http=%d heap=%d blk=%d got=%zu", file.name, static_cast<int>(result),
+              HttpDownloader::lastHttpCode, static_cast<int>(ESP.getFreeHeap()),
+              static_cast<int>(ESP.getMaxAllocHeap()), fileProgress_);
+      char buf[160];
+      // Same diagnostics as the manifest fetch: err is DownloadError, http is
+      // either an HTTP status or a negated esp_err_t, tls is the TLS-layer
+      // reason behind it, and blk is the largest contiguous block. got is how
+      // far the transfer got before it died, rounded to the last whole percent.
+      snprintf(buf, sizeof(buf), "err=%d http=%d crt=%d/%X a=%d@%dK/%d p=%d/%d got=%dKB", static_cast<int>(result),
+               HttpDownloader::lastHttpCode, HttpDownloader::lastCrtDiag, HttpDownloader::lastCrtErr,
+               HttpDownloader::lastFailSize, HttpDownloader::lastFailFreeKb, HttpDownloader::lastFailBlk,
+               HttpDownloader::lastPreHeapKb, HttpDownloader::lastPreBlkKb, static_cast<int>(fileProgress_ / 1024));
       RenderLock lock(*this);
       state_ = ERROR;
-      errorMessage_ = "Download failed: " + file.name;
+      errorMessage_ = std::string("Download failed: ") + file.name;
+      errorDetail_ = buf;
       return;
     }
 
@@ -250,7 +343,7 @@ void FontDownloadActivity::downloadFamily(ManifestFamily& family) {
       Storage.remove(destPath);
       RenderLock lock(*this);
       state_ = ERROR;
-      errorMessage_ = "Invalid font file: " + file.name;
+      errorMessage_ = std::string("Invalid font file: ") + file.name;
       return;
     }
   }
@@ -385,7 +478,7 @@ void FontDownloadActivity::render(RenderLock&&) {
 
       size_t totalFiles = 0;
       for (const auto& f : families_) {
-        if (!f.installed) totalFiles += f.files.size();
+        if (!f.installed) totalFiles += f.fileCount;
       }
       renderer.drawText(UI_10_FONT_ID, metrics.contentSidePadding, y,
                         (std::string(tr(STR_FILES_LABEL)) + std::to_string(totalFiles)).c_str());
@@ -399,7 +492,7 @@ void FontDownloadActivity::render(RenderLock&&) {
       renderer.drawCenteredText(UI_10_FONT_ID, y, confirmText.c_str());
       y += lineHeight + metrics.verticalSpacing;
       renderer.drawText(UI_10_FONT_ID, metrics.contentSidePadding, y,
-                        (std::string(tr(STR_FILES_LABEL)) + std::to_string(family.files.size())).c_str());
+                        (std::string(tr(STR_FILES_LABEL)) + std::to_string(family.fileCount)).c_str());
       y += lineHeight + metrics.verticalSpacing;
       renderer.drawText(UI_10_FONT_ID, metrics.contentSidePadding, y,
                         (std::string(tr(STR_SIZE_LABEL)) + StringUtils::formatSize(family.totalSize)).c_str());
@@ -438,8 +531,22 @@ void FontDownloadActivity::render(RenderLock&&) {
     if (!errorMessage_.empty()) {
       renderer.drawCenteredText(UI_10_FONT_ID, centerY + metrics.verticalSpacing, errorMessage_.c_str());
     }
+    if (!errorDetail_.empty()) {
+      renderer.drawCenteredText(UI_10_FONT_ID, centerY + metrics.verticalSpacing + lineHeight, errorDetail_.c_str());
+    }
     const auto labels = mappedInput.mapLabels(tr(STR_BACK), "", "", "");
     GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
+  }
+
+  // Live heap readout. Added to measure a reproduction that had resisted
+  // guesswork — downloads succeeded right after boot and failed after a reading
+  // session — and kept because comparing this number across states is the
+  // fastest way to tell a heap regression from a network one.
+  if (SETTINGS.debugDisplay) {
+    char dbg[48];
+    snprintf(dbg, sizeof(dbg), "heap=%dK blk=%dK", static_cast<int>(ESP.getFreeHeap() / 1024),
+             static_cast<int>(ESP.getMaxAllocHeap() / 1024));
+    renderer.drawText(UI_10_FONT_ID, metrics.contentSidePadding, pageHeight - lineHeight * 2, dbg);
   }
 
   renderer.displayBuffer();

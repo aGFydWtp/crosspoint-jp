@@ -10,6 +10,7 @@
 
 #include "../../Epub.h"
 #include "../Page.h"
+#include "../SectionBuildPerf.h"
 #include "../blocks/TableRowBlock.h"
 #include "../blocks/TextBlock.h"
 #include "../converters/ImageDecoderFactory.h"
@@ -338,6 +339,7 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
   }
 
   if (matches(name, IMAGE_TAGS, NUM_IMAGE_TAGS)) {
+    SECTION_PERF_SCOPE(imageUs);
     std::string src;
     std::string alt;
     if (atts != nullptr) {
@@ -1270,7 +1272,9 @@ bool ChapterHtmlSlimParser::parseAndBuildPages() {
       return false;
     }
 
+    SECTION_PERF_BEGIN(readStartUs);
     const size_t len = file.read(buf, PARSE_BUFFER_SIZE);
+    SECTION_PERF_END(readStartUs, readUs);
 
     if (len == 0 && file.available() > 0) {
       LOG_ERR("EHP", "File read error");
@@ -1284,7 +1288,11 @@ bool ChapterHtmlSlimParser::parseAndBuildPages() {
 
     done = file.available() == 0;
 
-    if (XML_ParseBuffer(parser, static_cast<int>(len), done) == XML_STATUS_ERROR) {
+    SECTION_PERF_BEGIN(parseStartUs);
+    const XML_Status parseStatus = XML_ParseBuffer(parser, static_cast<int>(len), done);
+    SECTION_PERF_END(parseStartUs, parseUs);
+
+    if (parseStatus == XML_STATUS_ERROR) {
       LOG_ERR("EHP", "Parse error at line %lu:\n%s", XML_GetCurrentLineNumber(parser),
               XML_ErrorString(XML_GetErrorCode(parser)));
       XML_StopParser(parser, XML_FALSE);                // Stop any pending processing

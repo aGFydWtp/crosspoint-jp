@@ -952,10 +952,11 @@ Philosophy: We are building a dedicated e-reader, not a Swiss Army knife. If a f
 
 ## リモート構成
 
+このリポジトリ (aGFydWtp/crosspoint-jp) は zrn-ns/crosspoint-jp (CrossPointJP) の追従フォーク。
+
 ```
-origin   → zrn-ns/crosspoint-jp (フォーク)
-upstream → crosspoint-reader/crosspoint-reader (本家)
-cjk-fork → aBER0724/crosspoint-reader-cjk (CJKフォーク)
+origin → aGFydWtp/crosspoint-jp (このフォーク)
+zrn    → zrn-ns/crosspoint-jp (CrossPointJP。取り込み元)
 ```
 
 ## 2つのフォントシステム
@@ -1017,13 +1018,15 @@ pio run -t upload --upload-port /dev/tty.usbmodem101
 - RAM: ~32% (104KB / 328KB)
 - Flash: ~85% (5.8MB / 6.8MB)
 
-## upstream追従
+## CrossPointJP (zrn) 追従
 
 ```bash
-git fetch upstream
-git checkout personal/main
-git merge upstream/<新バージョンタグ>
-# コンフリクト解決: CJK変更・フォントシステム部分を優先
+git fetch zrn --tags
+git checkout -b merge/zrn-<日付> master
+git merge zrn/master
+# コンフリクト解決: fork 固有部分 (OTA の自リポジトリ URL / parseForkedSeq /
+# -forked.N リリースワークフロー / Cloudflare フラッシャー / OPDS verifyTls) を保持し、
+# それ以外は zrn 側を優先
 ```
 
 **rebaseではなくmergeを使用**（機能ごとのマージ履歴を保持するため）。
