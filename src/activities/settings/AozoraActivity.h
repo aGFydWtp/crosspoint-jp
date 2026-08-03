@@ -55,6 +55,10 @@ class AozoraActivity : public Activity {
     char kana[48];
     char ndc[8];
     char author[48];
+    char subtitle[64];  // API の subtitle。CJK 21 文字相当
+    // API の variant（文字遣い）。実測値は「新字新仮名」「新字旧仮名」「旧字旧仮名」の
+    // 3 種でいずれも UTF-8 15 バイト。char[16] では NUL 込みで余裕がないため 20 とする。
+    char variant[20];
   };
 
   State state_ = WIFI_SELECTION;
@@ -79,10 +83,19 @@ class AozoraActivity : public Activity {
   std::deque<AuthorEntry> authors_;
   std::deque<WorkEntry> works_;
 
+  // 同名作品の識別用ビットマスク。works_ のインデックス i のビットが立っていることを表す。
+  // 描画のたびに O(N^2) の strcmp を回さないよう、パース完了時に一度だけ計算する。
+  //   dupTitleMask_   : 同一ページ内に同名タイトルが存在する
+  //   ambiguousMask_  : 副題・文字遣いまで一致し、作品 ID でしか区別できない
+  //                     （例: 芥川竜之介「仙人」id 143 / 144）
+  uint32_t dupTitleMask_ = 0;
+  uint32_t ambiguousMask_ = 0;
+
   // Works pagination
   int worksTotal_ = 0;
   int worksOffset_ = 0;
   static constexpr int WORKS_PAGE_SIZE = 30;
+  static_assert(WORKS_PAGE_SIZE <= 32, "重複判定マスクが uint32_t に収まる必要がある");
   char lastWorksQuery_[64] = {};  // 再取得用にクエリを保持
 
   // Selected kana row index (for KANA_CHAR_SELECT)
@@ -97,6 +110,9 @@ class AozoraActivity : public Activity {
   int selectedWorkId_ = 0;
   char selectedWorkTitle_[80] = {};
   char selectedWorkAuthor_[48] = {};
+  char selectedWorkSubtitle_[64] = {};
+  char selectedWorkVariant_[20] = {};
+  char selectedWorkNdc_[8] = {};
 
   // Download progress
   size_t downloadProgress_ = 0;
@@ -109,9 +125,13 @@ class AozoraActivity : public Activity {
   // DOWNLOADED_LIST 表示用のページキャッシュ。
   // indexManager_ からオンデマンドで読み出し、常駐メモリを最小化する。
   static constexpr int DL_PAGE_SIZE = 30;
+  static_assert(DL_PAGE_SIZE <= 32, "重複判定マスクが uint32_t に収まる必要がある");
   AozoraBookEntry dlPageCache_[DL_PAGE_SIZE] = {};
   int dlPageStart_ = -1;  // -1 = キャッシュ無効
   int dlPageCount_ = 0;
+  // dlPageCache_ 内の重複判定マスク。ビット位置はキャッシュ内のローカルインデックス。
+  uint32_t dlDupTitleMask_ = 0;
+  uint32_t dlAmbiguousMask_ = 0;
 
   // ページキャッシュに [start, start+DL_PAGE_SIZE) 範囲のエントリを読み込む。
   void loadDownloadedPage(int start);
@@ -138,6 +158,11 @@ class AozoraActivity : public Activity {
   bool fetchWorks(const char* queryParam);
   bool downloadBook();
   bool updateBook();
+  /**
+   * 選択中の作品をリーダーで開く。呼び出し後は this が破棄され得るため、
+   * 呼び出し元は即座に return してメンバに触れないこと。
+   */
+  void openSelectedWorkInReader();
   // Download destPath from url with the same retry policy as the listing calls.
   // Sets errorMessage_ and returns false once every attempt has failed.
   bool downloadWithRetry(const char* url, const char* destPath);
@@ -145,4 +170,11 @@ class AozoraActivity : public Activity {
   // JSON parsing
   bool parseAuthorsJson(JsonDocument& doc);
   bool parseWorksJson(JsonDocument& doc);
+
+  /** works_ から dupTitleMask_ / ambiguousMask_ を再計算する */
+  void computeWorkDuplicateMasks();
+  /** WORK_LIST の 2 行目（著者・副題・文字遣い・作品 ID）を組み立てる */
+  std::string buildWorkListSubtitle(int index) const;
+  /** DOWNLOADED_LIST の 2 行目を組み立てる。index はリスト全体での絶対インデックス */
+  std::string buildDownloadedListSubtitle(int index) const;
 };

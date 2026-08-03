@@ -20,7 +20,29 @@ bool AozoraIndexManager::loadAndPurge() {
   }
 
   if (Storage.exists(INDEX_BIN_PATH)) {
-    return loadFromBin_();
+    const int version = readBinVersion_();
+    if (version == BIN_HEADER_VERSION) {
+      return loadFromBin_();
+    }
+    if (version == BIN_VERSION_READ_FAILED) {
+      // SD の一時的な不調の可能性がある。bin を消すと正常な履歴を失うので手を付けず、
+      // 今回の起動だけ履歴なしで続行する（次回起動で再試行される）。
+      LOG_ERR("AOZORA", "Could not read bin header, keeping file and starting with empty history");
+      return false;
+    }
+
+    if (version == BIN_HEADER_VERSION_V1) {
+      LOG_DBG("AOZORA", "Migrating bin v1 -> v2");
+      if (migrateBinV1ToV2_()) {
+        return loadFromBin_();
+      }
+      LOG_ERR("AOZORA", "v1->v2 migration failed, falling back to directory scan");
+    } else {
+      LOG_ERR("AOZORA", "Unsupported bin version %d, falling back to directory scan", version);
+    }
+    // ここに来る bin は内容が壊れているか未対応バージョン。残すと以降の起動で毎回
+    // 同じ失敗を繰り返すため削除し、SD 上の EPUB 実ファイルからの再構築に落とす。
+    Storage.remove(INDEX_BIN_PATH);
   }
 
   if (Storage.exists(INDEX_PATH)) {
@@ -50,7 +72,8 @@ bool AozoraIndexManager::isDownloaded(int32_t workId) const {
   return std::binary_search(downloadedIds_.begin(), downloadedIds_.end(), workId);
 }
 
-bool AozoraIndexManager::addEntry(int32_t workId, const char* title, const char* author, const char* filename) {
+bool AozoraIndexManager::addEntry(int32_t workId, const char* title, const char* author, const char* filename,
+                                  const char* subtitle, const char* variant) {
   if (isDownloaded(workId)) return true;
 
   AozoraBookEntry entry;
@@ -59,6 +82,8 @@ bool AozoraIndexManager::addEntry(int32_t workId, const char* title, const char*
   snprintf(entry.title, sizeof(entry.title), "%s", title);
   snprintf(entry.author, sizeof(entry.author), "%s", author);
   snprintf(entry.filename, sizeof(entry.filename), "%s", filename);
+  snprintf(entry.subtitle, sizeof(entry.subtitle), "%s", subtitle ? subtitle : "");
+  snprintf(entry.variant, sizeof(entry.variant), "%s", variant ? variant : "");
 
   // O_TRUNC 付きで開くと既存レコードが全消失するため、O_RDWR | O_CREAT で開く
   const bool binExists = Storage.exists(INDEX_BIN_PATH);
@@ -171,6 +196,8 @@ bool AozoraIndexManager::readEntryAt(size_t indexInActive, AozoraBookEntry& out)
   out.title[sizeof(out.title) - 1] = '\0';
   out.author[sizeof(out.author) - 1] = '\0';
   out.filename[sizeof(out.filename) - 1] = '\0';
+  out.subtitle[sizeof(out.subtitle) - 1] = '\0';
+  out.variant[sizeof(out.variant) - 1] = '\0';
   return true;
 }
 
@@ -233,6 +260,127 @@ bool AozoraIndexManager::loadFromBin_() {
 
   file.close();
   LOG_DBG("AOZORA", "Loaded %zu active entries from bin", activeOffsets_.size());
+  return true;
+}
+
+int AozoraIndexManager::readBinVersion_() {
+  HalFile file;
+  if (!Storage.openFileForRead("AOZORA", INDEX_BIN_PATH, file)) {
+    LOG_ERR("AOZORA", "readBinVersion: open failed");
+    return BIN_VERSION_READ_FAILED;
+  }
+  uint8_t header[BIN_HEADER_SIZE];
+  const int bytes = file.read(header, sizeof(header));
+  file.close();
+  if (bytes != static_cast<int>(sizeof(header))) {
+    LOG_ERR("AOZORA", "readBinVersion: short read (%d bytes)", bytes);
+    // ヘッダより短いファイルは中身が無いので、破損として扱って作り直す
+    return BIN_VERSION_BAD_MAGIC;
+  }
+  if (memcmp(header, BIN_HEADER_MAGIC, sizeof(BIN_HEADER_MAGIC)) != 0) {
+    LOG_ERR("AOZORA", "readBinVersion: bad magic");
+    return BIN_VERSION_BAD_MAGIC;
+  }
+  return static_cast<int>(header[4]);
+}
+
+/**
+ * v1 形式の bin (status + 180B レコード) を v2 形式 (status + 248B レコード) に変換する。
+ *
+ * v2 レコードの先頭 180 バイトは v1 レコードとバイト単位で一致するため、旧レコードを
+ * そのまま読んで subtitle / variant を空にしたまま append すればよい。tombstone は
+ * loadFromBin_() が読み飛ばす死んだ領域なので、この機会に落としてファイルを詰める。
+ *
+ * .tmp に書き終えてから rename する atomic swap 方式なので、途中で電源が落ちても
+ * 元の v1 bin は無傷のまま残る（次回起動時に .tmp は loadAndPurge が掃除する）。
+ */
+bool AozoraIndexManager::migrateBinV1ToV2_() {
+  HalFile src;
+  if (!Storage.openFileForRead("AOZORA", INDEX_BIN_PATH, src)) {
+    LOG_ERR("AOZORA", "migrateV2: open v1 bin failed");
+    return false;
+  }
+  const size_t fileSize = src.fileSize();
+
+  Storage.remove(INDEX_TMP_PATH);  // 万が一残骸があれば削除
+  HalFile dst;
+  if (!Storage.openFileForWrite("AOZORA", INDEX_TMP_PATH, dst)) {
+    LOG_ERR("AOZORA", "migrateV2: open tmp for write failed");
+    src.close();
+    return false;
+  }
+  if (!writeHeader_(dst)) {  // v2 ヘッダを書く
+    dst.close();
+    Storage.remove(INDEX_TMP_PATH);
+    src.close();
+    return false;
+  }
+
+  int migratedCount = 0;
+  bool ok = true;
+  size_t offset = BIN_HEADER_SIZE;
+
+  while (offset + BIN_V1_RECORD_SIZE <= fileSize) {
+    if (!src.seekSet(offset)) {
+      ok = false;
+      break;
+    }
+
+    uint8_t status = 0;
+    if (src.read(&status, 1) != 1) {
+      ok = false;
+      break;
+    }
+
+    if (status != STATUS_ACTIVE) {
+      offset += BIN_V1_RECORD_SIZE;
+      continue;  // tombstone は引き継がない
+    }
+
+    AozoraBookEntryV1 old;
+    memset(&old, 0, sizeof(old));
+    if (src.read(&old, sizeof(old)) != static_cast<int>(sizeof(old))) {
+      ok = false;
+      break;
+    }
+    // 破損データによる over-read を防ぐ
+    old.title[sizeof(old.title) - 1] = '\0';
+    old.author[sizeof(old.author) - 1] = '\0';
+    old.filename[sizeof(old.filename) - 1] = '\0';
+
+    AozoraBookEntry entry;
+    memset(&entry, 0, sizeof(entry));
+    entry.workId = old.workId;
+    snprintf(entry.title, sizeof(entry.title), "%s", old.title);
+    snprintf(entry.author, sizeof(entry.author), "%s", old.author);
+    snprintf(entry.filename, sizeof(entry.filename), "%s", old.filename);
+    // subtitle / variant は v1 に存在しない。空のまま引き継ぐ。
+
+    uint32_t newOffset = 0;
+    if (!appendRecord_(dst, entry, newOffset)) {
+      LOG_ERR("AOZORA", "migrateV2: appendRecord failed");
+      ok = false;
+      break;
+    }
+    migratedCount++;
+    offset += BIN_V1_RECORD_SIZE;
+  }
+
+  dst.close();
+  src.close();
+
+  if (!ok) {
+    Storage.remove(INDEX_TMP_PATH);
+    return false;
+  }
+
+  if (!Storage.rename(INDEX_TMP_PATH, INDEX_BIN_PATH)) {
+    LOG_ERR("AOZORA", "migrateV2: rename failed");
+    Storage.remove(INDEX_TMP_PATH);
+    return false;
+  }
+
+  LOG_DBG("AOZORA", "Migrated %d entries from bin v1 to v2", migratedCount);
   return true;
 }
 
@@ -371,6 +519,10 @@ done:
  * makeRelativePath() の命名規則を逆手にとってファイル名から workId とタイトルを
  * 抽出する。この処理により、SD カード上に EPUB が残っていれば履歴 JSON が消えても
  * 完全に回復できる。
+ *
+ * ただし副題・文字遣いはファイル名に含まれないため復元できず、空欄で再構築される。
+ * addEntry() は既存 workId をスキップするため、いったん空欄で入ったエントリは
+ * 削除して再取得するまで埋まらない（既知の制約）。
  */
 bool AozoraIndexManager::rebuildFromDirectoryScan_() {
   HalFile rootDir;
